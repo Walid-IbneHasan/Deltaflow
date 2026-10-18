@@ -15,11 +15,13 @@ to the size of the change, not the size of the tables.
 | M2 — delta algebra, frontiers, map/filter views, in-memory sink | done — [notes](docs/milestones/M2.md), [design](docs/delta-algebra.md) |
 | M3 — RocksDB state with a memory budget, incremental join | done — [notes](docs/milestones/M3.md), [design](docs/join.md) |
 | M4 — group_by with count/sum/min/max (exact under deletes), distinct | done — [notes](docs/milestones/M4.md), [design](docs/aggregates.md) |
-| M5–M7 | not started |
+| M5 — exactly-once Postgres sink, checkpointed state, `kill -9` chaos suite | done — [notes](docs/milestones/M5.md), [design](docs/exactly-once.md) |
+| M6–M7 | not started |
 
 Views can filter, map, project, inner-join and aggregate source tables.
-Operator state lives in RocksDB under a memory budget, and view results
-live in memory. Durable state and the Postgres sink come in M5. This table
+Operator state lives in RocksDB under a memory budget, and checkpoints
+make it survive crashes. Results go to Postgres tables exactly once, each
+with a watermark committed in the same transaction. This table
 is updated only when a milestone's acceptance test passes.
 
 ```python
@@ -48,7 +50,9 @@ make load    # randomized inserts/updates/deletes; prints a replayable seed
 make check   # ruff, mypy --strict, pytest
 make tail    # print the decoded replication stream
 make views   # filtered, join and aggregate views following the stream (run `make load` alongside)
+make worker  # durable worker: four views into analytics.*, survives kill -9
 make differential  # acceptance tests (DELTAFLOW_SEED=N to replay a seed)
+make chaos   # kill -9 the worker during load; sinks must equal a recompute
 ```
 
 Design decisions are in [`docs/decisions/`](docs/decisions/), and per-milestone
