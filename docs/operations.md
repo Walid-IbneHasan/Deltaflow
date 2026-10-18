@@ -153,14 +153,29 @@ itself caused the stalls (57.8 s threaded, 0.37 s direct), so the call was
 briefly made directly on the event loop. A later run showed a 29 s stall
 with the direct call: the slowness had nothing to do with threads.
 
-The direct call then broke something else. It blocks the loop, and the
-replication heartbeat runs on that loop. In CI (Python 3.14), a slow
-checkpoint stopped the heartbeats for longer than the backpressure test's
-2 s `wal_sender_timeout`, and the server dropped the connection:
-`terminating walsender process due to replication timeout`. The thread is
-back, now for the right reason. The run loop awaits it, so the state
-cannot change during a checkpoint, while the loop stays free for
-heartbeats.
+**A second explanation was wrong too, and is corrected here.** The backpressure
+test once failed in CI (Python 3.14): `terminating walsender process due to
+replication timeout`. A checkpoint had stopped the heartbeats for longer
+than the test's 2 s `wal_sender_timeout`. I moved the checkpoint back into
+a worker thread "so heartbeats keep running", and CI went green. That
+reasoning was false. **rocksdict holds the GIL for the whole checkpoint.**
+During a 1.1 s checkpoint in a thread, the main thread made exactly one
+iteration, so heartbeats (asyncio or thread) wait for it either way. CI
+passed because the next runs' checkpoints were fast.
+
+What is actually true:
+
+- **A slow checkpoint freezes the whole worker process.** On Linux that was
+  0.05–0.12 s. On the Windows host, sometimes 20–30 s.
+- **Correctness is never at stake.** A frozen process cannot write, and on
+  waking it is fenced (M7) or finds its slot gone.
+- **Availability needs margin.** `wal_sender_timeout` and the cluster lease
+  TTL must exceed the slowest checkpoint the host produces.
+
+The real fix would be a checkpoint that releases the GIL, or runs out of
+process. rocksdict offers neither, and a hand-rolled checkpoint (flush plus
+hard links) is unsafe without RocksDB's "disable file deletions", which
+rocksdict does not expose. Not done.
 
 **What a checkpoint costs everyone else:** the run loop waits for it, so
 freshness of transactions arriving during a checkpoint includes it. On

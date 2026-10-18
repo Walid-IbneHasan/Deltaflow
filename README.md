@@ -17,7 +17,7 @@ to the size of the change, not the size of the tables.
 | M4 — group_by with count/sum/min/max (exact under deletes), distinct | done — [notes](docs/milestones/M4.md), [design](docs/aggregates.md) |
 | M5 — exactly-once Postgres sink, checkpointed state, `kill -9` chaos suite | done — [notes](docs/milestones/M5.md), [design](docs/exactly-once.md) |
 | M6 — metrics, JSON logs, Next.js console, backpressure, measured benchmark | done — [notes](docs/milestones/M6.md), [design](docs/operations.md) |
-| M7 | not started |
+| M7 — scale-out: sharded views, Postgres leases with epoch fencing, failover | done — [notes](docs/milestones/M7.md), [design](docs/scale-out.md) |
 
 Views can filter, map, project, inner-join and aggregate source tables.
 Operator state lives in RocksDB under a memory budget, and checkpoints
@@ -81,6 +81,8 @@ make console # live operator graph and lag: http://localhost:3017
 make differential  # acceptance tests (DELTAFLOW_SEED=N to replay a seed)
 make chaos   # kill -9 the worker during load; sinks must equal a recompute
 make bench   # capacity and freshness benchmark (re-seeds the database)
+make cluster-worker ID=w1  # sharded worker; start w2, w3 alongside, kill any of them
+make cluster-reset         # drop the cluster's slots, partial tables, leases and state
 ```
 
 Design decisions are in [`docs/decisions/`](docs/decisions/), and per-milestone
