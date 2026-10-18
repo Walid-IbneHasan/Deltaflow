@@ -82,6 +82,7 @@ def compile_views(views: Sequence[View], store: StateStore, namespace: str = "")
                     node = GroupBy(
                         node,
                         keys=step.keys,
+                        names=step.output_keys,
                         aggregates=step.aggregates,
                         store=store,
                         name=f"{namespace}{view.name}.{i}",

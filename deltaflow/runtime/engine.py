@@ -22,7 +22,7 @@ import hashlib
 import json
 import time
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from deltaflow.core import Delta, Frontier, FrontierViolationError, Row, consolidate
@@ -38,6 +38,8 @@ from deltaflow.replication.changes import (
     Transaction,
 )
 from deltaflow.replication.lsn import Lsn
+from deltaflow.replication.pgoutput import UNCHANGED_TOAST
+from deltaflow.sharding import shard_of
 from deltaflow.state import TableArrangement, TableSchema
 from deltaflow.state.store import StateStore
 
@@ -55,6 +57,7 @@ class Engine:
         snapshot_chunk_rows: int = 5_000,
         snapshot_chunk_bytes: int = 2 << 20,
         resume: Mapping[str, Any] | None = None,
+        shard: int | None = None,
     ) -> None:
         """All operator state (arrangements, join indices) goes into `store`.
         `namespace` prefixes every keyspace, so several engines can share one
@@ -64,7 +67,19 @@ class Engine:
 
         `resume` is the `metadata()` saved with a state checkpoint, when
         `store` is that checkpoint restored: the engine continues from it
-        instead of expecting snapshots."""
+        instead of expecting snapshots.
+
+        With `shard`, the registry must be sharded and the engine keeps only
+        that shard's rows: its views' results are this shard's partials
+        (planner/merge.py combines them)."""
+        if shard is not None and (registry.shards is None or not 0 <= shard < registry.shards):
+            raise PlanError(f"shard {shard} given for a registry with shards={registry.shards}")
+        self.shard = shard
+        self._owns: dict[str, Callable[[Mapping[str, Any]], bool]] = {}
+        if shard is not None and registry.shards is not None:
+            n = registry.shards
+            for table, column in registry.shard_by.items():
+                self._owns[table] = _owner_check(column, n, shard)
         registry.freeze()
         self._store = store
         self._namespace = namespace
@@ -92,6 +107,7 @@ class Engine:
             "version": 1,
             "lsn": int(self.frontier.lower),
             "fingerprint": self._fingerprint,
+            "shard": self.shard,
             "arrangements": {
                 table: {
                     "columns": list(a.schema.columns),
@@ -103,6 +119,8 @@ class Engine:
         }
 
     def _resume(self, meta: Mapping[str, Any]) -> None:
+        if meta.get("shard") != self.shard:
+            raise PlanError(f"checkpoint is of shard {meta.get('shard')}, not {self.shard}")
         if meta.get("fingerprint") != self._fingerprint:
             raise PlanError(
                 "the views changed since the state checkpoint was taken; the state cannot "
@@ -114,6 +132,7 @@ class Engine:
                 schema,
                 self._store.keyspace(f"{self._namespace}arr:{table}"),
                 count=int(info["count"]),
+                owns=self._owns.get(table),
             )
         self._started = True
         self.advance(Frontier.at(Lsn(int(meta["lsn"]))))
@@ -176,7 +195,9 @@ class Engine:
         if schema.table in self._arrangements:
             raise RuntimeError(f"snapshot of {schema.table} already installed")
         arrangement = TableArrangement(
-            schema, self._store.keyspace(f"{self._namespace}arr:{schema.table}")
+            schema,
+            self._store.keyspace(f"{self._namespace}arr:{schema.table}"),
+            owns=self._owns.get(schema.table),
         )
         self._arrangements[schema.table] = arrangement
         return SnapshotLoader(self, arrangement, *self._chunk_limits)
@@ -229,9 +250,8 @@ class Engine:
 
     def _install_chunk(self, arrangement: TableArrangement, chunk: list[Row]) -> None:
         self.counters["snapshot_chunks"] += 1
-        for row in chunk:
-            arrangement.load(row)
-        self._step({arrangement.schema.table: [Delta(row, SNAPSHOT_TIME, 1) for row in chunk]})
+        mine = [row for row in chunk if arrangement.load(row)]
+        self._step({arrangement.schema.table: [Delta(row, SNAPSHOT_TIME, 1) for row in mine]})
 
     def _step(self, batches: dict[str, list[Delta[Row]]], *, initial: bool = False) -> None:
         """Push one batch per source through the graph. With `initial`, each
@@ -310,7 +330,8 @@ def fingerprint(registry: Deltaflow) -> str:
             case JoinStep():
                 return ["join", s.table, s.left_on, s.right_on, s.left_prefix, s.right_prefix]
             case GroupStep():
-                return ["group", s.keys, {k: repr(v) for k, v in s.aggregates.items()}]
+                aggs = {k: repr(v) for k, v in s.aggregates.items()}
+                return ["group", s.keys, s.output_keys, aggs]
             case _:
                 return [type(s).__name__]
 
@@ -324,4 +345,17 @@ def fingerprint(registry: Deltaflow) -> str:
         ]
         for v in registry.views
     ]
-    return hashlib.sha256(json.dumps(views, sort_keys=True, default=list).encode()).hexdigest()
+    sharding = [registry.shards, sorted(registry.shard_by.items())]
+    return hashlib.sha256(
+        json.dumps([views, sharding], sort_keys=True, default=list).encode()
+    ).hexdigest()
+
+
+def _owner_check(column: str, shards: int, shard: int) -> Callable[[Mapping[str, Any]], bool]:
+    def owns(row: Mapping[str, Any]) -> bool:
+        value = row[column]
+        if value is UNCHANGED_TOAST:
+            raise TypeError(f"shard column {column!r} sent as unchanged-TOAST placeholder")
+        return shard_of(value, shards) == shard
+
+    return owns

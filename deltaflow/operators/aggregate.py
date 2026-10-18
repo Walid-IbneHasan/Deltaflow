@@ -122,10 +122,13 @@ class GroupBy(Operator):
         aggregates: dict[str, Aggregate],
         store: StateStore,
         name: str,
+        names: tuple[str, ...] | None = None,
     ) -> None:
+        """`names` are the output column names of `keys` (default: the same)."""
         super().__init__(input)
         self.name = name
         self.keys = keys
+        self.names = names or keys
         self.aggregates = aggregates
         self._groups = store.keyspace(f"agg:{name}:groups")
         self._values = store.keyspace(f"agg:{name}:values")
@@ -245,7 +248,7 @@ class GroupBy(Operator):
             self._values.put(entry, n.to_bytes(_COUNT, "big", signed=True) + blob)
 
     def _output(self, key: tuple[Any, ...], kb: bytes, group: _Group) -> Iterator[tuple[str, Any]]:
-        yield from zip(self.keys, key, strict=True)
+        yield from zip(self.names, key, strict=True)
         for i, (name, agg) in enumerate(self.aggregates.items()):
             state = group.states[i]
             match agg:

@@ -61,6 +61,12 @@ class GroupStep:
     #: empty for a global aggregate (exactly one output row, as in SQL)
     keys: tuple[str, ...]
     aggregates: dict[str, Aggregate]
+    #: output column name of each key (defaults to the key itself)
+    names: tuple[str, ...] = ()
+
+    @property
+    def output_keys(self) -> tuple[str, ...]:
+        return self.names or self.keys
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,9 +91,21 @@ class View:
 
 
 class Deltaflow:
-    """Registry of views. Frozen once an engine is built from it."""
+    """Registry of views. Frozen once an engine is built from it.
 
-    def __init__(self) -> None:
+    With `shards` and `shard_by`, every view is checked to be exactly
+    computable shard by shard (M7, docs/scale-out.md). `shard_by` names, per
+    source table, the column whose value decides a row's shard."""
+
+    def __init__(
+        self, *, shards: int | None = None, shard_by: Mapping[str, str] | None = None
+    ) -> None:
+        if (shards is None) != (shard_by is None):
+            raise PlanError("give both shards and shard_by, or neither")
+        if shards is not None and shards < 1:
+            raise PlanError("shards must be at least 1")
+        self.shards = shards
+        self.shard_by: dict[str, str] = dict(shard_by or {})
         self._views: dict[str, View] = {}
         self._frozen = False
 
@@ -134,6 +152,7 @@ class ViewBuilder:
         self._steps: list[Step] = []
         self._prefixes: list[str] = []
         self._aggregated = False
+        self._mapped = False
         self._done = False
 
     def source(self, table: str) -> ViewBuilder:
@@ -145,17 +164,24 @@ class ViewBuilder:
                 f"source {table!r} must be schema-qualified, e.g. 'public.orders' "
                 "(an unqualified name would depend on search_path)"
             )
+        if self._registry.shards and table not in self._registry.shard_by:
+            raise PlanError(
+                f"{table} has no shard column in shard_by; a sharded view cannot read it"
+            )
         self._source = table
         self._prefixes = [_relname(table)]
         return self
 
     def filter(self, predicate: Predicate) -> ViewBuilder:
         self._check_step(predicate, "filter")
+        self._check_not_terminal("filter")
         self._steps.append(FilterStep(predicate))
         return self
 
     def map(self, fn: MapFunction) -> ViewBuilder:
         self._check_step(fn, "map")
+        self._check_not_terminal("map")
+        self._mapped = True
         self._steps.append(MapStep(fn))
         return self
 
@@ -190,6 +216,8 @@ class ViewBuilder:
                 "a join after an aggregation (group_by, agg, distinct) is not supported"
             )
         pairs = _pairs(on)
+        if self._registry.shards:
+            self._check_co_partitioned(table, pairs)
         prefix = _relname(table)
         if prefix in self._prefixes:
             raise PlanError(
@@ -209,19 +237,23 @@ class ViewBuilder:
         self._prefixes.append(prefix)
         return self
 
-    def group_by(self, *columns: str) -> GroupedBuilder:
+    def group_by(self, *columns: str, **aliases: str) -> GroupedBuilder:
         """`.group_by("customers.country").agg(n=Count(), revenue=Sum("amount"))`.
-        Output rows hold the group columns (named as given) and the aggregates."""
+        Output rows hold the group columns (named as given, or as aliased:
+        `group_by(country="customers.country")`) and the aggregates."""
         self._check_usable()
+        self._check_not_terminal("group_by")
         if self._source is None:
             raise PlanError(f"view {self._name!r}: call .source(table) before .group_by()")
-        if not columns or not all(isinstance(c, str) and c for c in columns):
+        keys = (*columns, *aliases.values())
+        names = (*columns, *aliases)
+        if not keys or not all(isinstance(c, str) and c for c in keys):
             raise PlanError(
                 "group_by needs at least one column name (use .agg() for a global aggregate)"
             )
-        if len(set(columns)) != len(columns):
-            raise PlanError(f"group_by lists a column more than once: {columns!r}")
-        return GroupedBuilder(self, tuple(columns))
+        if len(set(keys)) != len(keys) or len(set(names)) != len(names):
+            raise PlanError(f"group_by lists a column more than once: {keys!r}")
+        return GroupedBuilder(self, tuple(keys), tuple(names))
 
     def agg(self, **aggregates: Aggregate) -> ViewBuilder:
         """A global aggregate over all rows: one output row, even over none."""
@@ -231,14 +263,21 @@ class ViewBuilder:
 
     def distinct(self) -> ViewBuilder:
         self._check_usable()
+        self._check_not_terminal("distinct")
         if self._source is None:
             raise PlanError(f"view {self._name!r}: call .source(table) before .distinct()")
         self._steps.append(DistinctStep())
         self._aggregated = True
         return self
 
-    def _aggregate(self, keys: tuple[str, ...], aggregates: dict[str, Aggregate]) -> ViewBuilder:
+    def _aggregate(
+        self,
+        keys: tuple[str, ...],
+        aggregates: dict[str, Aggregate],
+        names: tuple[str, ...] = (),
+    ) -> ViewBuilder:
         self._check_usable()
+        self._check_not_terminal("agg")
         if self._source is None:
             raise PlanError(f"view {self._name!r}: call .source(table) before .agg()")
         for name, agg in aggregates.items():
@@ -247,9 +286,9 @@ class ViewBuilder:
                     f"aggregate {name}={agg!r}: expected Count, Sum, Min or Max "
                     "(other aggregates are not maintained incrementally yet)"
                 )
-            if name in keys:
+            if name in (names or keys):
                 raise PlanError(f"aggregate name {name!r} collides with a group_by column")
-        self._steps.append(GroupStep(keys, dict(aggregates)))
+        self._steps.append(GroupStep(keys, dict(aggregates), names if names != keys else ()))
         self._aggregated = True
         return self
 
@@ -270,6 +309,38 @@ class ViewBuilder:
         if inspect.iscoroutinefunction(fn):
             raise PlanError(f"{what} function must be synchronous, not async")
 
+    def _check_not_terminal(self, what: str) -> None:
+        """In a sharded registry, shards compute partial aggregates that a
+        merge view combines; that merge knows the aggregate columns only if
+        nothing transforms them afterwards."""
+        if self._registry.shards and self._aggregated:
+            raise PlanError(
+                f"in a sharded view an aggregation (group_by, agg, distinct) must be the last "
+                f"step; .{what}() after it is not supported"
+            )
+
+    def _check_co_partitioned(self, table: str, pairs: list[tuple[str, str]]) -> None:
+        """A join is computed shard by shard only if both sides are sharded by
+        their join keys: then every matching pair lives on the same shard."""
+        assert self._source is not None
+        if table not in self._registry.shard_by:
+            raise PlanError(
+                f"{table} has no shard column in shard_by; a sharded view cannot read it"
+            )
+        if len(self._prefixes) > 1:
+            raise PlanError("a sharded view may contain at most one join")
+        if self._mapped:
+            raise PlanError(
+                "in a sharded view a map before a join could change the join key, so rows "
+                "would no longer meet on the same shard; filter or select after the join"
+            )
+        left, right = self._registry.shard_by[self._source], self._registry.shard_by[table]
+        if pairs != [(left, right)]:
+            raise PlanError(
+                f"join on {pairs} is not co-partitioned: sharded views can only join "
+                f"{self._source}.{left} = {table}.{right}, the two tables' shard columns"
+            )
+
     def _check_usable(self) -> None:
         if self._done:
             raise PlanError(f"view {self._name!r} is already registered; start a new .view()")
@@ -278,13 +349,14 @@ class ViewBuilder:
 class GroupedBuilder:
     """Returned by group_by: say which aggregates to compute."""
 
-    def __init__(self, builder: ViewBuilder, keys: tuple[str, ...]) -> None:
+    def __init__(self, builder: ViewBuilder, keys: tuple[str, ...], names: tuple[str, ...]) -> None:
         self._builder = builder
         self._keys = keys
+        self._names = names
 
     def agg(self, **aggregates: Aggregate) -> ViewBuilder:
         """Zero aggregates is allowed: the distinct groups themselves."""
-        return self._builder._aggregate(self._keys, aggregates)
+        return self._builder._aggregate(self._keys, aggregates, self._names)
 
 
 def _relname(table: str) -> str:

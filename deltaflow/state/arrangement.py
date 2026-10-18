@@ -20,12 +20,20 @@ lost or duplicated upstream, so it raises instead of guessing.
 
 Rows live in the state store (M3), keyed by the canonical encoding of the
 key columns, so an arrangement may be far larger than memory.
+
+**Sharded (M7).** With `owns`, the arrangement keeps only the rows its shard
+owns. A change whose shard key moves a row between shards becomes a delete
+here and an insert there. The consistency checks are necessarily weaker in
+this mode: an UPDATE or DELETE of a key this shard does not have is someone
+else's row, not a lost change. One case cannot be handled. A row that moves
+*in* with an unchanged-TOAST placeholder has its value on the shard it came
+from, so it raises.
 """
 
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -61,11 +69,20 @@ type Key = tuple[Any, ...]
 
 
 class TableArrangement:
-    def __init__(self, schema: TableSchema, keyspace: Keyspace, *, count: int = 0) -> None:
-        """`count` is the number of rows already in `keyspace` (on resume)."""
+    def __init__(
+        self,
+        schema: TableSchema,
+        keyspace: Keyspace,
+        *,
+        count: int = 0,
+        owns: Callable[[Mapping[str, Any]], bool] | None = None,
+    ) -> None:
+        """`count` is the number of rows already in `keyspace` (on resume).
+        `owns` says whether a row belongs to this arrangement's shard."""
         self.schema = schema
         self._rows = keyspace
         self._count = count
+        self._owns = owns
         self._checked: Relation | None = None
         self.counters: Counter[str] = Counter()
 
@@ -75,22 +92,29 @@ class TableArrangement:
     def rows(self) -> Iterator[Row]:
         return (decode_row(v) for _, v in self._rows.scan())
 
-    def load(self, row: Row) -> None:
-        """Add a row from the initial snapshot."""
+    def load(self, row: Row) -> bool:
+        """Add a row from the initial snapshot; False if another shard owns it."""
+        if self._owns is not None and not self._owns(row):
+            return False
         key = self._key(row)
         if self._get(key) is not None:
             raise SourceStateError(f"{self.schema.table}: duplicate key {key!r} in snapshot")
         self._put(key, row)
+        return True
 
     def apply(self, change: RowInsert | RowUpdate | RowDelete) -> list[tuple[Row, int]]:
         """Apply one change; return it as whole-row (row, diff) pairs."""
         self._check(change.relation)
         match change:
             case RowInsert():
+                if self._owns is not None and not self._owns(change.new):
+                    return []
                 return [(self._insert(change.new), 1)]
             case RowUpdate():
                 return self._update(change)
             case RowDelete():
+                if self._owns is not None and self._get(self._key(change.old)) is None:
+                    return []  # another shard's row
                 old = self._take(self._key(change.old), "delete")
                 if change.old_kind == "full":
                     self._cross_check(old, change.old)
@@ -118,6 +142,8 @@ class TableArrangement:
         # The old key is in `old` when the key changed (or for FULL);
         # otherwise it is unchanged and can be read from `new`.
         old_key = self._key(change.old if change.old is not None else change.new)
+        if self._owns is not None and self._get(old_key) is None:
+            return self._move_in(change)
         old = self._take(old_key, "update")
         if change.old_kind == "full" and change.old is not None:
             self._cross_check(old, change.old)
@@ -137,8 +163,33 @@ class TableArrangement:
             raise SourceStateError(
                 f"{self.schema.table}: update of {old_key!r} moves onto existing key {new_key!r}"
             )
+        if self._owns is not None and not self._owns(new):
+            self.counters["moved_out"] += 1
+            return [(old, -1)]  # the row now lives on another shard
         self._put(new_key, new)
         return [(old, -1), (new, 1)]
+
+    def _move_in(self, change: RowUpdate) -> list[tuple[Row, int]]:
+        """An UPDATE of a row this shard does not have: either another shard's
+        row that stays there, or one moving in."""
+        assert self._owns is not None
+        if any(v is UNCHANGED_TOAST for v in change.new.values()):
+            # Is it moving in? Only decidable if the shard key itself was sent.
+            try:
+                moving_in = self._owns(change.new)
+            except (KeyError, TypeError):
+                moving_in = True
+            if not moving_in:
+                return []
+            raise SourceStateError(
+                f"{self.schema.table}: a row moved into shard with an unchanged-TOAST "
+                "placeholder; its value is on the shard it came from. Shard by a column "
+                "that does not change, or keep large columns out of sharded sources"
+            )
+        if not self._owns(change.new):
+            return []
+        self.counters["moved_in"] += 1
+        return [(self._insert(change.new), 1)]
 
     def _get(self, key: Key) -> Row | None:
         raw = self._rows.get(encode_key(key))
