@@ -7,7 +7,7 @@ LOAD_ARGS ?= --txns 2000
 WORKER_ARGS ?=
 SEED_ARGS ?=
 
-.PHONY: up down nuke psql seed load tail tail-drop views worker worker-reset differential chaos lint fmt typecheck test check
+.PHONY: up down nuke psql seed load tail tail-drop views worker worker-reset console bench differential chaos lint fmt typecheck test check
 
 up:
 	$(COMPOSE) up -d --wait
@@ -47,6 +47,14 @@ worker:
 # Drop the worker's slot and state (it bootstraps again on the next start).
 worker-reset:
 	$(UV) run python -m deltaflow.devtools.worker --reset
+
+# Live console for a running worker (http://localhost:3017; worker on :9187).
+console:
+	cd console && npm install --no-audit --no-fund && npm run build && npm start
+
+# Benchmark: capacity and freshness (re-seeds the database!). Results in benchmarks/results/.
+bench:
+	$(UV) run python -m benchmarks.throughput
 
 # Chaos suite: kill -9 the worker during load; sinks must equal a recompute.
 chaos:

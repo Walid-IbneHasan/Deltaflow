@@ -85,3 +85,9 @@ def test_json_log_lines() -> None:
     assert line["lsn"] == "0/1"
     assert line["seconds"] == 0.25
     assert "ts" in line
+
+
+def test_an_unlabelled_metric_is_exposed_before_it_is_touched() -> None:
+    reg = Registry()
+    reg.counter("deltaflow_untouched_total", "x")
+    assert "deltaflow_untouched_total 0\n" in reg.expose()

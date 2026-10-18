@@ -1,0 +1,24 @@
+{
+  "name": "deltaflow-console",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Live view of a Deltaflow worker: operator graph, throughput, lag",
+  "scripts": {
+    "dev": "next dev --port 3017",
+    "build": "next build",
+    "start": "next start --port 3017",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --experimental-strip-types lib/*.test.ts"
+  },
+  "dependencies": {
+    "next": "16.3.8",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.1",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "typescript": "5.9.3"
+  }
+}

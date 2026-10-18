@@ -278,51 +278,83 @@ async def flush(
     return written
 
 
+#: Postgres allows at most 65535 bind parameters per statement.
+_MAX_PARAMS = 65_535
+
+
+def _chunks[T](items: Sequence[T], per_item: int) -> list[Sequence[T]]:
+    size = max(1, _MAX_PARAMS // max(1, per_item))
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
 async def _write_keyed(
     cur: psycopg.AsyncCursor[tuple[Any, ...]],
     sink: PostgresSink,
     table: sql.Identifier,
     writes: SinkWrites,
 ) -> None:
-    if writes.deletes:
-        where = sql.SQL(" AND ").join(
-            sql.SQL("{} = %s").format(sql.Identifier(k)) for k in sink.key
+    """One multi-row statement per kind of write, not one statement per row.
+    Per-row statements, even pipelined with executemany, cost about 45 ms
+    per batch on the benchmark machine whatever the batch size; a single
+    statement is one round trip. RETURNING gives the keys Postgres actually
+    touched, matched against what the sink expected (by canonical key, since
+    RETURNING order is unspecified)."""
+    keys = sql.SQL(", ").join(map(sql.Identifier, sink.key))
+    nkey = len(sink.key)
+    for chunk in _chunks(writes.deletes, nkey):
+        values = sql.SQL(", ").join(
+            sql.SQL("({})").format(sql.SQL(", ").join(sql.Placeholder() * nkey)) for _ in chunk
         )
-        await cur.executemany(
-            sql.SQL("DELETE FROM {} WHERE {} RETURNING 1").format(table, where),
-            writes.deletes,
-            returning=True,
+        await cur.execute(
+            sql.SQL("DELETE FROM {} WHERE ({}) IN (VALUES {}) RETURNING {}").format(
+                table, keys, values, keys
+            ),
+            [v for key in chunk for v in key],
         )
-        _expect(sink, "delete", writes.deletes, await _results(cur), lambda r: r is not None)
-    upserts = writes.upserts
-    if not upserts:
+        deleted = {encode_key(r) for r in await cur.fetchall()}
+        for key in chunk:
+            if encode_key(key) not in deleted:
+                raise _drift(sink, "delete", key, "no such row")
+    if not writes.upserts:
         return
+    expected = {encode_key(r[c] for c in sink.key): True for r in writes.inserts}
+    expected |= {encode_key(r[c] for c in sink.key): False for r in writes.updates}
     cols = sql.SQL(", ").join(map(sql.Identifier, sink.columns))
     rest = [c for c in sink.columns if c not in sink.key]
-    assignment = (
-        sql.SQL("UPDATE SET {}").format(
-            sql.SQL(", ").join(
-                sql.SQL("{0} = EXCLUDED.{0}").format(sql.Identifier(c)) for c in rest
-            )
+    # With every column in the key, "update" sets a key column to itself, so
+    # that RETURNING still reports the row.
+    assigned = rest or [sink.key[0]]
+    assignment = sql.SQL(", ").join(
+        sql.SQL("{0} = EXCLUDED.{0}").format(sql.Identifier(c)) for c in assigned
+    )
+    width = len(sink.columns)
+    for rows in _chunks(writes.upserts, width):
+        values = sql.SQL(", ").join(
+            sql.SQL("({})").format(sql.SQL(", ").join(sql.Placeholder() * width)) for _ in rows
         )
-        if rest
-        else sql.SQL("UPDATE SET {0} = EXCLUDED.{0}").format(sql.Identifier(sink.key[0]))
+        # (xmax = 0) is true for a freshly inserted row, false for an updated one.
+        await cur.execute(
+            sql.SQL(
+                "INSERT INTO {} ({}) VALUES {} ON CONFLICT ({}) DO UPDATE SET {} "
+                "RETURNING {}, (xmax = 0)"
+            ).format(table, cols, values, keys, assignment, keys),
+            [r[c] for r in rows for c in sink.columns],
+        )
+        for returned in await cur.fetchall():
+            kb = encode_key(returned[:nkey])
+            inserted = returned[nkey]
+            if kb not in expected or expected[kb] != inserted:
+                what = "insert" if expected.get(kb, inserted) else "update"
+                raise _drift(
+                    sink, what, tuple(returned[:nkey]), "it was " + ("new" if inserted else "there")
+                )
+
+
+def _drift(sink: PostgresSink, what: str, key: object, found: str) -> SinkError:
+    return SinkError(
+        f"{sink.table}: {what} of key {key!r} did not match the table ({found}); the table and "
+        "the view have drifted apart, or the view is not unique on the key"
     )
-    # (xmax = 0) is true for a freshly inserted row, false for an updated one.
-    query = sql.SQL(
-        "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO {} RETURNING (xmax = 0)"
-    ).format(
-        table,
-        cols,
-        sql.SQL(", ").join(sql.Placeholder() * len(sink.columns)),
-        sql.SQL(", ").join(map(sql.Identifier, sink.key)),
-        assignment,
-    )
-    await cur.executemany(query, [[r[c] for c in sink.columns] for r in upserts], returning=True)
-    inserted = await _results(cur)
-    n = len(writes.inserts)
-    _expect(sink, "insert", writes.inserts, inserted[:n], lambda r: r is not None and r[0] is True)
-    _expect(sink, "update", writes.updates, inserted[n:], lambda r: r is not None and r[0] is False)
 
 
 async def _write_single_row(
@@ -349,26 +381,3 @@ async def _write_single_row(
             ),
             [row[c] for c in sink.columns],
         )
-
-
-async def _results(cur: psycopg.AsyncCursor[tuple[Any, ...]]) -> list[tuple[Any, ...] | None]:
-    out = []
-    while True:
-        out.append(await cur.fetchone())
-        if not cur.nextset():
-            return out
-
-
-def _expect(
-    sink: PostgresSink,
-    what: str,
-    items: Sequence[object],
-    results: Sequence[tuple[Any, ...] | None],
-    ok: Any,
-) -> None:
-    for item, result in zip(items, results, strict=True):
-        if not ok(result):
-            raise SinkError(
-                f"{sink.table}: {what} of {item!r} did not match the table (got {result!r}); "
-                "the table and the view have drifted apart, or the view is not unique on the key"
-            )

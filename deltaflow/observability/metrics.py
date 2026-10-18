@@ -85,6 +85,8 @@ class _Family[V: _Value](_Metric):
         super().__init__(name, help, labels)
         self._make = make
         self._children: dict[LabelValues, V] = {}
+        if not self.label_names:
+            self._children[()] = make()  # an unlabelled metric is exposed as 0 from the start
 
     def labels(self, **labels: str) -> V:
         key = self._key(labels)

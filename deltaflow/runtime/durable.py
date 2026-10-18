@@ -81,7 +81,7 @@ class DurableRunner:
         memory_budget: int = DEFAULT_MEMORY_BUDGET,
         flush_interval: float = 0.1,
         max_flush_transactions: int = 1_000,
-        checkpoint_interval: float = 5.0,
+        checkpoint_interval: float = 10.0,
         status_interval: float = 10.0,
         sink_dsn: str | None = None,
     ) -> None:
@@ -107,7 +107,8 @@ class DurableRunner:
         self._status_interval = status_interval
         self.counters: Counter[str] = Counter()
         self.metrics = RunnerMetrics()
-        self._pending_commits: list[datetime] = []
+        #: (end_lsn, commit_time) of applied transactions not yet flushed
+        self._pending_commits: list[tuple[Lsn, datetime]] = []
         self.slot_lag_bytes: int | None = None
         self.engine: Engine | None = None
         self.store: StateStore | None = None
@@ -335,7 +336,7 @@ class DurableRunner:
                 self.counters["transactions"] += 1
                 self.metrics.transactions.inc()
                 self.metrics.changes.inc(len(event.changes))
-                self._pending_commits.append(event.commit_time)
+                self._pending_commits.append((event.end_lsn, event.commit_time))
                 if not pending:
                     first_pending = now
                 pending += 1
@@ -386,13 +387,17 @@ class DurableRunner:
             self._pending_commits.clear()  # replays: already visible long ago
             return
         started = time.perf_counter()
+        before = self.flushed_lsn
         written = await flush(self._sql, self.sinks, lsn)
         self.metrics.flush_seconds.observe(time.perf_counter() - started)
         # End-to-end freshness of every transaction this flush made visible:
-        # from its commit on the source to the sink's commit.
+        # from its commit on the source to the sink's commit. Replayed
+        # transactions at or below the previous watermark were visible long
+        # before this flush, so they are not freshness samples.
         visible = datetime.now(UTC)
-        for committed in self._pending_commits:
-            self.metrics.lag.observe(max(0.0, (visible - committed).total_seconds()))
+        for end, committed in self._pending_commits:
+            if before is None or end > before:
+                self.metrics.lag.observe(max(0.0, (visible - committed).total_seconds()))
         self._pending_commits.clear()
         self.metrics.rows_written.inc(written)
         self.flushed_lsn = lsn
@@ -411,11 +416,13 @@ class DurableRunner:
                 f"checkpoint at {lsn} would be ahead of the sinks ({self.flushed_lsn})"
             )
         crash_point("checkpoint:before")
-        # In a thread, so the stream reader and heartbeats keep running. The
-        # loop awaits it, so the engine applies nothing meanwhile and the
-        # state stays exactly at `lsn`.
+        # Directly, on the event loop's thread: the engine must not apply
+        # anything during it anyway, and it usually takes 0.3-0.7 s, far
+        # inside any heartbeat deadline. (On the Windows benchmark machine,
+        # with on-access antivirus scanning, some checkpoints took 20-60 s,
+        # in a worker thread or not; docs/milestones/M6.md.)
         started = time.perf_counter()
-        await asyncio.to_thread(self.state.checkpoint, self.store, lsn, self.engine.metadata())
+        self.state.checkpoint(self.store, lsn, self.engine.metadata())
         seconds = time.perf_counter() - started
         self.metrics.checkpoint_seconds.observe(seconds)
         log.info("checkpoint", extra={"lsn": str(lsn), "seconds": round(seconds, 3)})
@@ -462,6 +469,13 @@ class DurableRunner:
         await self.close(final_checkpoint=exc_type is None)
 
 
+#: Freshness buckets, seconds: fine enough to read a p99 off them.
+LAG_BUCKETS = (
+    0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75,
+    1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 30.0, 60.0,
+)  # fmt: skip
+
+
 class RunnerMetrics:
     """The runner's Prometheus metrics (served at /metrics)."""
 
@@ -481,7 +495,7 @@ class RunnerMetrics:
         self.lag = r.histogram(
             "deltaflow_end_to_end_lag_seconds",
             "Source commit to sink commit, per transaction (freshness)",
-            buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0),
+            buckets=LAG_BUCKETS,
         )
         self.flush_seconds = r.histogram("deltaflow_sink_flush_seconds", "Duration of sink flushes")
         self.checkpoint_seconds = r.histogram(

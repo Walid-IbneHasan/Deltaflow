@@ -1,0 +1,183 @@
+:root {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --text: #1c2330;
+  --muted: #5f6b7d;
+  --line: #d8dde5;
+  --edge: #b7c0cd;
+  --edge-active: #2f6fdf;
+  --source: #2f6fdf;
+  --linear: #7a8597;
+  --join: #9b51e0;
+  --aggregate: #d9822b;
+  --sink: #219a62;
+  --up: #219a62;
+  --down: #d1453b;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #11151c;
+    --panel: #19202a;
+    --text: #e3e8ef;
+    --muted: #94a0b2;
+    --line: #2b3542;
+    --edge: #3b4757;
+    --edge-active: #5b8ff0;
+    color-scheme: dark;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+main {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 16px;
+}
+
+header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 22px;
+}
+
+h2 {
+  font-size: 15px;
+  margin: 20px 0 8px;
+}
+
+.subtitle {
+  color: var(--muted);
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+}
+
+.status {
+  margin-left: auto;
+  font-weight: 600;
+}
+
+.status-up {
+  color: var(--up);
+}
+
+.status-down {
+  color: var(--down);
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.metric {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.metric-label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.metric-value {
+  font-family: ui-monospace, monospace;
+  font-size: 15px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.graph {
+  width: 100%;
+  height: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.node {
+  fill: var(--panel);
+  stroke: var(--line);
+}
+
+.node-kind {
+  font-size: 11px;
+  fill: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.node-label {
+  font-size: 13px;
+  fill: var(--text);
+}
+
+.node-rate {
+  font-size: 11px;
+  fill: var(--muted);
+  font-family: ui-monospace, monospace;
+}
+
+.edge {
+  fill: none;
+  stroke: var(--edge);
+  stroke-width: 1.5;
+}
+
+.edge-active {
+  stroke: var(--edge-active);
+  stroke-width: 2;
+}
+
+table {
+  width: 100%;
+  margin-top: 16px;
+  border-collapse: collapse;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  display: block;
+  overflow-x: auto;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+th {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 12px;
+}
+
+td.num {
+  text-align: right;
+  font-family: ui-monospace, monospace;
+}
