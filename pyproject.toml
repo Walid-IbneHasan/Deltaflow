@@ -13,6 +13,7 @@ dev = [
     "pytest>=8.3",
     "ruff>=0.8",
     "mypy>=1.13",
+    "hypothesis>=6.100",
 ]
 
 [build-system]

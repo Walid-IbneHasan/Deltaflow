@@ -18,6 +18,7 @@ library or doing without.
 | `pytest` | Fixtures and parametrisation; `unittest` would need far more boilerplate for the differential suites. |
 | `ruff` | Lint + format in one fast tool, replacing flake8/isort/black. |
 | `mypy` | `--strict` is a project constraint. |
+| `hypothesis` (M2) | Property tests for the delta algebra (group laws, consolidation, linearity of operators) and for the source arrangement against a model. Hand-rolled random testing would have to reinvent shrinking, which is what turns a failing 30-delta batch into the 3-delta counterexample worth reading. Brings `sortedcontainers`, pure Python. |
 | `uv` (tool, not a package dependency) | Pins the interpreter (`.python-version` = 3.12, the supported floor) and the lockfile (`uv.lock`), so CI and local runs resolve identically. |
 | GNU make | `make up/seed/load/check` is the spec'd interface. On Windows it was installed with `winget install ezwinports.make`; recipes run in Git Bash's `sh`. |
 
@@ -28,8 +29,6 @@ library or doing without.
   deprecated along with asyncio policies in 3.14. A three-line
   `deltaflow.aio.run()` that picks `SelectorEventLoop` on Windows serves both
   CLIs and tests with no extra dependency.
-- **`hypothesis`.** Needed for the algebra property tests in M2; it is added
-  then, with its own entry, rather than speculatively now.
 
 ## Postgres version
 
