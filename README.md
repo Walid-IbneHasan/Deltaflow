@@ -22,9 +22,15 @@ passes.
 
 ```python
 df = Deltaflow()
-df.view("big_open_orders").source("public.orders")   .filter(lambda r: r["amount"] >= 4000 and r["status"] != "cancelled")   .select("id", "customer_id", "amount")   .sink(sink := MemorySink())
+(
+    df.view("big_open_orders")
+    .source("public.orders")
+    .filter(lambda r: r["amount"] >= 4000 and r["status"] != "cancelled")
+    .select("id", "customer_id", "amount")
+    .sink(sink := MemorySink())
+)
 async with Runner(df, dsn) as runner:
-    await runner.run()   # sink.result == the view, exactly, as of sink.frontier
+    await runner.run()  # sink.result == the view, exactly, as of sink.frontier
 ```
 
 ## Quick start
