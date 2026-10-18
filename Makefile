@@ -6,7 +6,7 @@ COMPOSE ?= docker compose
 LOAD_ARGS ?= --txns 2000
 SEED_ARGS ?=
 
-.PHONY: up down nuke psql seed load lint fmt typecheck test check
+.PHONY: up down nuke psql seed load tail tail-drop differential lint fmt typecheck test check
 
 up:
 	$(COMPOSE) up -d --wait
@@ -26,6 +26,18 @@ seed:
 
 load:
 	$(UV) run python -m deltaflow.devtools.loadgen $(LOAD_ARGS)
+
+# Print the decoded change stream (persistent slot; resumes after Ctrl-C).
+tail:
+	$(UV) run python -m deltaflow.replication.tail
+
+# Drop tail's slot so it stops retaining WAL.
+tail-drop:
+	$(UV) run python -m deltaflow.replication.tail --drop
+
+# Replication replay acceptance test. Random seed unless DELTAFLOW_SEED is set.
+differential:
+	$(UV) run pytest tests/differential -v -s
 
 lint:
 	$(UV) run ruff check .
