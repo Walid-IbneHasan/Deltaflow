@@ -1,0 +1,36 @@
+name: deltaflow
+
+services:
+  postgres:
+    # 16 is the oldest version Deltaflow supports; developing against the floor
+    # keeps us from depending on newer pgoutput protocol features by accident.
+    image: postgres:16
+    environment:
+      POSTGRES_USER: deltaflow
+      POSTGRES_PASSWORD: deltaflow
+      POSTGRES_DB: deltaflow
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=16
+      - -c
+      - max_wal_senders=16
+      # Keep idle replication connections alive long enough to debug; the
+      # reader sends standby status updates well inside this window.
+      - -c
+      - wal_sender_timeout=60s
+    ports:
+      - "${DELTAFLOW_PG_PORT:-55432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deltaflow -d deltaflow_test"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  pgdata:
