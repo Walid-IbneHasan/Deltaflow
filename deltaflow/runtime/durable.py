@@ -89,6 +89,7 @@ class DurableRunner:
         shard: int | None = None,
         fence: tuple[int, int] | None = None,
         live_name: str = "live",
+        application_name: str = "deltaflow",
     ) -> None:
         """With `shard`, this runner maintains that shard of a sharded
         registry: its sinks write partial rows to `<table>__shards`, its
@@ -106,6 +107,9 @@ class DurableRunner:
         self._views = {id(v.sink): f"{v.name}{suffix}" for v in registry.views}
         self.shard = shard
         self._fence = fence
+        #: every connection is tagged with it, so a cluster can find (and
+        #: terminate) all of a dead worker's sessions
+        self._app = application_name
         self._dsn = dsn
         self._sink_dsn = sink_dsn or dsn
         self.state = StateDirectory(state_dir, live=live_name)
@@ -132,17 +136,21 @@ class DurableRunner:
     # --- start: resume or bootstrap ------------------------------------------
 
     async def start(self) -> None:
-        self._sql = await psycopg.AsyncConnection.connect(self._sink_dsn, autocommit=True)
+        self._sql = await psycopg.AsyncConnection.connect(
+            self._sink_dsn, autocommit=True, application_name=self._app
+        )
         await ensure_watermark_table(self._sql)
         shapes = {}
         for sink in self.sinks:
             shapes[sink.table] = await self._shape(sink)
-        async with await psycopg.AsyncConnection.connect(self._dsn, autocommit=True) as admin:
+        async with await psycopg.AsyncConnection.connect(
+            self._dsn, autocommit=True, application_name=self._app
+        ) as admin:
             if self._manage_publication:
                 registry_sources = self.registry.sources
                 await self._ensure_publication(admin, registry_sources)
             have_slot = await slot_exists(admin, self.slot)
-        repl = await ReplicationConnection.connect(self._dsn, application_name="deltaflow")
+        repl = await ReplicationConnection.connect(self._dsn, application_name=self._app)
         try:
             checkpoint = self.state.latest()
             reason = await self._why_not_resume(checkpoint, have_slot)
@@ -266,7 +274,9 @@ class DurableRunner:
         info = await create_slot(repl, self.slot, export_snapshot=True)
         assert info.snapshot_name is not None
         crash_point("bootstrap:after_slot")
-        async with await psycopg.AsyncConnection.connect(self._dsn) as conn:
+        async with await psycopg.AsyncConnection.connect(
+            self._dsn, application_name=self._app
+        ) as conn:
             await load_snapshot(
                 self.engine,
                 conn,
@@ -296,7 +306,9 @@ class DurableRunner:
     async def _watch_slot(self, stop: asyncio.Event, every: float = 2.0) -> None:
         """Slot lag: WAL the server retains for this slot, polled on its own
         connection so it never interleaves with a flush transaction."""
-        async with await psycopg.AsyncConnection.connect(self._dsn, autocommit=True) as conn:
+        async with await psycopg.AsyncConnection.connect(
+            self._dsn, autocommit=True, application_name=self._app
+        ) as conn:
             while not stop.is_set():
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -459,12 +471,13 @@ class DurableRunner:
                 f"checkpoint at {lsn} would be ahead of the sinks ({self.flushed_lsn})"
             )
         crash_point("checkpoint:before")
-        # In a worker thread, so the event loop stays free and the stream's
-        # heartbeat keeps the replication connection alive however long the
-        # checkpoint takes (a slow disk took over 2 s in CI, and up to 58 s on
-        # the Windows benchmark host; docs/operations.md). The run loop awaits
-        # it, so the engine applies nothing meanwhile and the state stays at
-        # `lsn`.
+        # The run loop awaits this, so the engine applies nothing meanwhile and
+        # the state stays at `lsn`. The worker thread does NOT keep the process
+        # responsive: rocksdict holds the GIL for the whole checkpoint
+        # (measured: the main thread made no progress during a 1.1 s
+        # checkpoint), so heartbeats wait for it too. Timeouts (wal_sender,
+        # cluster lease TTL) must therefore exceed the slowest checkpoint the
+        # host produces; docs/operations.md.
         started = time.perf_counter()
         meta = self.engine.metadata()
         await asyncio.to_thread(self.state.checkpoint, self.store, lsn, meta)

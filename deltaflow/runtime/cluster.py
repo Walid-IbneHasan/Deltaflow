@@ -23,9 +23,13 @@ pipelines of the shards it owns. Ownership works as follows:
   that lost a shard, but still runs because it is hung or partitioned, can
   therefore never commit another write.
 * **Zombies.** If a shard's lock is held by a worker whose heartbeat has
-  expired, the would-be owner terminates the holder's lock backend. That
-  releases the lock, and fencing covers the rest. A shard's replication
-  slot is likewise taken from a stale holder.
+  expired, the would-be owner terminates *all* of that worker's sessions.
+  They are tagged `application_name = deltaflow:<worker>`. Terminating only
+  the lock session is not enough: a flush the dead worker left open still
+  holds its share lock on the lease row, and the epoch bump would wait for
+  it. The epoch bump also runs under a lock timeout, so the coordinator
+  loop never blocks on one. A shard's replication slot is taken from a
+  stale holder the same way. Fencing covers anything still in flight.
 
 Why not Raft: docs/decisions/0007-scale-out.md.
 """
@@ -128,10 +132,13 @@ class ClusterWorker:
         self.stats = ClusterStats()
         self._lock_conn: Conn | None = None
         self._lock_pid = 0
+        self._app = f"deltaflow:{worker_id}"
         self._conn: Conn | None = None
 
     async def run(self, stop: asyncio.Event) -> None:
-        self._conn = await psycopg.AsyncConnection.connect(self._dsn, autocommit=True)
+        self._conn = await psycopg.AsyncConnection.connect(
+            self._dsn, autocommit=True, application_name=self._app
+        )
         await self._conn.execute(CLUSTER_DDL)
         await self._connect_lock()
         beating = threading.Event()
@@ -175,7 +182,9 @@ class ClusterWorker:
         if self._lock_conn is not None:
             with contextlib.suppress(Exception):
                 await self._lock_conn.close()
-        self._lock_conn = await psycopg.AsyncConnection.connect(self._dsn, autocommit=True)
+        self._lock_conn = await psycopg.AsyncConnection.connect(
+            self._dsn, autocommit=True, application_name=self._app
+        )
         self._lock_pid = self._lock_conn.info.backend_pid
         await self._conn_checked().execute(_HEARTBEAT, (self.worker_id, self._lock_pid))
 
@@ -189,7 +198,7 @@ class ClusterWorker:
         while not stop.wait(self._heartbeat):
             try:
                 if conn is None or conn.closed:
-                    conn = psycopg.connect(self._dsn, autocommit=True)
+                    conn = psycopg.connect(self._dsn, autocommit=True, application_name=self._app)
                 conn.execute(_HEARTBEAT, (self.worker_id, self._lock_pid))
             except psycopg.Error as exc:
                 log.warning(
@@ -236,10 +245,51 @@ class ClusterWorker:
         if not (row and row[0]):
             await self._evict_stale_holder(shard)
             return  # try again on the next tick
+        try:
+            epoch = await self._bump_epoch(shard)
+        except psycopg.errors.LockNotAvailable:
+            # A flush of the previous owner still holds the lease row. Let go
+            # of the lock and try again on the next tick, rather than block
+            # the whole loop behind it.
+            await self._lock_conn.execute("SELECT pg_advisory_unlock(%s, %s)", (LOCK_CLASS, shard))
+            log.info("lease row busy, retrying", extra={"worker": self.worker_id, "shard": shard})
+            await self._evict_previous_owner(shard)
+            return
+        stop = asyncio.Event()
+        task = asyncio.create_task(self._run_shard(shard, epoch, stop), name=f"shard-{shard}")
+        self.owned[shard] = _Owned(epoch, stop, task)
+        self.stats.acquired[shard] += 1
+        log.info("acquired shard", extra={"worker": self.worker_id, "shard": shard, "epoch": epoch})
+
+    async def _evict_previous_owner(self, shard: int) -> None:
+        """The lease row is held by a session of the shard's previous owner
+        (a flush it never finished). If that owner is not live, terminate
+        all of its sessions."""
+        assert self._conn is not None
+        async with self._conn.cursor() as cur:
+            await cur.execute(
+                "SELECT pg_terminate_backend(a.pid) FROM pg_stat_activity a"
+                " JOIN _deltaflow.shard_leases l ON a.application_name = 'deltaflow:' || l.owner"
+                " WHERE l.shard = %s AND l.owner <> %s AND NOT EXISTS ("
+                "   SELECT 1 FROM _deltaflow.workers w WHERE w.worker = l.owner"
+                "   AND w.heartbeat_at > now() - make_interval(secs => %s))",
+                (shard, self.worker_id, self._ttl),
+            )
+            terminated = len(await cur.fetchall())
+        if terminated:
+            self.stats.zombies_terminated += 1
+            log.warning(
+                "terminated sessions of the shard's previous owner",
+                extra={"worker": self.worker_id, "shard": shard, "sessions": terminated},
+            )
+
+    async def _bump_epoch(self, shard: int) -> int:
+        assert self._conn is not None
         async with self._conn.transaction(), self._conn.cursor() as cur:
             # The exclusive row lock this takes waits for any flush still
             # holding the old epoch's share lock, and every later flush of
             # the old owner sees the new epoch.
+            await cur.execute("SET LOCAL lock_timeout = '2s'")
             await cur.execute(
                 "INSERT INTO _deltaflow.shard_leases (shard, owner, epoch, since)"
                 " VALUES (%s, %s, 1, now()) ON CONFLICT (shard) DO UPDATE"
@@ -249,15 +299,10 @@ class ClusterWorker:
             )
             epoch_row = await cur.fetchone()
         assert epoch_row is not None
-        epoch = int(str(epoch_row[0]))
-        stop = asyncio.Event()
-        task = asyncio.create_task(self._run_shard(shard, epoch, stop), name=f"shard-{shard}")
-        self.owned[shard] = _Owned(epoch, stop, task)
-        self.stats.acquired[shard] += 1
-        log.info("acquired shard", extra={"worker": self.worker_id, "shard": shard, "epoch": epoch})
+        return int(str(epoch_row[0]))
 
     async def _evict_stale_holder(self, shard: int) -> None:
-        """Terminate the lock backend of a holder whose heartbeat expired."""
+        """Terminate every session of a lock holder whose heartbeat expired."""
         assert self._conn is not None
         async with self._conn.cursor() as cur:
             await cur.execute(
@@ -269,13 +314,28 @@ class ClusterWorker:
                 (self._ttl, LOCK_CLASS, shard),
             )
             holder = await cur.fetchone()
-            if holder is not None and holder[1] is None:
-                await cur.execute("SELECT pg_terminate_backend(%s)", (holder[0],))
-                self.stats.zombies_terminated += 1
-                log.warning(
-                    "terminated stale holder of shard",
-                    extra={"worker": self.worker_id, "shard": shard, "pid": holder[0]},
-                )
+            if holder is None or holder[1] is not None:
+                return  # free by now, or held by a live worker
+            # All of the stale worker's sessions, not just the lock: a flush
+            # it left open would hold the lease row.
+            await cur.execute(
+                "SELECT pg_terminate_backend(a.pid) FROM pg_stat_activity a"
+                " WHERE a.pid <> pg_backend_pid() AND (a.pid = %s OR (a.application_name LIKE"
+                " 'deltaflow:%%' AND a.application_name ="
+                " (SELECT application_name FROM pg_stat_activity WHERE pid = %s)))",
+                (holder[0], holder[0]),
+            )
+            terminated = len(await cur.fetchall())
+            self.stats.zombies_terminated += 1
+            log.warning(
+                "terminated stale holder of shard",
+                extra={
+                    "worker": self.worker_id,
+                    "shard": shard,
+                    "pid": holder[0],
+                    "sessions": terminated,
+                },
+            )
 
     def _runner(self, shard: int, epoch: int) -> DurableRunner:
         return DurableRunner(
@@ -288,6 +348,7 @@ class ClusterWorker:
             shard=shard,
             fence=(shard, epoch),
             live_name=f"live-{self.worker_id}",
+            application_name=self._app,
             **self._runner_options,
         )
 

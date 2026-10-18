@@ -229,7 +229,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--slot-prefix", default="deltaflow_cluster")
     parser.add_argument("--publication", default="deltaflow_cluster")
     parser.add_argument("--heartbeat", type=float, default=0.5, help="seconds")
-    parser.add_argument("--ttl", type=float, default=3.0, help="seconds without heartbeat = dead")
+    # Must exceed the slowest checkpoint: rocksdict holds the GIL during one,
+    # freezing heartbeats (docs/operations.md). The tests use 3 s on small state.
+    parser.add_argument("--ttl", type=float, default=10.0, help="seconds without heartbeat = dead")
     parser.add_argument("--flush-interval", type=float, default=0.1)
     parser.add_argument("--checkpoint-interval", type=float, default=5.0)
     parser.add_argument("--memory-budget", type=int, default=32, help="MiB per shard")
