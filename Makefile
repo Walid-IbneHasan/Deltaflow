@@ -6,7 +6,7 @@ COMPOSE ?= docker compose
 LOAD_ARGS ?= --txns 2000
 SEED_ARGS ?=
 
-.PHONY: up down nuke psql seed load tail tail-drop differential lint fmt typecheck test check
+.PHONY: up down nuke psql seed load tail tail-drop views differential lint fmt typecheck test check
 
 up:
 	$(COMPOSE) up -d --wait
@@ -35,7 +35,11 @@ tail:
 tail-drop:
 	$(UV) run python -m deltaflow.replication.tail --drop
 
-# Replication replay acceptance test. Random seed unless DELTAFLOW_SEED is set.
+# Maintain two filtered views and print their changes (run `make load` alongside).
+views:
+	$(UV) run python -m deltaflow.devtools.views_demo
+
+# Differential acceptance tests (M1 replay, M2 views). Random seed unless DELTAFLOW_SEED is set.
 differential:
 	$(UV) run pytest tests/differential -v -s
 
