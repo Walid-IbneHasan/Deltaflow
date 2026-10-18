@@ -54,7 +54,9 @@ from deltaflow.runtime.engine import Engine, fingerprint
 from deltaflow.runtime.runner import DEFAULT_MEMORY_BUDGET
 from deltaflow.runtime.snapshot import load_snapshot
 from deltaflow.sinks.postgres import (
+    SHARD_COLUMN,
     PostgresSink,
+    SinkError,
     describe_sink_table,
     ensure_watermark_table,
     flush,
@@ -84,7 +86,14 @@ class DurableRunner:
         checkpoint_interval: float = 10.0,
         status_interval: float = 10.0,
         sink_dsn: str | None = None,
+        shard: int | None = None,
+        fence: tuple[int, int] | None = None,
+        live_name: str = "live",
     ) -> None:
+        """With `shard`, this runner maintains that shard of a sharded
+        registry: its sinks write partial rows to `<table>__shards`, its
+        watermarks are per (view, shard), and every flush is fenced by the
+        lease `fence=(shard, epoch)` (M7, runtime/cluster.py)."""
         for view in registry.views:
             if not isinstance(view.sink, PostgresSink):
                 raise PlanError(
@@ -93,10 +102,13 @@ class DurableRunner:
                 )
         self.registry = registry
         self.sinks = [v.sink for v in registry.views if isinstance(v.sink, PostgresSink)]
-        self._views = {id(v.sink): v.name for v in registry.views}
+        suffix = "" if shard is None else f"@{shard}"
+        self._views = {id(v.sink): f"{v.name}{suffix}" for v in registry.views}
+        self.shard = shard
+        self._fence = fence
         self._dsn = dsn
         self._sink_dsn = sink_dsn or dsn
-        self.state = StateDirectory(state_dir)
+        self.state = StateDirectory(state_dir, live=live_name)
         self.slot = slot
         self.publication = publication
         self._manage_publication = manage_publication
@@ -124,7 +136,7 @@ class DurableRunner:
         await ensure_watermark_table(self._sql)
         shapes = {}
         for sink in self.sinks:
-            shapes[sink.table] = await describe_sink_table(self._sql, sink.table)
+            shapes[sink.table] = await self._shape(sink)
         async with await psycopg.AsyncConnection.connect(self._dsn, autocommit=True) as admin:
             if self._manage_publication:
                 registry_sources = self.registry.sources
@@ -153,6 +165,25 @@ class DurableRunner:
         except BaseException:
             await repl.close()
             raise
+
+    def _write_table(self, sink: PostgresSink) -> str:
+        return sink.table if self.shard is None else f"{sink.table}__shards"
+
+    async def _shape(self, sink: PostgresSink) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """The view's columns and key as the sink table defines them. A
+        sharded partial table leads with the shard column, in its primary
+        key too; that is the runner's business, not the view's."""
+        assert self._sql is not None
+        table = self._write_table(sink)
+        columns, key = await describe_sink_table(self._sql, table)
+        if self.shard is None:
+            return columns, key
+        if not columns or columns[0] != SHARD_COLUMN or not key or key[0] != SHARD_COLUMN:
+            raise SinkError(
+                f"{table}: a partial table must start with a {SHARD_COLUMN!r} column that "
+                "leads its primary key"
+            )
+        return columns[1:], key[1:]
 
     async def _ensure_publication(self, admin: Conn, tables: tuple[str, ...]) -> None:
         async with admin.cursor() as cur:
@@ -195,9 +226,14 @@ class DurableRunner:
             columns, key = shapes[sink.table]
             view = self._views[id(sink)]
             sink.bind(
-                view=view, columns=columns, key=key, watermark=await load_watermark(self._sql, view)
+                view=view,
+                columns=columns,
+                key=key,
+                watermark=await load_watermark(self._sql, view),
+                shard=self.shard,
+                write_table=self._write_table(sink),
             )
-        self.engine = Engine(self.registry, self.store, resume=checkpoint.meta)
+        self.engine = Engine(self.registry, self.store, resume=checkpoint.meta, shard=self.shard)
         self.flushed_lsn = min(s.watermark for s in self.sinks if s.watermark is not None)
         self.checkpointed_lsn = checkpoint.lsn
         self.counters["resumes"] += 1
@@ -218,8 +254,15 @@ class DurableRunner:
         self.store = self.state.open_live(memory_budget=self._memory_budget)
         for sink in self.sinks:
             columns, key = shapes[sink.table]
-            sink.bind(view=self._views[id(sink)], columns=columns, key=key, watermark=None)
-        self.engine = Engine(self.registry, self.store)
+            sink.bind(
+                view=self._views[id(sink)],
+                columns=columns,
+                key=key,
+                watermark=None,
+                shard=self.shard,
+                write_table=self._write_table(sink),
+            )
+        self.engine = Engine(self.registry, self.store, shard=self.shard)
         info = await create_slot(repl, self.slot, export_snapshot=True)
         assert info.snapshot_name is not None
         crash_point("bootstrap:after_slot")
@@ -231,7 +274,7 @@ class DurableRunner:
                 consistent_point=info.consistent_point,
                 publication=self.publication,
             )
-        await flush(self._sql, self.sinks, info.consistent_point, replace=True)
+        await flush(self._sql, self.sinks, info.consistent_point, replace=True, fence=self._fence)
         crash_point("bootstrap:after_sink")
         self.flushed_lsn = info.consistent_point
         await self._checkpoint()
@@ -388,7 +431,7 @@ class DurableRunner:
             return
         started = time.perf_counter()
         before = self.flushed_lsn
-        written = await flush(self._sql, self.sinks, lsn)
+        written = await flush(self._sql, self.sinks, lsn, fence=self._fence)
         self.metrics.flush_seconds.observe(time.perf_counter() - started)
         # End-to-end freshness of every transaction this flush made visible:
         # from its commit on the source to the sink's commit. Replayed

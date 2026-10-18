@@ -7,7 +7,7 @@ LOAD_ARGS ?= --txns 2000
 WORKER_ARGS ?=
 SEED_ARGS ?=
 
-.PHONY: up down nuke psql seed load tail tail-drop views worker worker-reset console bench differential chaos lint fmt typecheck test check
+.PHONY: up down nuke psql seed load tail tail-drop views worker worker-reset cluster-worker cluster-reset console bench differential chaos lint fmt typecheck test check
 
 up:
 	$(COMPOSE) up -d --wait
@@ -47,6 +47,15 @@ worker:
 # Drop the worker's slot and state (it bootstraps again on the next start).
 worker-reset:
 	$(UV) run python -m deltaflow.devtools.worker --reset
+
+# Sharded cluster worker (start several: make cluster-worker ID=w1, ID=w2, ...).
+ID ?= w1
+cluster-worker:
+	$(UV) run python -m deltaflow.devtools.cluster --worker-id $(ID)
+
+# Drop the cluster's slots, partial tables, leases and state.
+cluster-reset:
+	$(UV) run python -m deltaflow.devtools.cluster --reset
 
 # Live console for a running worker (http://localhost:3017; worker on :9187).
 console:

@@ -47,11 +47,15 @@ class CheckpointInfo:
 
 
 class StateDirectory:
-    def __init__(self, root: Path, *, keep: int = 2) -> None:
+    def __init__(self, root: Path, *, keep: int = 2, live: str = "live") -> None:
+        """`live` names the live database directory. Workers that take turns
+        on one shard share its checkpoints but each use their own live
+        directory, so a previous owner that is still alive is never wiped
+        from under itself."""
         self.root = root
         self.keep = keep
         self._checkpoints = root / "checkpoints"
-        self._live = root / "live"
+        self._live = root / live
         self._checkpoints.mkdir(parents=True, exist_ok=True)
 
     def checkpoints(self) -> list[CheckpointInfo]:
@@ -102,7 +106,8 @@ class StateDirectory:
         return info
 
     def reset(self) -> None:
-        shutil.rmtree(self.root, ignore_errors=True)
+        shutil.rmtree(self._checkpoints, ignore_errors=True)
+        shutil.rmtree(self._live, ignore_errors=True)
         self._checkpoints.mkdir(parents=True, exist_ok=True)
 
 

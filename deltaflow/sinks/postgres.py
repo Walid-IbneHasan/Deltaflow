@@ -43,10 +43,15 @@ from deltaflow.state.codec import encode_key
 type Conn = psycopg.AsyncConnection[tuple[Any, ...]]
 
 WATERMARKS = "_deltaflow.watermarks"
+SHARD_COLUMN = "shard"
 
 
 class SinkError(RuntimeError):
     """The view's output cannot be written to its table as declared."""
+
+
+class FencedError(SinkError):
+    """This runner's lease on its shard was taken over; it must not write."""
 
 
 @dataclass(slots=True)
@@ -83,17 +88,46 @@ class PostgresSink(Sink):
         self.columns: tuple[str, ...] = ()
         self.key: tuple[str, ...] = ()
         self.watermark: Lsn | None = None
+        #: sharded (M7): this sink writes one shard's partial rows into
+        #: `write_table`, with the shard number in its first key column
+        self.shard: int | None = None
+        self.write_table = table
         self._frontier = MutableFrontier(Frontier.at(Lsn(0)))
         self._pending: list[Delta[Row]] = []
         self._writes: dict[bytes, _KeyState] = {}
         self._bound = False
 
     def bind(
-        self, *, view: str, columns: tuple[str, ...], key: tuple[str, ...], watermark: Lsn | None
+        self,
+        *,
+        view: str,
+        columns: tuple[str, ...],
+        key: tuple[str, ...],
+        watermark: Lsn | None,
+        shard: int | None = None,
+        write_table: str | None = None,
     ) -> None:
-        """Called by the runner with the table's shape and stored watermark."""
+        """Called by the runner with the table's shape and stored watermark.
+        `columns` and `key` are the view's, without the shard column."""
         self.view, self.columns, self.key, self.watermark = view, columns, key, watermark
+        self.shard = shard
+        self.write_table = write_table or self.table
         self._bound = True
+
+    @property
+    def db_columns(self) -> tuple[str, ...]:
+        return (SHARD_COLUMN, *self.columns) if self.shard is not None else self.columns
+
+    @property
+    def db_key(self) -> tuple[str, ...]:
+        return (SHARD_COLUMN, *self.key) if self.shard is not None else self.key
+
+    def db_values(self, row: Row) -> list[Any]:
+        values = [row[c] for c in self.columns]
+        return [self.shard, *values] if self.shard is not None else values
+
+    def db_key_values(self, key: tuple[Any, ...]) -> tuple[Any, ...]:
+        return (self.shard, *key) if self.shard is not None else key
 
     @property
     def frontier(self) -> Frontier:
@@ -238,7 +272,12 @@ async def load_watermark(conn: Conn, view: str) -> Lsn | None:
 
 
 async def flush(
-    conn: Conn, sinks: Sequence[PostgresSink], lsn: Lsn, *, replace: bool = False
+    conn: Conn,
+    sinks: Sequence[PostgresSink],
+    lsn: Lsn,
+    *,
+    replace: bool = False,
+    fence: tuple[int, int] | None = None,
 ) -> int:
     """Write every sink's net changes and move its watermark to `lsn`, all in
     one transaction. With `replace`, each table is emptied first (the initial
@@ -247,7 +286,13 @@ async def flush(
     Every write is checked against the table. An insert must find no row, an
     update or delete exactly one. A mismatch means the table and the view
     have drifted apart (or the view is not unique on the key): it raises and
-    the transaction rolls back. Returns the number of rows written."""
+    the transaction rolls back. Returns the number of rows written.
+
+    With `fence=(shard, epoch)` the transaction first share-locks that lease
+    row and requires the epoch to still be ours. A takeover bumps the epoch
+    under an exclusive lock on the same row, so it is ordered against every
+    flush: after it commits, an old owner's flush finds the new epoch and
+    raises FencedError. An old owner can never write behind a new one."""
     for sink in sinks:
         if sink.watermark is not None and lsn < sink.watermark:
             raise SinkError(
@@ -255,12 +300,26 @@ async def flush(
             )
     written = 0
     async with conn.transaction(), conn.cursor() as cur:
+        if fence is not None:
+            await cur.execute(
+                "SELECT 1 FROM _deltaflow.shard_leases WHERE shard = %s AND epoch = %s FOR SHARE",
+                fence,
+            )
+            if await cur.fetchone() is None:
+                raise FencedError(f"lease on shard {fence[0]} (epoch {fence[1]}) was taken over")
         for sink in sinks:
             writes = sink.take()
-            table = sql.Identifier(*sink.table.split(".", 1))
-            if replace:
+            table = sql.Identifier(*sink.write_table.split(".", 1))
+            if replace and sink.shard is not None:
+                await cur.execute(
+                    sql.SQL("DELETE FROM {} WHERE {} = %s").format(
+                        table, sql.Identifier(SHARD_COLUMN)
+                    ),
+                    (sink.shard,),
+                )
+            elif replace:
                 await cur.execute(sql.SQL("DELETE FROM {}").format(table))
-            if sink.key:
+            if sink.db_key:
                 await _write_keyed(cur, sink, table, writes)
             else:
                 await _write_single_row(cur, sink, table, writes)
@@ -299,8 +358,8 @@ async def _write_keyed(
     statement is one round trip. RETURNING gives the keys Postgres actually
     touched, matched against what the sink expected (by canonical key, since
     RETURNING order is unspecified)."""
-    keys = sql.SQL(", ").join(map(sql.Identifier, sink.key))
-    nkey = len(sink.key)
+    keys = sql.SQL(", ").join(map(sql.Identifier, sink.db_key))
+    nkey = len(sink.db_key)
     for chunk in _chunks(writes.deletes, nkey):
         values = sql.SQL(", ").join(
             sql.SQL("({})").format(sql.SQL(", ").join(sql.Placeholder() * nkey)) for _ in chunk
@@ -309,25 +368,29 @@ async def _write_keyed(
             sql.SQL("DELETE FROM {} WHERE ({}) IN (VALUES {}) RETURNING {}").format(
                 table, keys, values, keys
             ),
-            [v for key in chunk for v in key],
+            [v for key in chunk for v in sink.db_key_values(key)],
         )
         deleted = {encode_key(r) for r in await cur.fetchall()}
         for key in chunk:
-            if encode_key(key) not in deleted:
+            if encode_key(sink.db_key_values(key)) not in deleted:
                 raise _drift(sink, "delete", key, "no such row")
     if not writes.upserts:
         return
-    expected = {encode_key(r[c] for c in sink.key): True for r in writes.inserts}
-    expected |= {encode_key(r[c] for c in sink.key): False for r in writes.updates}
-    cols = sql.SQL(", ").join(map(sql.Identifier, sink.columns))
-    rest = [c for c in sink.columns if c not in sink.key]
+
+    def db_key(r: Row) -> bytes:
+        return encode_key(sink.db_key_values(tuple(r[c] for c in sink.key)))
+
+    expected = {db_key(r): True for r in writes.inserts}
+    expected |= {db_key(r): False for r in writes.updates}
+    cols = sql.SQL(", ").join(map(sql.Identifier, sink.db_columns))
+    rest = [c for c in sink.db_columns if c not in sink.db_key]
     # With every column in the key, "update" sets a key column to itself, so
     # that RETURNING still reports the row.
-    assigned = rest or [sink.key[0]]
+    assigned = rest or [sink.db_key[0]]
     assignment = sql.SQL(", ").join(
         sql.SQL("{0} = EXCLUDED.{0}").format(sql.Identifier(c)) for c in assigned
     )
-    width = len(sink.columns)
+    width = len(sink.db_columns)
     for rows in _chunks(writes.upserts, width):
         values = sql.SQL(", ").join(
             sql.SQL("({})").format(sql.SQL(", ").join(sql.Placeholder() * width)) for _ in rows
@@ -338,7 +401,7 @@ async def _write_keyed(
                 "INSERT INTO {} ({}) VALUES {} ON CONFLICT ({}) DO UPDATE SET {} "
                 "RETURNING {}, (xmax = 0)"
             ).format(table, cols, values, keys, assignment, keys),
-            [r[c] for r in rows for c in sink.columns],
+            [v for r in rows for v in sink.db_values(r)],
         )
         for returned in await cur.fetchall():
             kb = encode_key(returned[:nkey])
