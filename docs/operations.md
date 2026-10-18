@@ -1,0 +1,161 @@
+# Operating Deltaflow: metrics, logs, console, backpressure, performance
+
+This is written for a reviewer who will push back. Every claim names the test
+or measurement behind it. Measured numbers are in the README and
+[milestones/M6.md](milestones/M6.md).
+
+## Metrics (`GET /metrics`, Prometheus text format)
+
+The durable worker serves them on `--http-port` (default 9187, bound to
+127.0.0.1). Format and server are hand-written
+([decision 0006](decisions/0006-metrics-without-prometheus-client.md)).
+
+| Metric | What it measures |
+|---|---|
+| `deltaflow_end_to_end_lag_seconds` (histogram) | **freshness**: per transaction, source commit → commit of the sink transaction that made it visible |
+| `deltaflow_operator_deltas_total{operator,direction}` | **per-operator throughput**: deltas into and out of each operator (rates via `rate()`) |
+| `deltaflow_operator_seconds_total{operator}` | time spent in each operator |
+| `deltaflow_state_bytes{kind}` | **state size**: SST and blob files on disk, memtables, cache usage |
+| `deltaflow_slot_lag_bytes` | **slot lag**: WAL the server retains for the slot (`pg_current_wal_lsn() − confirmed_flush_lsn`), polled every 2 s on its own connection |
+| `deltaflow_apply_lag_bytes` | WAL received but not yet applied by the engine |
+| `deltaflow_stream_queued` | decoded transactions waiting for the engine; at its bound (32) the reader stops reading: backpressure |
+| `deltaflow_lsn{position}` | engine frontier, sink watermark, checkpoint LSN |
+| `deltaflow_sink_flush_seconds`, `deltaflow_checkpoint_seconds` | durations |
+| `deltaflow_transactions_total`, `deltaflow_source_changes_total`, `deltaflow_sink_rows_written_total`, `deltaflow_runner_events_total{event}` | counts, including bootstraps (a full recompute is never silent) |
+| `deltaflow_resident_memory_bytes` | RSS |
+
+Two notes on how these are measured.
+
+**Freshness spans two clocks.** The commit time comes from the Postgres
+server, the flush time from the worker. The benchmark measures the offset
+between them (0.0 ms on the benchmark machine) and reports it with every
+run. Clock skew between machines would show up directly in this metric.
+
+**Replayed transactions are not freshness samples.** After a resume, the
+transactions at or below the sink watermark were visible long before. The
+first version counted them anyway, with their old commit times, when a
+flush covered both replayed and new transactions. That is fixed: only
+transactions past the previous watermark are observed.
+
+`test_metrics_and_stats_report_the_run` checks, after a real load, that the
+transaction count, freshness observations, per-operator counters,
+checkpoint events, state size and slot lag are all exposed and non-trivial.
+
+## Logs
+
+One JSON object per line on stderr (`--log-format json`, the default), with
+event fields as top-level keys:
+
+    {"ts": "…", "level": "info", "logger": "deltaflow.runtime.durable", "msg": "checkpoint", "lsn": "0/C560DA18", "seconds": 0.063}
+    {"ts": "…", "level": "warning", "logger": "deltaflow.runtime.durable", "msg": "bootstrapping from a fresh snapshot: no state checkpoint", "reason": "no state checkpoint"}
+
+## Console (`console/`, Next.js)
+
+`make console`, then open http://localhost:3017. It polls the worker's
+`GET /api/stats` once a second and shows:
+
+- **the operator graph**: sources, joins, filters, maps, aggregates and
+  sinks, laid out by longest path from a source;
+- **per operator**: deltas in/s and out/s, and how busy it is (share of
+  wall time spent in it). Edges light up when data flows;
+- **runner metrics**: freshness p50/p99, frontier, watermark, checkpoint,
+  apply lag, slot lag, queue depth against its bound, state size, cache
+  against budget, RSS.
+
+`?api=http://host:port` points it at another worker. The rate and layout
+logic is unit-tested with `node --test` (`console/lib/graph.test.ts`).
+CI type-checks and builds it.
+
+## Backpressure under a slow sink
+
+Nothing in the pipeline buffers without bound:
+
+1. a slow flush (the sink cannot commit) blocks the run loop;
+2. the engine stops taking transactions from the stream's queue;
+3. the queue fills to `max_pending`, and the reader stops reading the socket;
+4. TCP flow control stops the walsender.
+
+A separate heartbeat task keeps sending standby status updates, so the
+server does not drop the connection after `wal_sender_timeout`.
+
+`test_a_slow_sink_applies_backpressure_and_survives_wal_sender_timeout`
+lowers `wal_sender_timeout` to 2 s and locks a sink table for 8 s, four
+times the timeout, under load. It checks that:
+
+- the queue reaches exactly its bound (32/32);
+- RSS does not grow;
+- the replication connection survives;
+- after the lock is released everything catches up, and every sink equals
+  its SQL.
+
+Two things found while making that test honest:
+
+- **The first version tested nothing.** `docker-compose.yml` passed
+  `-c wal_sender_timeout=60s`, and command-line settings override
+  `ALTER SYSTEM`, so the timeout was never lowered. The flag is gone, and
+  the test now asserts the setting took effect. With heartbeats disabled it
+  then fails, as it should.
+- **Docker Desktop on Windows breaks the premise.** Its port forwarding
+  stops relaying client → server data while the server → client direction
+  is backed up, so heartbeats never reach the walsender, and the server
+  drops the connection after the timeout. The same stalled consumer run
+  from a Linux container on the compose network kept its connection
+  (`reply_time` kept advancing through the stall). The test therefore runs
+  on Linux (CI) and is skipped on win32, with that reason.
+
+  Consequence for Windows + Docker Desktop: a consumer stalled longer than
+  `wal_sender_timeout` is disconnected. The runner exits, and a restart
+  resumes exactly-once (M5). The runner does not reconnect by itself: run
+  it under a supervisor.
+
+## Performance: what measuring found
+
+`make bench` (`benchmarks/throughput.py`) has two parts.
+
+- **Capacity:** a backlog of transactions commits while the worker is
+  stopped. Its catch-up is then timed, from the moment its endpoint
+  answers until every sink's watermark passes a marker. Nothing waits on
+  the load generator, so this is the engine's ceiling, with sink writes and
+  checkpoints included.
+- **Freshness:** load arrives at fixed fractions of capacity, and the
+  freshness histogram is read afterwards.
+
+Four problems were found by measuring, not by reading code:
+
+1. **Checkpoints queued behind compactions (7.7 s each).** With one RocksDB
+   background job (the M3 memory tuning), the memtable flush every
+   checkpoint needs waited for a running compaction. A catch-up of 400
+   transactions took 37 s, 31 of them in checkpoints. With two background
+   jobs: 3.5 s. The M3 memory test still passes.
+2. **Per-row sink statements cost about 45 ms a batch.** Every
+   `executemany` (psycopg pipeline mode) cost about 45 ms whether it
+   carried 8 rows or 143, while a simple query took 0.36 ms. Flushes took
+   about 366 ms and were 19 of a 26 s catch-up. Now each flush writes one
+   multi-row `INSERT … ON CONFLICT … RETURNING` and one `DELETE … WHERE
+   (key) IN (VALUES …) RETURNING` per sink, and the drift check matches
+   the returned keys. Capacity went from about 420 to about 1,230
+   changes/s on Windows.
+3. **Freshness counted replays** (above).
+4. **Multi-second file I/O stalls on the Windows host.** Some checkpoints
+   took 20–58 s there. RocksDB's own log shows why: a background flush
+   took 31 s to write one 6.7 MB blob file, while the next flush wrote a
+   1.3 MB one in 0.3 s. Raw `write` + `fsync` of 6 MB files from Python
+   took at most 238 ms, idle or under Postgres load, so this is not plain
+   disk contention. On-access antivirus scanning is enabled on that host,
+   and a scan of a file being appended to is the most likely cause; that
+   is not proven (it needs admin-level tracing). The same benchmark in a
+   Linux container on the same machine had 21 checkpoints, the slowest
+   0.118 s.
+
+**One hypothesis was wrong, and is recorded as such.** For a while,
+checkpoints ran in a worker thread (`asyncio.to_thread`) to keep the loop
+responsive. A single A/B run suggested the thread itself was the cause of
+the stalls (57.8 s threaded, 0.37 s direct). A later run showed a 29 s
+stall with a direct call. The slowness had nothing to do with threads. The
+direct call was kept because it is simpler: the engine must not apply
+during a checkpoint anyway.
+
+**What a checkpoint costs everyone else:** the run loop waits for it, so
+freshness of transactions arriving during a checkpoint includes it. On
+Linux that was 0.05–0.12 s every 10 s. On the Windows host, rarely, tens
+of seconds.

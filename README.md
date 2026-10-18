@@ -16,7 +16,8 @@ to the size of the change, not the size of the tables.
 | M3 — RocksDB state with a memory budget, incremental join | done — [notes](docs/milestones/M3.md), [design](docs/join.md) |
 | M4 — group_by with count/sum/min/max (exact under deletes), distinct | done — [notes](docs/milestones/M4.md), [design](docs/aggregates.md) |
 | M5 — exactly-once Postgres sink, checkpointed state, `kill -9` chaos suite | done — [notes](docs/milestones/M5.md), [design](docs/exactly-once.md) |
-| M6–M7 | not started |
+| M6 — metrics, JSON logs, Next.js console, backpressure, measured benchmark | done — [notes](docs/milestones/M6.md), [design](docs/operations.md) |
+| M7 | not started |
 
 Views can filter, map, project, inner-join and aggregate source tables.
 Operator state lives in RocksDB under a memory budget, and checkpoints
@@ -39,6 +40,31 @@ async with Runner(df, dsn, memory_budget=64 << 20) as runner:
     await runner.run()  # sink.result == the view, exactly, as of sink.frontier
 ```
 
+## Benchmark (measured)
+
+`make bench` (method: [`benchmarks/throughput.py`](benchmarks/throughput.py)).
+The workload is the worker's four views: a join + group_by, a join, a
+global aggregate and a distinct, over 1,000 customers and 10,000 orders. It
+writes exactly-once to Postgres sinks and checkpoints every 10 s. The
+machine is an AMD Ryzen 5 5600X (6 cores), 16 GB, Windows 11 with Docker
+Desktop, and PostgreSQL 16.15.
+
+"Sustained changes/second" is the time to catch up a 20,814-change backlog,
+sink writes and checkpoints included. Freshness runs from the source commit
+to the sink commit that made the change visible. Percentiles are histogram
+bucket upper bounds.
+
+| Run | Sustained changes/s | p99 freshness at 25% / 50% / 75% load |
+|---|---|---|
+| Linux container on this machine | **1,603** (438 txn/s) | **≤ 0.15 s / ≤ 0.15 s / ≤ 0.2 s** (386 / 770 / 1,151 changes/s) |
+| Native on the Windows host | **935** (256 txn/s) | ≤ 0.75 s / **≤ 30 s** / ≤ 1.0 s (226 / 449 / 549 changes/s) |
+
+The Windows 50% figure is real. One checkpoint stalled for 27 s, because
+the host took up to 31 s to write a single RocksDB file. On Linux, on the
+same hardware, the slowest checkpoint took 0.118 s. Details, evidence and
+everything else measuring found:
+[docs/milestones/M6.md](docs/milestones/M6.md).
+
 ## Quick start
 
 Requires Docker, [uv](https://docs.astral.sh/uv/) and GNU make.
@@ -50,9 +76,11 @@ make load    # randomized inserts/updates/deletes; prints a replayable seed
 make check   # ruff, mypy --strict, pytest
 make tail    # print the decoded replication stream
 make views   # filtered, join and aggregate views following the stream (run `make load` alongside)
-make worker  # durable worker: four views into analytics.*, survives kill -9
+make worker  # durable worker: four views into analytics.*, survives kill -9; metrics on :9187
+make console # live operator graph and lag: http://localhost:3017
 make differential  # acceptance tests (DELTAFLOW_SEED=N to replay a seed)
 make chaos   # kill -9 the worker during load; sinks must equal a recompute
+make bench   # capacity and freshness benchmark (re-seeds the database)
 ```
 
 Design decisions are in [`docs/decisions/`](docs/decisions/), and per-milestone
