@@ -74,7 +74,7 @@ class Harness:
                     sys.executable, "-m", "deltaflow.devtools.worker",
                     "--dsn", self.dsn, "--state-dir", str(self.state_dir), "--slot", self.slot,
                     "--publication", "deltaflow_chaos", "--memory-budget", "16",
-                    "--flush-interval", "0.05", "--checkpoint-interval", "0.3",
+                    "--flush-interval", "0.05", "--checkpoint-interval", "0.3", "--http-port", "-1",
                 ],
                 stdout=log,
                 stderr=subprocess.STDOUT,

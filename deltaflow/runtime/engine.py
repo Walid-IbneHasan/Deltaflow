@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from typing import Any
@@ -69,6 +70,10 @@ class Engine:
         self._namespace = namespace
         self._chunk_limits = (snapshot_chunk_rows, snapshot_chunk_bytes)
         self._plan = compile_views(registry.views, store, namespace)
+        #: per operator: [deltas in, deltas out, seconds], by id(operator)
+        self.operator_stats: dict[int, list[float]] = {
+            id(op): [0, 0, 0.0] for op in self._plan.operators
+        }
         self._arrangements: dict[str, TableArrangement] = {}
         self._started = False
         self.counters: Counter[str] = Counter()
@@ -120,6 +125,36 @@ class Engine:
     @property
     def frontier(self) -> Frontier:
         return Frontier.meet(*(s.frontier for s in self._plan.sources.values()))
+
+    def graph(self) -> dict[str, Any]:
+        """The operator graph and per-operator counters, JSON-able."""
+        nodes = []
+        for op in self._plan.operators:
+            info = self._plan.nodes[id(op)]
+            d_in, d_out, seconds = self.operator_stats[id(op)]
+            nodes.append(
+                {
+                    "id": info.id,
+                    "kind": info.kind,
+                    "label": info.label,
+                    "inputs": list(info.inputs),
+                    "views": list(info.views),
+                    "deltas_in": d_in,
+                    "deltas_out": d_out,
+                    "seconds": seconds,
+                }
+            )
+        sinks = [
+            {
+                "id": f"{view.name}/sink",
+                "kind": "sink",
+                "label": getattr(view.sink, "table", type(view.sink).__name__),
+                "inputs": [self._plan.nodes[id(node)].id],
+                "views": [view.name],
+            }
+            for view, node in self._plan.outputs
+        ]
+        return {"nodes": [*nodes, *sinks]}
 
     @property
     def arrangements(self) -> dict[str, TableArrangement]:
@@ -203,16 +238,24 @@ class Engine:
         operator first contributes its `initial()` deltas (time 0)."""
         outputs: dict[int, list[Delta[Row]]] = {}
         for op in self._plan.operators:
+            started = time.perf_counter()
+            received = 0
             produced: list[Delta[Row]] = op.initial() if initial else []
             if isinstance(op, Source):
                 if batch := batches.get(op.table):
+                    received = len(batch)
                     produced = op.process(0, consolidate(batch))
                     self.counters["source_deltas"] += len(produced)
             else:
                 for port, inp in enumerate(op.inputs):
                     if upstream := outputs.get(id(inp)):
+                        received += len(upstream)
                         produced.extend(op.process(port, upstream))
             outputs[id(op)] = produced
+            stats = self.operator_stats[id(op)]
+            stats[0] += received
+            stats[1] += len(produced)
+            stats[2] += time.perf_counter() - started
         for view, node in self._plan.outputs:
             if out := outputs.get(id(node)):
                 view.sink.accept(consolidate(out))

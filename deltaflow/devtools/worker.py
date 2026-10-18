@@ -23,7 +23,6 @@ import argparse
 import asyncio
 import contextlib
 import io
-import logging
 import os
 import signal
 import sys
@@ -36,6 +35,8 @@ import psycopg
 from deltaflow import aio
 from deltaflow.config import pg_dsn
 from deltaflow.core import Row
+from deltaflow.observability import logs
+from deltaflow.observability.http import MonitorServer, json_handler
 from deltaflow.planner import Count, Deltaflow, Max, Min, Sum
 from deltaflow.runtime import DurableRunner
 from deltaflow.sinks import PostgresSink
@@ -145,6 +146,22 @@ async def _main(args: argparse.Namespace) -> None:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop.set)
     await runner.start()
+    monitor = None
+    if args.http_port >= 0:
+        monitor = MonitorServer(
+            {
+                "/metrics": lambda: (
+                    "text/plain; version=0.0.4",
+                    runner.collect().expose().encode(),
+                ),
+                "/api/stats": json_handler(runner.stats),
+                "/healthz": lambda: ("text/plain", b"ok\n"),
+            },
+            host=args.http_host,
+            port=args.http_port,
+        )
+        await monitor.start()
+        print(f"metrics on http://{args.http_host}:{monitor.port}/metrics", flush=True)
     how = "resumed" if runner.counters["resumes"] else "bootstrapped"
     print(
         f"worker pid={os.getpid()} {how}; checkpoint {runner.checkpointed_lsn}, "
@@ -154,6 +171,8 @@ async def _main(args: argparse.Namespace) -> None:
     try:
         await runner.run(stop)
     finally:
+        if monitor is not None:
+            await monitor.close()
         await runner.close()
         print(f"stopped cleanly: {dict(runner.counters)}", flush=True)
 
@@ -184,11 +203,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--memory-budget", type=int, default=64, help="MiB")
     parser.add_argument("--flush-interval", type=float, default=0.1, help="seconds")
     parser.add_argument("--checkpoint-interval", type=float, default=5.0, help="seconds")
+    parser.add_argument("--http-host", default="127.0.0.1")
+    parser.add_argument("--http-port", type=int, default=9187, help="-1 disables; 0 picks one")
+    parser.add_argument("--log-format", choices=("json", "text"), default="json")
     parser.add_argument("--reset", action="store_true", help="drop the slot and state, then exit")
     args = parser.parse_args(argv)
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
+    logs.configure(args.log_format)
     if isinstance(sys.stdout, io.TextIOWrapper):
         sys.stdout.reconfigure(errors="backslashreplace")
     with contextlib.suppress(KeyboardInterrupt):

@@ -17,10 +17,9 @@ services:
       - max_replication_slots=16
       - -c
       - max_wal_senders=16
-      # Keep idle replication connections alive long enough to debug; the
-      # reader sends standby status updates well inside this window.
-      - -c
-      - wal_sender_timeout=60s
+      # wal_sender_timeout is left at its default (60s) and not set here:
+      # command-line settings override ALTER SYSTEM, and the backpressure
+      # test lowers it with ALTER SYSTEM.
     ports:
       - "${DELTAFLOW_PG_PORT:-55432}:5432"
     volumes:

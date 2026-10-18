@@ -75,6 +75,21 @@ class ReplicationStream:
     def flushed_lsn(self) -> Lsn:
         return self._flushed
 
+    @property
+    def received_lsn(self) -> Lsn:
+        """Highest WAL position received from the server."""
+        return self._received
+
+    @property
+    def queued(self) -> int:
+        """Events decoded but not yet consumed. At `max_pending` the reader
+        stops reading the socket: backpressure all the way to the walsender."""
+        return self._queue.qsize()
+
+    @property
+    def max_pending(self) -> int:
+        return self._queue.maxsize
+
     async def start(self) -> None:
         options = ["proto_version '1'", f"publication_names '{','.join(self._publications)}'"]
         if self._messages:
