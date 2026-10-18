@@ -119,8 +119,11 @@ class StateStore:
         # Background work allocates outside the cache: compaction readahead,
         # output-file buffers, one set per concurrent job. Measured with the
         # defaults, RocksDB's resident memory reached 3.3x a 16 MiB budget;
-        # with these settings 1.3x (docs/join.md, section 6).
-        opts.set_max_background_jobs(1)
+        # with these settings 1.3x (docs/join.md, section 6). Two jobs, not
+        # one: with a single job a memtable flush (and so every checkpoint)
+        # queued behind a running compaction, and checkpoints took 7.7 s
+        # (docs/milestones/M6.md).
+        opts.set_max_background_jobs(2)
         opts.set_max_subcompactions(1)
         opts.set_compaction_readahead_size(256 << 10)
         opts.set_writable_file_max_buffer_size(256 << 10)

@@ -224,7 +224,7 @@ class DurableRunner:
         await flush(self._sql, self.sinks, info.consistent_point, replace=True)
         crash_point("bootstrap:after_sink")
         self.flushed_lsn = info.consistent_point
-        self._checkpoint()
+        await self._checkpoint()
         self.counters["bootstraps"] += 1
         log.info("bootstrapped slot %s at %s", self.slot, info.consistent_point)
         return info.consistent_point
@@ -261,7 +261,7 @@ class DurableRunner:
                 and self._state_lsn() != self.checkpointed_lsn
                 and now - last_checkpoint >= self._checkpoint_interval
             ):
-                self._checkpoint()
+                await self._checkpoint()
                 last_checkpoint = now
 
     async def _next(self, timeout: float) -> Transaction | None:
@@ -298,7 +298,7 @@ class DurableRunner:
         self.counters["flushes"] += 1
         self.counters["rows_written"] += written
 
-    def _checkpoint(self) -> None:
+    async def _checkpoint(self) -> None:
         """Checkpoint the state at the engine's frontier E. Valid only if the
         sinks are written through E or beyond (E <= W): after a restore, the
         sinks then drop the replay of (E, W] and nothing is applied twice."""
@@ -310,7 +310,10 @@ class DurableRunner:
                 f"checkpoint at {lsn} would be ahead of the sinks ({self.flushed_lsn})"
             )
         crash_point("checkpoint:before")
-        self.state.checkpoint(self.store, lsn, self.engine.metadata())
+        # In a thread, so the stream reader and heartbeats keep running. The
+        # loop awaits it, so the engine applies nothing meanwhile and the
+        # state stays exactly at `lsn`.
+        await asyncio.to_thread(self.state.checkpoint, self.store, lsn, self.engine.metadata())
         self.checkpointed_lsn = lsn
         crash_point("checkpoint:after")
         if self._stream is not None:
@@ -329,7 +332,7 @@ class DurableRunner:
             ):
                 await self._flush()
                 if self._state_lsn() != self.checkpointed_lsn:
-                    self._checkpoint()
+                    await self._checkpoint()
         finally:
             if self._stream is not None:
                 await self._stream.close()
