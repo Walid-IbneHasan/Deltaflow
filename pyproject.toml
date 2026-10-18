@@ -31,6 +31,7 @@ select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF", "ASYNC", "PT", "C4", "PL"
 ignore = [
     "PLR2004", # magic values are fine in tests and protocol code
     "PLR0913", # CLI entry points take many options
+    "ASYNC109", # connect/close timeouts are part of the API, not a smell
 ]
 
 [tool.mypy]
