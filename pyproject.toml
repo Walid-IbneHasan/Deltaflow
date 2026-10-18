@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "psycopg[binary]>=3.2",
+    "rocksdict>=0.3.29",
 ]
 
 [dependency-groups]

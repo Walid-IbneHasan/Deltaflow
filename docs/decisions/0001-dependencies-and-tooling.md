@@ -9,6 +9,7 @@ library or doing without.
 
 | Dependency | Why |
 |---|---|
+| `rocksdict` (M3) | Operator state store with a memory budget. See [0004](0004-state-store-rocksdb.md). |
 | `psycopg[binary]` 3 | Spec requirement. The stdlib has no PostgreSQL client. The `binary` extra ships the C implementation (`psycopg.pq.__impl__ == "binary"`) so no local libpq is needed on Windows or CI. It is used for ordinary SQL connections (seeding, load, and later the sink). The **replication connection does not go through psycopg's decoding**: from M1 the `pgoutput` stream is parsed by hand. |
 
 ## Development only
