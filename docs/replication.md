@@ -79,9 +79,11 @@ Tests: `test_primary_key_update_sends_old_key` and
 `test_replica_identity_full_sends_whole_old_row` (integration), plus
 `test_update_keeps_unchanged_toast_sentinel_and_key_only_old_row` (unit).
 
-**This is the open question for M2.** Retracting a row from a view needs the
-whole old row. M1 delivers exactly what the server sends; how views obtain
-full old rows is decided in M2.
+Retracting a row from a view needs the whole old row. The reader delivers
+exactly what the server sends. Since M2, views get full old rows (and
+unchanged TOAST values) from Deltaflow's own arrangement of each source
+table. See [decision 0003](decisions/0003-source-arrangements.md) and
+[delta-algebra.md](delta-algebra.md) §2.
 
 ## 4. LSNs and acknowledgement (at-least-once)
 
@@ -162,5 +164,6 @@ loader honours the offset either way.
   decoder raises instead of guessing.
 - Schema changes are followed via RELATION messages: later changes decode
   against the new column list. Mapping a view's columns onto a changed table
-  is a planner concern (M2+).
+  is a planner concern. Since M2 a column change on a live source raises
+  `SchemaChangedError`.
 - TLS on the replication connection. See decision 0002.
