@@ -1,10 +1,12 @@
-"""Maintain a filtered view and a join view over the seed tables and print their changes.
+"""Maintain a filtered view, a join view and an aggregate over the seed tables; print changes.
 
     python -m deltaflow.devtools.views_demo [--dsn DSN]
 
 Run `make load` in another terminal and watch the views follow it. Each line
 is one frontier advance, i.e. one committed transaction that changed the
 view: how many rows it added and retracted, and the view's size afterwards.
+For the aggregate (the spec's orders_per_customer), each line is a group's
+new value.
 State is rebuilt on every start (temporary slot, fresh state store), so
 each start re-reads the snapshot.
 """
@@ -21,7 +23,7 @@ from decimal import Decimal
 from deltaflow import aio
 from deltaflow.config import pg_dsn
 from deltaflow.core import Delta, Frontier, Row
-from deltaflow.planner import Deltaflow
+from deltaflow.planner import Count, Deltaflow, Sum
 from deltaflow.runtime import Runner
 from deltaflow.sinks import MemorySink
 
@@ -56,6 +58,27 @@ class _Printer:
         )
 
 
+class _GroupPrinter:
+    """Prints each changed group's new row (and groups that disappear)."""
+
+    def __init__(self, name: str, key: str) -> None:
+        self.name = name
+        self.key = key
+        self.sink = MemorySink(on_change=self)
+        self.live = False
+
+    def __call__(self, frontier: Frontier, batch: list[Delta[Row]]) -> None:
+        if not self.live:
+            return
+        added = {d.row[self.key]: d.row for d in batch if d.diff > 0}
+        gone = {d.row[self.key] for d in batch if d.diff < 0} - added.keys()
+        for key, row in added.items():
+            values = ", ".join(f"{k}={v}" for k, v in row.items() if k != self.key)
+            print(f"[{frontier}] {self.name} {key}: {values}", flush=True)
+        for key in gone:
+            print(f"[{frontier}] {self.name} {key}: (group gone)", flush=True)
+
+
 async def _main(dsn: str) -> None:
     df = Deltaflow()
     big, nl = _Printer("big_open_orders"), _Printer("dutch_big_orders")
@@ -75,6 +98,16 @@ async def _main(dsn: str) -> None:
         .select("orders.id", "customers.name", "amount")
         .sink(nl.sink)
     )
+    per_country = _GroupPrinter("orders_per_customer", "customers.country")
+    (
+        df.view(per_country.name)
+        .source("public.orders")
+        .join("public.customers", on=("customer_id", "id"))
+        .filter(lambda r: r["status"] != "cancelled")
+        .group_by("customers.country")
+        .agg(count=Count(), revenue=Sum("orders.amount"))
+        .sink(per_country.sink)
+    )
     started = time.perf_counter()
     async with Runner(df, dsn, status_interval=2) as runner:
         print(
@@ -82,7 +115,9 @@ async def _main(dsn: str) -> None:
             f"{big.name}={big.sink.result.size()} rows, {nl.name}={nl.sink.result.size()} rows",
             flush=True,
         )
-        big.live = nl.live = True
+        for country in sorted(per_country.sink.rows(), key=lambda r: str(r["customers.country"])):
+            print(f"  {per_country.name} {dict(country)}", flush=True)
+        big.live = nl.live = per_country.live = True
         print("following the stream; Ctrl-C to stop", flush=True)
         await runner.run()
 
