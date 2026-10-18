@@ -4,9 +4,10 @@ COMPOSE ?= docker compose
 # `make load` runs a finite workload by default so it terminates;
 # use LOAD_ARGS="--txns 0" to run until interrupted.
 LOAD_ARGS ?= --txns 2000
+WORKER_ARGS ?=
 SEED_ARGS ?=
 
-.PHONY: up down nuke psql seed load tail tail-drop views differential lint fmt typecheck test check
+.PHONY: up down nuke psql seed load tail tail-drop views worker worker-reset differential chaos lint fmt typecheck test check
 
 up:
 	$(COMPOSE) up -d --wait
@@ -38,6 +39,18 @@ tail-drop:
 # Maintain a filtered, a join and an aggregate view and print their changes (run `make load` alongside).
 views:
 	$(UV) run python -m deltaflow.devtools.views_demo
+
+# Durable, exactly-once worker writing analytics.* (kill it any time; it resumes).
+worker:
+	$(UV) run python -m deltaflow.devtools.worker $(WORKER_ARGS)
+
+# Drop the worker's slot and state (it bootstraps again on the next start).
+worker-reset:
+	$(UV) run python -m deltaflow.devtools.worker --reset
+
+# Chaos suite: kill -9 the worker during load; sinks must equal a recompute.
+chaos:
+	$(UV) run pytest tests/chaos -v -s
 
 # Differential acceptance tests (M1 replay, M2 views). Random seed unless DELTAFLOW_SEED is set.
 differential:

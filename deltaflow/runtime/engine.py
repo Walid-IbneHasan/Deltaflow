@@ -18,12 +18,16 @@ snapshot, and everything after it arrives as a transaction.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from typing import Any
 
 from deltaflow.core import Delta, Frontier, FrontierViolationError, Row, consolidate
+from deltaflow.faults import crash_point
 from deltaflow.operators import Source
-from deltaflow.planner import Deltaflow, PlanError
+from deltaflow.planner import Deltaflow, FilterStep, GroupStep, JoinStep, MapStep, PlanError
 from deltaflow.planner.compile import compile_views
 from deltaflow.replication.changes import (
     RowDelete,
@@ -49,12 +53,17 @@ class Engine:
         namespace: str = "",
         snapshot_chunk_rows: int = 5_000,
         snapshot_chunk_bytes: int = 2 << 20,
+        resume: Mapping[str, Any] | None = None,
     ) -> None:
         """All operator state (arrangements, join indices) goes into `store`.
         `namespace` prefixes every keyspace, so several engines can share one
         store (tests do). Snapshots are pushed through the graph in chunks
         of at most `snapshot_chunk_rows` rows or about `snapshot_chunk_bytes`
-        of row data, so a large table is never in memory as a whole."""
+        of row data, so a large table is never in memory as a whole.
+
+        `resume` is the `metadata()` saved with a state checkpoint, when
+        `store` is that checkpoint restored: the engine continues from it
+        instead of expecting snapshots."""
         registry.freeze()
         self._store = store
         self._namespace = namespace
@@ -63,8 +72,46 @@ class Engine:
         self._arrangements: dict[str, TableArrangement] = {}
         self._started = False
         self.counters: Counter[str] = Counter()
-        # Operators with output before any input (a global aggregate's row).
-        self._step({}, initial=True)
+        self._fingerprint = fingerprint(registry)
+        if resume is not None:
+            self._resume(resume)
+        else:
+            # Operators with output before any input (a global aggregate's row).
+            self._step({}, initial=True)
+
+    def metadata(self) -> dict[str, Any]:
+        """What a checkpoint must record to resume this engine (JSON-able)."""
+        if not self._started or self.frontier.lower is None:
+            raise RuntimeError("metadata is only meaningful for a started, open engine")
+        return {
+            "version": 1,
+            "lsn": int(self.frontier.lower),
+            "fingerprint": self._fingerprint,
+            "arrangements": {
+                table: {
+                    "columns": list(a.schema.columns),
+                    "key": list(a.schema.key),
+                    "count": len(a),
+                }
+                for table, a in self._arrangements.items()
+            },
+        }
+
+    def _resume(self, meta: Mapping[str, Any]) -> None:
+        if meta.get("fingerprint") != self._fingerprint:
+            raise PlanError(
+                "the views changed since the state checkpoint was taken; the state cannot "
+                "be reused (reset it to rebuild from a fresh snapshot)"
+            )
+        for table, info in meta["arrangements"].items():
+            schema = TableSchema(table, tuple(info["columns"]), tuple(info["key"]))
+            self._arrangements[table] = TableArrangement(
+                schema,
+                self._store.keyspace(f"{self._namespace}arr:{table}"),
+                count=int(info["count"]),
+            )
+        self._started = True
+        self.advance(Frontier.at(Lsn(int(meta["lsn"]))))
 
     @property
     def sources(self) -> tuple[str, ...]:
@@ -135,6 +182,7 @@ class Engine:
                 case _:
                     pass  # logical messages carry no row data
         self._step(batches)
+        crash_point("apply:after_state")  # state changed, frontier not yet advanced
         self.counters["transactions"] += 1
         self.advance(Frontier.at(txn.end_lsn))
 
@@ -202,3 +250,35 @@ class SnapshotLoader:
 def _approx_size(row: Row) -> int:
     """Rough bytes held by a row: its strings and byte strings dominate."""
     return 64 + sum(len(v) if isinstance(v, str | bytes) else 16 for v in (row[c] for c in row))
+
+
+def fingerprint(registry: Deltaflow) -> str:
+    """A digest of the views' structure: names, sources, the kind and static
+    parameters of every step, and sinks. A checkpoint is only reused under
+    the same fingerprint. Function *bodies* are not part of it (only their
+    qualified names), so changing what a lambda computes needs a reset."""
+
+    def step(s: object) -> object:
+        match s:
+            case FilterStep():
+                return ["filter", getattr(s.predicate, "__qualname__", repr(s.predicate))]
+            case MapStep():
+                return ["map", getattr(s.fn, "__qualname__", repr(s.fn))]
+            case JoinStep():
+                return ["join", s.table, s.left_on, s.right_on, s.left_prefix, s.right_prefix]
+            case GroupStep():
+                return ["group", s.keys, {k: repr(v) for k, v in s.aggregates.items()}]
+            case _:
+                return [type(s).__name__]
+
+    views = [
+        [
+            v.name,
+            v.source,
+            [step(s) for s in v.steps],
+            type(v.sink).__name__,
+            getattr(v.sink, "table", None),
+        ]
+        for v in registry.views
+    ]
+    return hashlib.sha256(json.dumps(views, sort_keys=True, default=list).encode()).hexdigest()

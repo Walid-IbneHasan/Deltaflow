@@ -61,10 +61,11 @@ type Key = tuple[Any, ...]
 
 
 class TableArrangement:
-    def __init__(self, schema: TableSchema, keyspace: Keyspace) -> None:
+    def __init__(self, schema: TableSchema, keyspace: Keyspace, *, count: int = 0) -> None:
+        """`count` is the number of rows already in `keyspace` (on resume)."""
         self.schema = schema
         self._rows = keyspace
-        self._count = 0
+        self._count = count
         self._checked: Relation | None = None
         self.counters: Counter[str] = Counter()
 

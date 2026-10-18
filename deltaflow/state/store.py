@@ -31,9 +31,11 @@ What the budget does *not* cover is accounted for in docs/join.md:
 
 Durability
 ----------
-None in M3. The WAL is disabled and the directory is wiped on open, because
-state is rebuilt from a fresh snapshot on every start. Making state survive
-a restart, atomically with the sink's watermark, is M5.
+The WAL is disabled: individual writes are never made durable. Durability
+comes from checkpoints taken at transaction boundaries (state/durable.py).
+After a crash, the live database is discarded and the last complete
+checkpoint restored. A half-applied transaction therefore never survives,
+and that is why the WAL would buy nothing.
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ from types import TracebackType
 from rocksdict import (
     BlockBasedOptions,
     Cache,
+    Checkpoint,
     Options,
     Rdict,
     ReadOptions,
@@ -86,14 +89,16 @@ class StoreStats:
 
 
 class StateStore:
-    def __init__(self, path: Path, *, memory_budget: int) -> None:
+    def __init__(self, path: Path, *, memory_budget: int, fresh: bool = True) -> None:
+        """`fresh` wipes `path` first. Otherwise an existing database there
+        (a restored checkpoint, see state/durable.py) is opened as it is."""
         if memory_budget < MIN_BUDGET:
             raise ValueError(f"memory_budget must be at least {MIN_BUDGET} bytes")
         self.path = path
         self.memory_budget = memory_budget
-        if path.exists():
-            shutil.rmtree(path)  # M3 state is never resumed; see module docstring
-        path.mkdir(parents=True)
+        if fresh and path.exists():
+            shutil.rmtree(path)
+        path.mkdir(parents=True, exist_ok=True)
 
         self._cache = Cache(memory_budget)
         table = BlockBasedOptions()
@@ -152,6 +157,11 @@ class StateStore:
             sst_bytes=prop("rocksdb.total-sst-files-size") + prop("rocksdb.total-blob-file-size"),
             sst_files=len(self._db.live_files()),
         )
+
+    def checkpoint_to(self, path: Path) -> None:
+        """A consistent copy of the whole database at `path` (memtables are
+        flushed first; SST and blob files are hard-linked)."""
+        Checkpoint(self._db).create_checkpoint(str(path))
 
     def close(self) -> None:
         self._db.close()
