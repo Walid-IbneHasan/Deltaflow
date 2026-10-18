@@ -147,13 +147,20 @@ Four problems were found by measuring, not by reading code:
    Linux container on the same machine had 21 checkpoints, the slowest
    0.118 s.
 
-**One hypothesis was wrong, and is recorded as such.** For a while,
-checkpoints ran in a worker thread (`asyncio.to_thread`) to keep the loop
-responsive. A single A/B run suggested the thread itself was the cause of
-the stalls (57.8 s threaded, 0.37 s direct). A later run showed a 29 s
-stall with a direct call. The slowness had nothing to do with threads. The
-direct call was kept because it is simpler: the engine must not apply
-during a checkpoint anyway.
+**One hypothesis was wrong, and is recorded as such.** Checkpoints run in
+a worker thread (`asyncio.to_thread`). A single A/B run suggested the thread
+itself caused the stalls (57.8 s threaded, 0.37 s direct), so the call was
+briefly made directly on the event loop. A later run showed a 29 s stall
+with the direct call: the slowness had nothing to do with threads.
+
+The direct call then broke something else. It blocks the loop, and the
+replication heartbeat runs on that loop. In CI (Python 3.14), a slow
+checkpoint stopped the heartbeats for longer than the backpressure test's
+2 s `wal_sender_timeout`, and the server dropped the connection:
+`terminating walsender process due to replication timeout`. The thread is
+back, now for the right reason. The run loop awaits it, so the state
+cannot change during a checkpoint, while the loop stays free for
+heartbeats.
 
 **What a checkpoint costs everyone else:** the run loop waits for it, so
 freshness of transactions arriving during a checkpoint includes it. On

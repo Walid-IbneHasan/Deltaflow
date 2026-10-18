@@ -416,13 +416,15 @@ class DurableRunner:
                 f"checkpoint at {lsn} would be ahead of the sinks ({self.flushed_lsn})"
             )
         crash_point("checkpoint:before")
-        # Directly, on the event loop's thread: the engine must not apply
-        # anything during it anyway, and it usually takes 0.3-0.7 s, far
-        # inside any heartbeat deadline. (On the Windows benchmark machine,
-        # with on-access antivirus scanning, some checkpoints took 20-60 s,
-        # in a worker thread or not; docs/milestones/M6.md.)
+        # In a worker thread, so the event loop stays free and the stream's
+        # heartbeat keeps the replication connection alive however long the
+        # checkpoint takes (a slow disk took over 2 s in CI, and up to 58 s on
+        # the Windows benchmark host; docs/operations.md). The run loop awaits
+        # it, so the engine applies nothing meanwhile and the state stays at
+        # `lsn`.
         started = time.perf_counter()
-        self.state.checkpoint(self.store, lsn, self.engine.metadata())
+        meta = self.engine.metadata()
+        await asyncio.to_thread(self.state.checkpoint, self.store, lsn, meta)
         seconds = time.perf_counter() - started
         self.metrics.checkpoint_seconds.observe(seconds)
         log.info("checkpoint", extra={"lsn": str(lsn), "seconds": round(seconds, 3)})
