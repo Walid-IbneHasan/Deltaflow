@@ -18,8 +18,8 @@ The arrangement is also a consistency check on the stream. An INSERT of an
 existing key, or an UPDATE or DELETE of a missing one, means a change was
 lost or duplicated upstream, so it raises instead of guessing.
 
-M2 keeps the arrangement in a dict, so its size is bounded by memory. M3
-moves it onto the on-disk state backend.
+Rows live in the state store (M3), keyed by the canonical encoding of the
+key columns, so an arrangement may be far larger than memory.
 """
 
 from __future__ import annotations
@@ -33,6 +33,8 @@ from deltaflow.core import Row
 from deltaflow.replication.changes import Row as Values
 from deltaflow.replication.changes import RowDelete, RowInsert, RowUpdate
 from deltaflow.replication.pgoutput import UNCHANGED_TOAST, Relation
+from deltaflow.state.codec import decode_row, encode_key, encode_row
+from deltaflow.state.store import Keyspace
 
 
 class SourceStateError(RuntimeError):
@@ -59,24 +61,25 @@ type Key = tuple[Any, ...]
 
 
 class TableArrangement:
-    def __init__(self, schema: TableSchema) -> None:
+    def __init__(self, schema: TableSchema, keyspace: Keyspace) -> None:
         self.schema = schema
-        self._rows: dict[Key, Row] = {}
+        self._rows = keyspace
+        self._count = 0
         self._checked: Relation | None = None
         self.counters: Counter[str] = Counter()
 
     def __len__(self) -> int:
-        return len(self._rows)
+        return self._count
 
     def rows(self) -> Iterator[Row]:
-        return iter(self._rows.values())
+        return (decode_row(v) for _, v in self._rows.scan())
 
     def load(self, row: Row) -> None:
         """Add a row from the initial snapshot."""
         key = self._key(row)
-        if key in self._rows:
+        if self._get(key) is not None:
             raise SourceStateError(f"{self.schema.table}: duplicate key {key!r} in snapshot")
-        self._rows[key] = row
+        self._put(key, row)
 
     def apply(self, change: RowInsert | RowUpdate | RowDelete) -> list[tuple[Row, int]]:
         """Apply one change; return it as whole-row (row, diff) pairs."""
@@ -93,8 +96,9 @@ class TableArrangement:
                 return [(old, -1)]
 
     def truncate(self) -> list[tuple[Row, int]]:
-        out = [(r, -1) for r in self._rows.values()]
+        out = [(r, -1) for r in self.rows()]
         self._rows.clear()
+        self._count = 0
         return out
 
     def _insert(self, values: Values) -> Row:
@@ -104,9 +108,9 @@ class TableArrangement:
             )
         row = Row(values)
         key = self._key(row)
-        if key in self._rows:
+        if self._get(key) is not None:
             raise SourceStateError(f"{self.schema.table}: insert of existing key {key!r}")
-        self._rows[key] = row
+        self._put(key, row)
         return row
 
     def _update(self, change: RowUpdate) -> list[tuple[Row, int]]:
@@ -127,19 +131,29 @@ class TableArrangement:
         self.counters["unchanged_toast_resolved"] += resolved
         new = Row(values)
         new_key = self._key(new)
-        if new_key != old_key and new_key in self._rows:
-            self._rows[old_key] = old  # leave the arrangement as it was
+        if encode_key(new_key) != encode_key(old_key) and self._get(new_key) is not None:
+            self._put(old_key, old)  # leave the arrangement as it was
             raise SourceStateError(
                 f"{self.schema.table}: update of {old_key!r} moves onto existing key {new_key!r}"
             )
-        self._rows[new_key] = new
+        self._put(new_key, new)
         return [(old, -1), (new, 1)]
 
+    def _get(self, key: Key) -> Row | None:
+        raw = self._rows.get(encode_key(key))
+        return None if raw is None else decode_row(raw)
+
+    def _put(self, key: Key, row: Row) -> None:
+        self._rows.put(encode_key(key), encode_row(row))
+        self._count += 1
+
     def _take(self, key: Key, what: str) -> Row:
-        try:
-            return self._rows.pop(key)
-        except KeyError:
-            raise SourceStateError(f"{self.schema.table}: {what} of unknown key {key!r}") from None
+        row = self._get(key)
+        if row is None:
+            raise SourceStateError(f"{self.schema.table}: {what} of unknown key {key!r}")
+        self._rows.delete(encode_key(key))
+        self._count -= 1
+        return row
 
     def _key(self, values: Values | Row) -> Key:
         key = tuple(values[c] for c in self.schema.key)

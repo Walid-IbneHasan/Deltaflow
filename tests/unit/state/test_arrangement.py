@@ -10,6 +10,7 @@ exactly the row that was there before.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -22,6 +23,7 @@ from deltaflow.replication.changes import RowDelete, RowInsert, RowUpdate
 from deltaflow.replication.lsn import Lsn
 from deltaflow.replication.pgoutput import UNCHANGED_TOAST, Column, Relation
 from deltaflow.state import SchemaChangedError, SourceStateError, TableArrangement, TableSchema
+from deltaflow.state.store import StateStore
 
 SCHEMA = TableSchema("public.t", columns=("id", "a", "bio"), key=("id",))
 LSN = Lsn(0x100)
@@ -40,6 +42,10 @@ def relation(
 
 
 DEFAULT, FULL = relation("d"), relation("f")
+
+
+def fresh(store: StateStore, schema: TableSchema = SCHEMA) -> TableArrangement:
+    return TableArrangement(schema, store.keyspace(f"arr:{uuid.uuid4().hex}"))
 
 
 def row(id_: int, a: object, bio: object) -> dict[str, Any]:
@@ -120,10 +126,10 @@ def execute(  # noqa: PLR0911 - one return per operation kind reads best
 
 @given(st.lists(ops, max_size=60), st.sampled_from(["d", "f"]))
 def test_accumulated_deltas_equal_the_table_after_every_change(
-    script: list[Op], identity: Literal["d", "f"]
+    state_store: StateStore, script: list[Op], identity: Literal["d", "f"]
 ) -> None:
     rel = relation(identity)
-    arr = TableArrangement(SCHEMA)
+    arr = fresh(state_store)
     model: dict[int, dict[str, Any]] = {i: row(i, i, f"bio{i}") for i in range(3)}
     for r in model.values():
         arr.load(Row(r))
@@ -145,27 +151,27 @@ def test_accumulated_deltas_equal_the_table_after_every_change(
         assert len(arr) == len(model)
 
 
-def test_update_resolves_unchanged_toast_from_the_stored_row() -> None:
-    arr = TableArrangement(SCHEMA)
+def test_update_resolves_unchanged_toast_from_the_stored_row(state_store: StateStore) -> None:
+    arr = fresh(state_store)
     arr.load(Row(row(1, 10, "x" * 9000)))
     out = arr.apply(RowUpdate(DEFAULT, LSN, None, None, row(1, 11, UNCHANGED_TOAST)))
     assert out == [(Row(row(1, 10, "x" * 9000)), -1), (Row(row(1, 11, "x" * 9000)), 1)]
     assert arr.counters["unchanged_toast_resolved"] == 1
 
 
-def test_delete_retracts_the_whole_stored_row() -> None:
-    arr = TableArrangement(SCHEMA)
+def test_delete_retracts_the_whole_stored_row(state_store: StateStore) -> None:
+    arr = fresh(state_store)
     arr.load(Row(row(1, 10, "bio")))
     assert arr.apply(RowDelete(DEFAULT, LSN, "key", {"id": 1})) == [(Row(row(1, 10, "bio")), -1)]
     assert len(arr) == 0
 
 
-def test_composite_keys() -> None:
+def test_composite_keys(state_store: StateStore) -> None:
     schema = TableSchema("public.t", columns=("a", "b", "v"), key=("a", "b"))
     rel = Relation(
         1, "public", "t", "d", tuple(Column(c != "v", c, 25, -1) for c in schema.columns)
     )
-    arr = TableArrangement(schema)
+    arr = fresh(state_store, schema)
     arr.load(Row({"a": 1, "b": 1, "v": "x"}))
     arr.load(Row({"a": 1, "b": 2, "v": "y"}))
     out = arr.apply(RowDelete(rel, LSN, "key", {"a": 1, "b": 2}))
@@ -193,25 +199,27 @@ def test_composite_keys() -> None:
         ),
     ],
 )
-def test_changes_that_contradict_the_arrangement_raise(change: Any, message: str) -> None:
+def test_changes_that_contradict_the_arrangement_raise(
+    state_store: StateStore, change: Any, message: str
+) -> None:
     # Each of these means a change was lost, duplicated or misapplied
     # upstream. Carrying on would publish a wrong view, so stop instead.
-    arr = TableArrangement(SCHEMA)
+    arr = fresh(state_store)
     arr.load(Row(row(1, 0, "a")))
     arr.load(Row(row(2, 0, "b")))
     with pytest.raises(SourceStateError, match=message):
         arr.apply(change)
 
 
-def test_duplicate_snapshot_row_raises() -> None:
-    arr = TableArrangement(SCHEMA)
+def test_duplicate_snapshot_row_raises(state_store: StateStore) -> None:
+    arr = fresh(state_store)
     arr.load(Row(row(1, 0, "a")))
     with pytest.raises(SourceStateError, match="duplicate key"):
         arr.load(Row(row(1, 0, "a")))
 
 
-def test_schema_change_raises() -> None:
-    arr = TableArrangement(SCHEMA)
+def test_schema_change_raises(state_store: StateStore) -> None:
+    arr = fresh(state_store)
     widened = relation("d", columns=("id", "a", "bio", "extra"))
     with pytest.raises(
         SchemaChangedError, match=r"columns changed from \(id, a, bio\) to \(id, a, bio, extra\)"

@@ -35,6 +35,8 @@ ignore = [
     "PLR0913", # CLI entry points take many options
     "ASYNC109", # connect/close timeouts are part of the API, not a smell
 ]
+# Math notation in the join/algebra docstrings.
+allowed-confusables = ["×", "−"]
 
 [tool.mypy]
 strict = true

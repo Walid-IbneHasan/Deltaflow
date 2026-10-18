@@ -18,6 +18,7 @@ snapshot, and everything after it arrives as a transaction.
 
 from __future__ import annotations
 
+import itertools
 from collections import Counter
 from collections.abc import Iterable
 
@@ -34,15 +35,31 @@ from deltaflow.replication.changes import (
 )
 from deltaflow.replication.lsn import Lsn
 from deltaflow.state import TableArrangement, TableSchema
+from deltaflow.state.store import StateStore
 
 #: Timestamp of the initial snapshot: before every streamed transaction.
 SNAPSHOT_TIME = Lsn(0)
 
 
 class Engine:
-    def __init__(self, registry: Deltaflow) -> None:
+    def __init__(
+        self,
+        registry: Deltaflow,
+        store: StateStore,
+        *,
+        namespace: str = "",
+        snapshot_chunk: int = 5_000,
+    ) -> None:
+        """All operator state (arrangements, join indices) goes into `store`.
+        `namespace` prefixes every keyspace, so several engines can share one
+        store (tests do). Snapshots are pushed through the graph
+        `snapshot_chunk` rows at a time, so a large table is never in memory
+        as a whole."""
         registry.freeze()
-        self._plan = compile_views(registry.views)
+        self._store = store
+        self._namespace = namespace
+        self._snapshot_chunk = snapshot_chunk
+        self._plan = compile_views(registry.views, store, namespace)
         self._arrangements: dict[str, TableArrangement] = {}
         self._started = False
         self.counters: Counter[str] = Counter()
@@ -65,13 +82,17 @@ class Engine:
             raise PlanError(f"no view reads {schema.table}")
         if self._started:
             raise RuntimeError("snapshots must be installed before start()")
-        arrangement = TableArrangement(schema)
-        deltas = []
-        for row in rows:
-            arrangement.load(row)
-            deltas.append(Delta(row, SNAPSHOT_TIME, 1))
+        if schema.table in self._arrangements:
+            raise RuntimeError(f"snapshot of {schema.table} already installed")
+        arrangement = TableArrangement(
+            schema, self._store.keyspace(f"{self._namespace}arr:{schema.table}")
+        )
         self._arrangements[schema.table] = arrangement
-        self._step({schema.table: deltas})
+        it = iter(rows)
+        while chunk := list(itertools.islice(it, self._snapshot_chunk)):
+            for row in chunk:
+                arrangement.load(row)
+            self._step({schema.table: [Delta(row, SNAPSHOT_TIME, 1) for row in chunk]})
 
     def start(self, consistent_point: Lsn) -> None:
         """All snapshots are installed; they are complete as of `consistent_point`."""

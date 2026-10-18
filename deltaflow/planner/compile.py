@@ -5,8 +5,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from deltaflow.operators import Filter, Map, Operator, Source
-from deltaflow.planner.dsl import FilterStep, MapStep, View
+from deltaflow.operators import Filter, Join, Map, Operator, Source
+from deltaflow.planner.dsl import FilterStep, JoinStep, MapStep, View
+from deltaflow.state.store import StateStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,21 +20,38 @@ class Plan:
     outputs: tuple[tuple[View, Operator], ...]
 
 
-def compile_views(views: Sequence[View]) -> Plan:
+def compile_views(views: Sequence[View], store: StateStore, namespace: str = "") -> Plan:
+    """Operators are listed after their inputs. A join's right-hand source is
+    created where the join first needs it, which keeps that order."""
     sources: dict[str, Source] = {}
     operators: list[Operator] = []
     outputs: list[tuple[View, Operator]] = []
+
+    def source(table: str) -> Source:
+        if table not in sources:
+            sources[table] = Source(table)
+            operators.append(sources[table])
+        return sources[table]
+
     for view in views:
-        if view.source not in sources:
-            sources[view.source] = Source(view.source)
-            operators.append(sources[view.source])
-        node: Operator = sources[view.source]
-        for step in view.steps:
+        node: Operator = source(view.source)
+        for i, step in enumerate(view.steps):
             match step:
                 case FilterStep():
                     node = Filter(node, step.predicate)
                 case MapStep():
                     node = Map(node, step.fn)
+                case JoinStep():
+                    node = Join(
+                        node,
+                        source(step.table),
+                        left_on=step.left_on,
+                        right_on=step.right_on,
+                        left_prefix=step.left_prefix,
+                        right_prefix=step.right_prefix,
+                        store=store,
+                        name=f"{namespace}{view.name}.{i}",
+                    )
             operators.append(node)
         outputs.append((view, node))
     return Plan(sources, tuple(operators), tuple(outputs))

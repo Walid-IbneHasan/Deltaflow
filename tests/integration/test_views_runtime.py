@@ -40,7 +40,26 @@ def bio_digest(r: Row) -> Mapping[str, Any]:
     }
 
 
+def order_with_customer(r: Row) -> Mapping[str, Any]:
+    bio = r["customers.bio"]
+    return {
+        "id": r["orders.id"],
+        "amount": r["amount"],
+        "country": r["country"],
+        "bio_md5": None if bio is None else hashlib.md5(bio.encode()).hexdigest(),
+    }
+
+
 VIEWS: dict[str, tuple[Callable[[Deltaflow, MemorySink], object], str]] = {
+    "orders_with_customer": (
+        lambda df, s: df.view("orders_with_customer")
+        .source("public.orders")
+        .join("public.customers", on=("customer_id", "id"))
+        .map(order_with_customer)
+        .sink(s),
+        "SELECT o.id, o.amount, c.country, md5(c.bio) AS bio_md5"
+        " FROM orders o JOIN customers c ON c.id = o.customer_id",
+    ),
     "big_orders": (
         lambda df, s: (
             df.view("big_orders")
@@ -82,6 +101,8 @@ async def _each_change_kind(dsn: str, *, full_identity: bool) -> None:
             statements = [
                 ("INSERT INTO orders VALUES (5000, 1, 'paid', 4321.00, NULL, now())", ()),
                 ("UPDATE orders SET amount = amount + 2000 WHERE id = 5000", ()),
+                ("UPDATE orders SET customer_id = 2 WHERE id = 5000", ()),  # join key moves
+                ("UPDATE customers SET country = 'JP' WHERE id = 2", ()),  # fans out to orders
                 # Leaves the out-of-line bio of customer 2 untouched: the
                 # stream carries the placeholder, the view must keep the bio.
                 ("UPDATE customers SET name = 'Renamed' WHERE id = 2", ()),

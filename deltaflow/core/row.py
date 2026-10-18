@@ -14,6 +14,9 @@ class Row(Mapping[str, Any]):
     unsupported column type (an array arrives as `list`, jsonb as `dict`)
     fails loudly at the source instead of somewhere inside an operator.
 
+    Columns of a joined row are qualified (`orders.status`); `row["status"]`
+    finds it as long as exactly one column has that unqualified name.
+
     Rows are immutable for a second reason too: the source arrangement hands
     its stored rows to user functions. A function that mutated its input
     would silently corrupt the state that later retractions are computed
@@ -37,7 +40,19 @@ class Row(Mapping[str, Any]):
             ) from None
 
     def __getitem__(self, key: str) -> Any:
-        return self._values[key]
+        try:
+            return self._values[key]
+        except KeyError:
+            if "." in key:
+                raise
+        # Joined rows have qualified names ("orders.status"). An unqualified
+        # name resolves to the one column it qualifies, if exactly one does.
+        matches = [k for k in self._values if k.endswith("." + key)]
+        if len(matches) == 1:
+            return self._values[matches[0]]
+        if matches:
+            raise KeyError(f"{key!r} is ambiguous: {', '.join(matches)}")
+        raise KeyError(key)
 
     def __iter__(self) -> Iterator[str]:
         return iter(self._values)

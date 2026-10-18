@@ -1,14 +1,18 @@
 """Connect an engine to Postgres: publication, slot, snapshot, stream.
 
-M2 state lives in memory, so every start is a fresh start. The runner
-creates a *temporary* slot that exports a snapshot, loads the snapshot, and
-streams from the slot's consistent point. The slot disappears with the
-connection. Resuming from a durable watermark instead is M5.
+State is not resumable before M5, so every start is a fresh start. The
+runner opens an empty state store and creates a *temporary* slot that
+exports a snapshot. It loads the snapshot, then streams from the slot's
+consistent point. The slot disappears with the connection. Resuming from a
+durable watermark instead is M5.
 """
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 import uuid
+from pathlib import Path
 from types import TracebackType
 
 import psycopg
@@ -20,6 +24,9 @@ from deltaflow.replication.stream import ReplicationStream
 from deltaflow.replication.wire import ReplicationConnection
 from deltaflow.runtime.engine import Engine
 from deltaflow.runtime.snapshot import load_snapshot
+from deltaflow.state.store import StateStore
+
+DEFAULT_MEMORY_BUDGET = 256 << 20
 
 
 class Runner:
@@ -31,11 +38,23 @@ class Runner:
         publication: str = "deltaflow_views",
         manage_publication: bool = True,
         status_interval: float = 10.0,
+        state_dir: Path | None = None,
+        memory_budget: int = DEFAULT_MEMORY_BUDGET,
     ) -> None:
         """With `manage_publication` the runner (re)creates `publication` to
         cover exactly the views' sources. Otherwise it must already exist,
-        and it is checked."""
-        self.engine = Engine(registry)
+        and it is checked.
+
+        Operator state goes to a RocksDB store in `state_dir` (wiped first),
+        or in a temporary directory removed on close. Its memory is bounded
+        by `memory_budget` bytes."""
+        self._temp_dir: Path | None = None
+        if state_dir is None:
+            self._temp_dir = Path(tempfile.mkdtemp(prefix="deltaflow-"))
+            state_dir = self._temp_dir / "state"
+        self.store = StateStore(state_dir, memory_budget=memory_budget)
+        self._store_open = True
+        self.engine = Engine(registry, self.store)
         self._dsn = dsn
         self.publication = publication
         self._manage_publication = manage_publication
@@ -92,6 +111,12 @@ class Runner:
         if self._stream is not None:
             await self._stream.close()
             self._stream = None
+        if self._store_open:
+            self.store.close()
+            self._store_open = False
+        if self._temp_dir is not None:
+            shutil.rmtree(self._temp_dir, ignore_errors=True)
+            self._temp_dir = None
 
     async def __aenter__(self) -> Runner:
         await self.start()

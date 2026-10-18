@@ -7,17 +7,21 @@ Registration checks everything that can be checked without a database:
 shape, names and callables. Source tables are checked against the catalog
 when the engine starts, before any change is consumed (runtime.snapshot).
 
-The DSL only offers operators that exist and are maintained incrementally.
-In M2 that is source, filter, map and select. There is no `join` or
-`group_by` method that raises "not implemented"; they appear with the
-milestones that implement them.
+The DSL only offers operators that exist and are maintained incrementally:
+source, filter, map, select (M2) and inner join (M3). There is no
+`group_by` method that raises "not implemented"; it appears with the
+milestone that implements it (M4).
+
+After a join, columns are qualified by table name (`orders.amount`,
+`customers.country`). An unqualified name still works wherever it is
+unambiguous (see `core.Row`).
 """
 
 from __future__ import annotations
 
 import inspect
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -43,7 +47,17 @@ class MapStep:
     fn: MapFunction
 
 
-type Step = FilterStep | MapStep
+@dataclass(frozen=True, slots=True)
+class JoinStep:
+    table: str
+    left_on: tuple[str, ...]
+    right_on: tuple[str, ...]
+    #: None when the left rows are already qualified by an earlier join
+    left_prefix: str | None
+    right_prefix: str
+
+
+type Step = FilterStep | MapStep | JoinStep
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +66,11 @@ class View:
     source: str
     steps: tuple[Step, ...]
     sink: Sink
+
+    @property
+    def sources(self) -> tuple[str, ...]:
+        joined = (s.table for s in self.steps if isinstance(s, JoinStep))
+        return (self.source, *joined)
 
 
 class Deltaflow:
@@ -68,7 +87,7 @@ class Deltaflow:
     @property
     def sources(self) -> tuple[str, ...]:
         """Distinct source tables, in order of first use."""
-        return tuple(dict.fromkeys(v.source for v in self._views.values()))
+        return tuple(dict.fromkeys(t for v in self._views.values() for t in v.sources))
 
     def view(self, name: str) -> ViewBuilder:
         self._check_open()
@@ -102,6 +121,7 @@ class ViewBuilder:
         self._name = name
         self._source: str | None = None
         self._steps: list[Step] = []
+        self._prefixes: list[str] = []
         self._done = False
 
     def source(self, table: str) -> ViewBuilder:
@@ -114,6 +134,7 @@ class ViewBuilder:
                 "(an unqualified name would depend on search_path)"
             )
         self._source = table
+        self._prefixes = [_relname(table)]
         return self
 
     def filter(self, predicate: Predicate) -> ViewBuilder:
@@ -130,6 +151,47 @@ class ViewBuilder:
         if not columns:
             raise PlanError("select needs at least one column")
         return self.map(_Select(columns))
+
+    def join(
+        self,
+        table: str,
+        *,
+        on: tuple[str, str] | Sequence[tuple[str, str]],
+        how: str = "inner",
+    ) -> ViewBuilder:
+        """Inner equi-join with source table `table`: `on=("customer_id", "id")`
+        or a list of such pairs for a composite key (left column, right column)."""
+        self._check_usable()
+        if self._source is None:
+            raise PlanError(f"view {self._name!r}: call .source(table) before .join()")
+        if how != "inner":
+            raise PlanError(
+                f"only inner joins are maintained incrementally so far; "
+                f"how={how!r} is not supported"
+            )
+        if not _TABLE_NAME.fullmatch(table):
+            raise PlanError(
+                f"join table {table!r} must be schema-qualified, e.g. 'public.customers'"
+            )
+        pairs = _pairs(on)
+        prefix = _relname(table)
+        if prefix in self._prefixes:
+            raise PlanError(
+                f"join with {table}: a table with the same name ({prefix}) is already in this "
+                "view; self-joins and same-named tables are not supported yet"
+            )
+        left_prefix = self._prefixes[0] if len(self._prefixes) == 1 else None
+        self._steps.append(
+            JoinStep(
+                table,
+                tuple(left for left, _ in pairs),
+                tuple(right for _, right in pairs),
+                left_prefix,
+                prefix,
+            )
+        )
+        self._prefixes.append(prefix)
+        return self
 
     def sink(self, sink: Sink) -> View:
         self._check_usable()
@@ -151,6 +213,25 @@ class ViewBuilder:
     def _check_usable(self) -> None:
         if self._done:
             raise PlanError(f"view {self._name!r} is already registered; start a new .view()")
+
+
+def _relname(table: str) -> str:
+    return table.split(".", 1)[1]
+
+
+def _pairs(on: object) -> list[tuple[str, str]]:
+    candidates = [on] if isinstance(on, tuple) else on
+    if isinstance(candidates, list | tuple) and candidates:
+        pairs = list(candidates)
+        if all(
+            isinstance(p, tuple) and len(p) == 2 and all(isinstance(c, str) and c for c in p)
+            for p in pairs
+        ):
+            return pairs
+    raise PlanError(
+        f"join on={on!r}: expected pairs of column names, e.g. ('customer_id', 'id') "
+        "or [('a', 'x'), ('b', 'y')]"
+    )
 
 
 class _Select:

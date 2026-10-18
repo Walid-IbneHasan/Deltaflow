@@ -4,6 +4,7 @@ transaction."""
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
@@ -27,6 +28,7 @@ from deltaflow.replication.pgoutput import UNCHANGED_TOAST, Column, Message, Rel
 from deltaflow.runtime import Engine
 from deltaflow.sinks import MemorySink, NegativeMultiplicityError
 from deltaflow.state import TableSchema
+from deltaflow.state.store import StateStore
 
 T = Relation(
     1,
@@ -83,12 +85,14 @@ VIEWS: dict[
 }
 
 
-def build(initial: list[dict[str, Any]]) -> tuple[Engine, dict[str, MemorySink]]:
+def build(
+    state_store: StateStore, initial: list[dict[str, Any]]
+) -> tuple[Engine, dict[str, MemorySink]]:
     df = Deltaflow()
     sinks = {name: MemorySink() for name in VIEWS}
     for name, (register, _) in VIEWS.items():
         register(df, sinks[name])
-    engine = Engine(df)
+    engine = Engine(df, state_store, namespace=uuid.uuid4().hex)
     engine.install(T_SCHEMA, [Row(r) for r in initial])
     engine.start(CONSISTENT_POINT)
     return engine, sinks
@@ -103,11 +107,11 @@ def check(
         assert sinks[name].result == expected(rows), name
 
 
-def test_snapshot_is_visible_once_the_engine_starts() -> None:
+def test_snapshot_is_visible_once_the_engine_starts(state_store: StateStore) -> None:
     df = Deltaflow()
     sink = MemorySink()
     df.view("positive").source("public.t").filter(a_positive).sink(sink)
-    engine = Engine(df)
+    engine = Engine(df, state_store, namespace=uuid.uuid4().hex)
     engine.install(
         T_SCHEMA, [Row({"id": 1, "a": 5, "bio": "x"}), Row({"id": 2, "a": -1, "bio": None})]
     )
@@ -131,10 +135,10 @@ ops = st.lists(
 
 @given(st.lists(ops, max_size=25))
 def test_views_match_the_model_after_every_transaction(
-    script: list[list[tuple[str, int, int | None]]],
+    state_store: StateStore, script: list[list[tuple[str, int, int | None]]]
 ) -> None:
     model = {i: {"id": i, "a": i - 2, "bio": f"bio{i}"} for i in range(5)}
-    engine, sinks = build(list(model.values()))
+    engine, sinks = build(state_store, list(model.values()))
     check(sinks, model, Frontier.at(CONSISTENT_POINT))
     next_id = 100
     for n, ops_ in enumerate(script, start=1):
@@ -173,39 +177,41 @@ def test_views_match_the_model_after_every_transaction(
         check(sinks, model, Frontier.at(t.end_lsn))
 
 
-def test_a_transaction_behind_the_frontier_is_rejected() -> None:
-    engine, _ = build([])
+def test_a_transaction_behind_the_frontier_is_rejected(state_store: StateStore) -> None:
+    engine, _ = build(state_store, [])
     engine.apply(txn(2))
     with pytest.raises(FrontierViolationError, match="behind the frontier"):
         engine.apply(txn(1, RowInsert(T, Lsn(0), {"id": 1, "a": 1, "bio": None})))
 
 
-def test_apply_before_snapshot_is_rejected() -> None:
+def test_apply_before_snapshot_is_rejected(state_store: StateStore) -> None:
     df = Deltaflow()
     df.view("v").source("public.t").sink(MemorySink())
-    engine = Engine(df)
+    engine = Engine(df, state_store, namespace=uuid.uuid4().hex)
     with pytest.raises(RuntimeError, match=r"snapshot of public\.t not installed"):
         engine.start(CONSISTENT_POINT)
     with pytest.raises(RuntimeError, match="not started"):
         engine.apply(txn(1))
 
 
-def test_installing_an_unknown_table_is_rejected() -> None:
+def test_installing_an_unknown_table_is_rejected(state_store: StateStore) -> None:
     df = Deltaflow()
     df.view("v").source("public.t").sink(MemorySink())
     with pytest.raises(PlanError, match=r"no view reads public.other"):
-        Engine(df).install(TableSchema("public.other", ("id",), ("id",)), [])
+        Engine(df, state_store, namespace=uuid.uuid4().hex).install(
+            TableSchema("public.other", ("id",), ("id",)), []
+        )
 
 
-def test_the_engine_freezes_its_registry() -> None:
+def test_the_engine_freezes_its_registry(state_store: StateStore) -> None:
     df = Deltaflow()
     df.view("v").source("public.t").sink(MemorySink())
-    Engine(df)
+    Engine(df, state_store, namespace=uuid.uuid4().hex)
     with pytest.raises(PlanError, match="frozen"):
         df.view("w")
 
 
-def test_a_non_deterministic_map_is_caught_not_published() -> None:
+def test_a_non_deterministic_map_is_caught_not_published(state_store: StateStore) -> None:
     calls = iter(range(10**6))
 
     def tag(r: Row) -> Mapping[str, Any]:
@@ -213,7 +219,7 @@ def test_a_non_deterministic_map_is_caught_not_published() -> None:
 
     df = Deltaflow()
     df.view("v").source("public.t").map(tag).sink(MemorySink())
-    engine = Engine(df)
+    engine = Engine(df, state_store, namespace=uuid.uuid4().hex)
     engine.install(T_SCHEMA, [Row({"id": 1, "a": 1, "bio": None})])
     engine.start(CONSISTENT_POINT)
     with pytest.raises(NegativeMultiplicityError):
