@@ -69,3 +69,20 @@ def test_a_fresh_store_starts_empty(tmp_path: Path) -> None:
 def test_budget_must_be_sane(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="at least"):
         StateStore(tmp_path / "s", memory_budget=1000)
+
+
+def test_first_and_last_of_a_prefix(tmp_path: Path) -> None:
+    with StateStore(tmp_path / "s", memory_budget=8 * MB) as store:
+        ks, other = store.keyspace("k"), store.keyspace("l")
+        assert ks.first(b"g1") is None
+        assert ks.last(b"g1") is None
+        for key in (b"g0\x05", b"g1\x01", b"g1\x07", b"g1\xff\xff", b"g2\x00"):
+            ks.put(key, key)
+        other.put(b"", b"next keyspace")
+        assert ks.first(b"g1") == (b"g1\x01", b"g1\x01")
+        assert ks.last(b"g1") == (b"g1\xff\xff", b"g1\xff\xff")
+        assert ks.last(b"g2") == (b"g2\x00", b"g2\x00")  # not the next keyspace's entry
+        assert ks.first(b"") == (b"g0\x05", b"g0\x05")
+        assert ks.last(b"") == (b"g2\x00", b"g2\x00")
+        ks.delete(b"g1\xff\xff")
+        assert ks.last(b"g1") == (b"g1\x07", b"g1\x07")

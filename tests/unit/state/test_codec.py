@@ -18,7 +18,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from deltaflow.core import Row
-from deltaflow.state.codec import decode_row, encode_key, encode_row, encode_row_key
+from deltaflow.state.codec import decode_row, encode_key, encode_ordered, encode_row, encode_row_key
 
 numbers = st.one_of(
     st.integers(-(10**30), 10**30),
@@ -126,3 +126,53 @@ def test_uuid_and_bytes_like() -> None:
     u = uuid.uuid4()
     assert encode_key((u,)) == encode_key((uuid.UUID(str(u)),))
     assert encode_key((memoryview(b"ab"),)) == encode_key((b"ab",))
+
+
+# --- order-preserving encoding (min/max state) -------------------------------
+
+ordered_numbers = st.one_of(
+    st.integers(-(10**30), 10**30),
+    st.decimals(allow_nan=False, places=None, min_value=-(10**8), max_value=10**8),
+    st.floats(allow_nan=False),
+)
+same_type_pairs = st.one_of(
+    st.tuples(ordered_numbers, ordered_numbers),
+    st.tuples(st.text(max_size=6), st.text(max_size=6)),
+    st.tuples(st.binary(max_size=6), st.binary(max_size=6)),
+    st.tuples(instants, instants),
+    st.tuples(st.datetimes(), st.datetimes()),
+    st.tuples(st.dates(), st.dates()),
+    st.tuples(st.times(), st.times()),
+    st.tuples(st.timedeltas(), st.timedeltas()),
+    st.tuples(st.uuids(), st.uuids()),
+)
+
+
+@given(same_type_pairs)
+def test_ordered_encoding_preserves_order_and_equality(pair: tuple[Any, Any]) -> None:
+    a, b = pair
+    ea, eb = encode_ordered(a), encode_ordered(b)
+    assert (ea < eb) == (a < b)
+    assert (ea == eb) == (a == b)
+
+
+@given(st.lists(ordered_numbers, min_size=1, max_size=20))
+def test_sorting_by_encoding_sorts_numbers(xs: list[Any]) -> None:
+    by_bytes = sorted(xs, key=encode_ordered)
+    assert [Decimal(x) for x in by_bytes] == sorted(Decimal(x) for x in xs)
+
+
+def test_ordered_encoding_examples() -> None:
+    xs = [
+        Decimal("-Infinity"), Decimal("-100"), Decimal("-1.23"), Decimal("-1.2"), -1,
+        Decimal("-0.001"), 0, Decimal("0.001"), 1, Decimal("1.2"), Decimal("1.23"), 100,
+        Decimal("Infinity"),
+    ]  # fmt: skip
+    assert sorted(xs, key=encode_ordered) == xs
+    assert encode_ordered(Decimal("1.50")) == encode_ordered(1.5) == encode_ordered(Decimal("1.5"))
+    # Code-point order, which is what Postgres's "C" collation gives for UTF-8.
+    assert sorted(["b", "B", "a", "é", "z"], key=encode_ordered) == ["B", "a", "b", "z", "é"]
+    with pytest.raises(TypeError):
+        encode_ordered(float("nan"))
+    with pytest.raises(TypeError):
+        encode_ordered(None)

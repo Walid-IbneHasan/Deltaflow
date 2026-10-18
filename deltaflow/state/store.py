@@ -207,6 +207,29 @@ class Keyspace:
             yield key[cut:], it.value()
             it.next()
 
+    def first(self, prefix: bytes = b"") -> tuple[bytes, bytes] | None:
+        """The entry with the smallest key starting with `prefix`."""
+        return next(self.scan(prefix), None)
+
+    def last(self, prefix: bytes = b"") -> tuple[bytes, bytes] | None:
+        """The entry with the largest key starting with `prefix`."""
+        full = self._prefix + prefix
+        it = self._db.iter()
+        upper = _successor(full)
+        if upper is None:
+            it.seek_to_last()
+        else:
+            it.seek_for_prev(upper)  # last key <= upper; upper itself is outside the prefix
+            if it.valid() and not it.key().startswith(full):
+                it.prev()
+        if not it.valid():
+            return None
+        key = it.key()
+        assert isinstance(key, bytes)
+        if not key.startswith(full):
+            return None
+        return key[len(self._prefix) :], it.value()
+
     def clear(self) -> None:
         upper = _successor(self._prefix)
         assert upper is not None  # the prefix starts with a length byte < 0xff

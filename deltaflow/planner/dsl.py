@@ -8,9 +8,8 @@ shape, names and callables. Source tables are checked against the catalog
 when the engine starts, before any change is consumed (runtime.snapshot).
 
 The DSL only offers operators that exist and are maintained incrementally:
-source, filter, map, select (M2) and inner join (M3). There is no
-`group_by` method that raises "not implemented"; it appears with the
-milestone that implements it (M4).
+source, filter, map, select (M2), inner join (M3), and group_by/agg
+and distinct (M4).
 
 After a join, columns are qualified by table name (`orders.amount`,
 `customers.country`). An unqualified name still works wherever it is
@@ -26,7 +25,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from deltaflow.core import Row
-from deltaflow.operators import MapFunction, Predicate
+from deltaflow.operators import Aggregate, Count, MapFunction, Max, Min, Predicate, Sum
 from deltaflow.sinks import Sink
 
 _VIEW_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}")
@@ -57,7 +56,19 @@ class JoinStep:
     right_prefix: str
 
 
-type Step = FilterStep | MapStep | JoinStep
+@dataclass(frozen=True, slots=True)
+class GroupStep:
+    #: empty for a global aggregate (exactly one output row, as in SQL)
+    keys: tuple[str, ...]
+    aggregates: dict[str, Aggregate]
+
+
+@dataclass(frozen=True, slots=True)
+class DistinctStep:
+    pass
+
+
+type Step = FilterStep | MapStep | JoinStep | GroupStep | DistinctStep
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +133,7 @@ class ViewBuilder:
         self._source: str | None = None
         self._steps: list[Step] = []
         self._prefixes: list[str] = []
+        self._aggregated = False
         self._done = False
 
     def source(self, table: str) -> ViewBuilder:
@@ -173,6 +185,10 @@ class ViewBuilder:
             raise PlanError(
                 f"join table {table!r} must be schema-qualified, e.g. 'public.customers'"
             )
+        if self._aggregated:
+            raise PlanError(
+                "a join after an aggregation (group_by, agg, distinct) is not supported"
+            )
         pairs = _pairs(on)
         prefix = _relname(table)
         if prefix in self._prefixes:
@@ -191,6 +207,50 @@ class ViewBuilder:
             )
         )
         self._prefixes.append(prefix)
+        return self
+
+    def group_by(self, *columns: str) -> GroupedBuilder:
+        """`.group_by("customers.country").agg(n=Count(), revenue=Sum("amount"))`.
+        Output rows hold the group columns (named as given) and the aggregates."""
+        self._check_usable()
+        if self._source is None:
+            raise PlanError(f"view {self._name!r}: call .source(table) before .group_by()")
+        if not columns or not all(isinstance(c, str) and c for c in columns):
+            raise PlanError(
+                "group_by needs at least one column name (use .agg() for a global aggregate)"
+            )
+        if len(set(columns)) != len(columns):
+            raise PlanError(f"group_by lists a column more than once: {columns!r}")
+        return GroupedBuilder(self, tuple(columns))
+
+    def agg(self, **aggregates: Aggregate) -> ViewBuilder:
+        """A global aggregate over all rows: one output row, even over none."""
+        if not aggregates:
+            raise PlanError("agg needs at least one aggregate, e.g. agg(n=Count())")
+        return self._aggregate((), aggregates)
+
+    def distinct(self) -> ViewBuilder:
+        self._check_usable()
+        if self._source is None:
+            raise PlanError(f"view {self._name!r}: call .source(table) before .distinct()")
+        self._steps.append(DistinctStep())
+        self._aggregated = True
+        return self
+
+    def _aggregate(self, keys: tuple[str, ...], aggregates: dict[str, Aggregate]) -> ViewBuilder:
+        self._check_usable()
+        if self._source is None:
+            raise PlanError(f"view {self._name!r}: call .source(table) before .agg()")
+        for name, agg in aggregates.items():
+            if not isinstance(agg, Count | Sum | Min | Max):
+                raise PlanError(
+                    f"aggregate {name}={agg!r}: expected Count, Sum, Min or Max "
+                    "(other aggregates are not maintained incrementally yet)"
+                )
+            if name in keys:
+                raise PlanError(f"aggregate name {name!r} collides with a group_by column")
+        self._steps.append(GroupStep(keys, dict(aggregates)))
+        self._aggregated = True
         return self
 
     def sink(self, sink: Sink) -> View:
@@ -213,6 +273,18 @@ class ViewBuilder:
     def _check_usable(self) -> None:
         if self._done:
             raise PlanError(f"view {self._name!r} is already registered; start a new .view()")
+
+
+class GroupedBuilder:
+    """Returned by group_by: say which aggregates to compute."""
+
+    def __init__(self, builder: ViewBuilder, keys: tuple[str, ...]) -> None:
+        self._builder = builder
+        self._keys = keys
+
+    def agg(self, **aggregates: Aggregate) -> ViewBuilder:
+        """Zero aggregates is allowed: the distinct groups themselves."""
+        return self._builder._aggregate(self._keys, aggregates)
 
 
 def _relname(table: str) -> str:

@@ -120,3 +120,61 @@ def encode_row(row: Row) -> bytes:
 
 def decode_row(data: bytes) -> Row:
     return Row(pickle.loads(data))
+
+
+# --- order-preserving encoding ------------------------------------------------
+#
+# For min/max state: within one type, byte order equals value order, and
+# bytes are equal exactly when values are equal. Numbers of every type share
+# one order (1 < Decimal("1.5") < 2.0), as in Python and SQL. Strings sort by
+# code point, i.e. UTF-8 byte order: Postgres's "C" collation, not a locale's.
+
+_OFFSET64 = 1 << 63
+_OFFSET128 = 1 << 127
+
+
+def _u64(n: int) -> bytes:
+    return (n + _OFFSET64).to_bytes(8, "big")
+
+
+def _ordered_number(value: int | float | Decimal) -> bytes:
+    d = Decimal(value)
+    if d.is_nan():
+        raise TypeError(f"NaN ({value!r}) has no place in an ordering")
+    if d.is_infinite():
+        return b"N\x00" if d < 0 else b"N\x04"
+    sign, digit_tuple, exp = d.as_tuple()
+    assert isinstance(exp, int)
+    digits = "".join(map(str, digit_tuple)).lstrip("0")
+    stripped = digits.rstrip("0")
+    if not stripped:
+        return b"N\x02"
+    # value = 0.<stripped> x 10^adjusted; the terminator makes "12" < "123".
+    adjusted = exp + len(digits)
+    body = _u64(adjusted) + stripped.encode() + b"\x00"
+    if sign:  # negative: reverse the order of the positive encoding
+        return b"N\x01" + bytes(255 - b for b in body)
+    return b"N\x03" + body
+
+
+def encode_ordered(value: Any) -> bytes:  # noqa: PLR0911 - ordered type dispatch
+    if isinstance(value, int | float | Decimal):  # bool is an int: False < True
+        return _ordered_number(value)
+    if isinstance(value, str):
+        return b"S" + value.encode("utf-8", "surrogatepass")
+    if isinstance(value, datetime):
+        if value.utcoffset() is not None:
+            return b"Z" + _u64((value - _EPOCH_UTC) // _MICRO)
+        return b"L" + _u64((value - _EPOCH_NAIVE) // _MICRO)
+    if isinstance(value, date):
+        return b"A" + _u64(value.toordinal())
+    if isinstance(value, time) and value.utcoffset() is None:
+        micros = ((value.hour * 60 + value.minute) * 60 + value.second) * 10**6
+        return b"H" + _u64(micros + value.microsecond)
+    if isinstance(value, timedelta):
+        return b"T" + ((value // _MICRO) + _OFFSET128).to_bytes(16, "big")
+    if isinstance(value, bytes | bytearray | memoryview):
+        return b"B" + bytes(value)
+    if isinstance(value, uuid.UUID):
+        return b"U" + value.bytes
+    raise TypeError(f"a value of type {type(value).__name__} ({value!r:.60}) cannot be ordered")

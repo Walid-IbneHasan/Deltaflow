@@ -31,6 +31,11 @@ class Operator(ABC):
     def process(self, port: int, batch: Sequence[Delta[Row]]) -> list[Delta[Row]]:
         """Deltas produced in response to `batch` arriving on input `port`."""
 
+    def initial(self) -> list[Delta[Row]]:
+        """Deltas the operator produces before any input, at time 0. Only a
+        global aggregate has any: SQL gives it a row even over no rows."""
+        return []
+
 
 class Source(Operator):
     """Entry point for one source table's deltas; owns its frontier."""

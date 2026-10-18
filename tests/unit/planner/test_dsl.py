@@ -6,7 +6,17 @@ from __future__ import annotations
 import pytest
 
 from deltaflow.core import Row
-from deltaflow.planner import Deltaflow, JoinStep, MapStep, PlanError
+from deltaflow.planner import (
+    Count,
+    Deltaflow,
+    DistinctStep,
+    GroupStep,
+    JoinStep,
+    MapStep,
+    Max,
+    PlanError,
+    Sum,
+)
 from deltaflow.sinks import MemorySink
 
 
@@ -160,3 +170,58 @@ def test_malformed_joins_are_rejected(build: object, message: str) -> None:
     builder = Deltaflow().view("v").source("public.orders")
     with pytest.raises(PlanError, match=message):
         build(builder)  # type: ignore[operator]
+
+
+def test_group_by_agg_and_distinct_steps() -> None:
+    df = Deltaflow()
+    view = (
+        df.view("orders_per_customer")
+        .source("public.orders")
+        .join("public.customers", on=("customer_id", "id"))
+        .filter(lambda r: r["status"] != "cancelled")
+        .group_by("customers.country")
+        .agg(count=Count(), revenue=Sum("orders.amount"))
+        .sink(MemorySink())
+    )
+    group = view.steps[2]
+    assert isinstance(group, GroupStep)
+    assert group.keys == ("customers.country",)
+    assert group.aggregates == {"count": Count(), "revenue": Sum("orders.amount")}
+    distinct = df.view("d").source("public.t").select("a").distinct().sink(MemorySink())
+    assert isinstance(distinct.steps[-1], DistinctStep)
+    total = df.view("total").source("public.t").agg(n=Count(), hi=Max("v")).sink(MemorySink())
+    assert isinstance(total.steps[0], GroupStep)
+    assert total.steps[0].keys == ()
+
+
+@pytest.mark.parametrize(
+    ("build", "message"),
+    [
+        (lambda b: b.group_by(), "at least one column"),
+        (lambda b: b.group_by("a", "a"), "more than once"),
+        (lambda b: b.group_by("a").agg(a=Count()), "collides with a group_by column"),
+        (lambda b: b.group_by("a").agg(n="count"), "Count, Sum, Min or Max"),
+        (lambda b: b.agg(), "at least one aggregate"),
+        (lambda b: b.agg(n=Count()).join("public.c", on=("a", "b")), "after an aggregation"),
+        (lambda b: b.distinct().join("public.c", on=("a", "b")), "after an aggregation"),
+    ],
+)
+def test_malformed_aggregations_are_rejected(build: object, message: str) -> None:
+    builder = Deltaflow().view("v").source("public.orders")
+    with pytest.raises(PlanError, match=message):
+        build(builder)  # type: ignore[operator]
+
+
+def test_aggregations_after_aggregations_are_allowed() -> None:
+    # e.g. how many countries have each order count
+    df = Deltaflow()
+    view = (
+        df.view("v")
+        .source("public.orders")
+        .group_by("country")
+        .agg(n=Count())
+        .group_by("n")
+        .agg(countries=Count())
+        .sink(MemorySink())
+    )
+    assert len(view.steps) == 2

@@ -16,7 +16,7 @@ import pytest
 from deltaflow.aio import run
 from deltaflow.core import Frontier, Row
 from deltaflow.devtools.seed import seed_database
-from deltaflow.planner import Deltaflow
+from deltaflow.planner import Count, Deltaflow, Max, Min, Sum
 from deltaflow.runtime import Runner, UnsupportedSourceError, describe_table
 from deltaflow.sinks import MemorySink
 from deltaflow.state import TableSchema
@@ -51,6 +51,19 @@ def order_with_customer(r: Row) -> Mapping[str, Any]:
 
 
 VIEWS: dict[str, tuple[Callable[[Deltaflow, MemorySink], object], str]] = {
+    "per_country": (
+        lambda df, s: (
+            df.view("per_country")
+            .source("public.orders")
+            .join("public.customers", on=("customer_id", "id"))
+            .group_by("customers.country")
+            .agg(n=Count(), revenue=Sum("amount"), lo=Min("amount"), hi=Max("amount"))
+            .sink(s)
+        ),
+        'SELECT c.country AS "customers.country", count(*) AS n, sum(o.amount) AS revenue,'
+        " min(o.amount) AS lo, max(o.amount) AS hi"
+        " FROM orders o JOIN customers c ON c.id = o.customer_id GROUP BY c.country",
+    ),
     "orders_with_customer": (
         lambda df, s: (
             df.view("orders_with_customer")

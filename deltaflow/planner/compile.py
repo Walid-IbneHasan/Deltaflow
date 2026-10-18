@@ -5,8 +5,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from deltaflow.operators import Filter, Join, Map, Operator, Source
-from deltaflow.planner.dsl import FilterStep, JoinStep, MapStep, View
+from deltaflow.operators import Distinct, Filter, GroupBy, Join, Map, Operator, Source
+from deltaflow.planner.dsl import DistinctStep, FilterStep, GroupStep, JoinStep, MapStep, View
 from deltaflow.state.store import StateStore
 
 
@@ -52,6 +52,16 @@ def compile_views(views: Sequence[View], store: StateStore, namespace: str = "")
                         store=store,
                         name=f"{namespace}{view.name}.{i}",
                     )
+                case GroupStep():
+                    node = GroupBy(
+                        node,
+                        keys=step.keys,
+                        aggregates=step.aggregates,
+                        store=store,
+                        name=f"{namespace}{view.name}.{i}",
+                    )
+                case DistinctStep():
+                    node = Distinct(node, store=store, name=f"{namespace}{view.name}.{i}")
             operators.append(node)
         outputs.append((view, node))
     return Plan(sources, tuple(operators), tuple(outputs))

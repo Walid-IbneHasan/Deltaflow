@@ -63,6 +63,8 @@ class Engine:
         self._arrangements: dict[str, TableArrangement] = {}
         self._started = False
         self.counters: Counter[str] = Counter()
+        # Operators with output before any input (a global aggregate's row).
+        self._step({}, initial=True)
 
     @property
     def sources(self) -> tuple[str, ...]:
@@ -148,10 +150,12 @@ class Engine:
             arrangement.load(row)
         self._step({arrangement.schema.table: [Delta(row, SNAPSHOT_TIME, 1) for row in chunk]})
 
-    def _step(self, batches: dict[str, list[Delta[Row]]]) -> None:
+    def _step(self, batches: dict[str, list[Delta[Row]]], *, initial: bool = False) -> None:
+        """Push one batch per source through the graph. With `initial`, each
+        operator first contributes its `initial()` deltas (time 0)."""
         outputs: dict[int, list[Delta[Row]]] = {}
         for op in self._plan.operators:
-            produced: list[Delta[Row]] = []
+            produced: list[Delta[Row]] = op.initial() if initial else []
             if isinstance(op, Source):
                 if batch := batches.get(op.table):
                     produced = op.process(0, consolidate(batch))
