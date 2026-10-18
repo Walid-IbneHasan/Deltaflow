@@ -52,11 +52,13 @@ def order_with_customer(r: Row) -> Mapping[str, Any]:
 
 VIEWS: dict[str, tuple[Callable[[Deltaflow, MemorySink], object], str]] = {
     "orders_with_customer": (
-        lambda df, s: df.view("orders_with_customer")
-        .source("public.orders")
-        .join("public.customers", on=("customer_id", "id"))
-        .map(order_with_customer)
-        .sink(s),
+        lambda df, s: (
+            df.view("orders_with_customer")
+            .source("public.orders")
+            .join("public.customers", on=("customer_id", "id"))
+            .map(order_with_customer)
+            .sink(s)
+        ),
         "SELECT o.id, o.amount, c.country, md5(c.bio) AS bio_md5"
         " FROM orders o JOIN customers c ON c.id = o.customer_id",
     ),

@@ -6,7 +6,8 @@ RocksDB's memory goes mainly to three places:
 
 * the block cache, holding uncompressed data blocks read from SST files;
 * memtables, holding recent writes not yet flushed;
-* index and filter blocks of open SST files.
+* index and filter blocks of open SST files;
+* buffers for background flushes and compactions, which bypass the cache.
 
 All three are tied to one LRU cache of `memory_budget` bytes:
 
@@ -14,7 +15,9 @@ All three are tied to one LRU cache of `memory_budget` bytes:
 * memtable memory is charged to it through a WriteBufferManager, whose
   limit is a quarter of the budget;
 * index and filter blocks are cached in it (`cache_index_and_filter_blocks`)
-  rather than held per open file.
+  rather than held per open file;
+* background work is limited to one job with small buffers, and large
+  values live in blob files so compaction does not rewrite them.
 
 Once the cache is full, the least recently used blocks are evicted, and
 memtables flush to SST files on disk. State beyond the budget lives in those
@@ -77,7 +80,7 @@ class StoreStats:
     #: memtable reservations
     cache_usage: int
     memtable_bytes: int
-    #: live data on disk
+    #: data on disk: SST files plus blob files
     sst_bytes: int
     sst_files: int
 
@@ -108,6 +111,21 @@ class StateStore:
         opts.set_write_buffer_size(max(memtables // 2, 64 << 10))
         opts.set_max_write_buffer_number(2)
         opts.set_max_open_files(512)
+        # Background work allocates outside the cache: compaction readahead,
+        # output-file buffers, one set per concurrent job. Measured with the
+        # defaults, RocksDB's resident memory reached 3.3x a 16 MiB budget;
+        # with these settings 1.3x (docs/join.md, section 6).
+        opts.set_max_background_jobs(1)
+        opts.set_max_subcompactions(1)
+        opts.set_compaction_readahead_size(256 << 10)
+        opts.set_writable_file_max_buffer_size(256 << 10)
+        opts.set_target_file_size_base(8 << 20)
+        # Values of 4 KiB and up (out-of-line TOAST values, mostly) go to blob
+        # files, so compaction rewrites small pointers rather than the values.
+        # Garbage collection reclaims blobs of overwritten and deleted values.
+        opts.set_enable_blob_files(True)
+        opts.set_min_blob_size(4 << 10)
+        opts.set_enable_blob_gc(True)
         self._db = Rdict(str(path), opts)
         write = WriteOptions()
         # rocksdict's stub declares disable_wal as a method; at runtime it is
@@ -131,7 +149,7 @@ class StateStore:
             memory_budget=self.memory_budget,
             cache_usage=self._cache.get_usage(),
             memtable_bytes=prop("rocksdb.cur-size-all-mem-tables"),
-            sst_bytes=prop("rocksdb.total-sst-files-size"),
+            sst_bytes=prop("rocksdb.total-sst-files-size") + prop("rocksdb.total-blob-file-size"),
             sst_files=len(self._db.live_files()),
         )
 

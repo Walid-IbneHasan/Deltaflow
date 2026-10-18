@@ -18,7 +18,6 @@ snapshot, and everything after it arrives as a transaction.
 
 from __future__ import annotations
 
-import itertools
 from collections import Counter
 from collections.abc import Iterable
 
@@ -48,17 +47,18 @@ class Engine:
         store: StateStore,
         *,
         namespace: str = "",
-        snapshot_chunk: int = 5_000,
+        snapshot_chunk_rows: int = 5_000,
+        snapshot_chunk_bytes: int = 2 << 20,
     ) -> None:
         """All operator state (arrangements, join indices) goes into `store`.
         `namespace` prefixes every keyspace, so several engines can share one
-        store (tests do). Snapshots are pushed through the graph
-        `snapshot_chunk` rows at a time, so a large table is never in memory
-        as a whole."""
+        store (tests do). Snapshots are pushed through the graph in chunks
+        of at most `snapshot_chunk_rows` rows or about `snapshot_chunk_bytes`
+        of row data, so a large table is never in memory as a whole."""
         registry.freeze()
         self._store = store
         self._namespace = namespace
-        self._snapshot_chunk = snapshot_chunk
+        self._chunk_limits = (snapshot_chunk_rows, snapshot_chunk_bytes)
         self._plan = compile_views(registry.views, store, namespace)
         self._arrangements: dict[str, TableArrangement] = {}
         self._started = False
@@ -78,6 +78,13 @@ class Engine:
 
     def install(self, schema: TableSchema, rows: Iterable[Row]) -> None:
         """Load one source table's snapshot."""
+        loader = self.begin_install(schema)
+        for row in rows:
+            loader.add(row)
+        loader.finish()
+
+    def begin_install(self, schema: TableSchema) -> SnapshotLoader:
+        """Load one source table's snapshot row by row (for async readers)."""
         if schema.table not in self._plan.sources:
             raise PlanError(f"no view reads {schema.table}")
         if self._started:
@@ -88,11 +95,7 @@ class Engine:
             schema, self._store.keyspace(f"{self._namespace}arr:{schema.table}")
         )
         self._arrangements[schema.table] = arrangement
-        it = iter(rows)
-        while chunk := list(itertools.islice(it, self._snapshot_chunk)):
-            for row in chunk:
-                arrangement.load(row)
-            self._step({schema.table: [Delta(row, SNAPSHOT_TIME, 1) for row in chunk]})
+        return SnapshotLoader(self, arrangement, *self._chunk_limits)
 
     def start(self, consistent_point: Lsn) -> None:
         """All snapshots are installed; they are complete as of `consistent_point`."""
@@ -139,6 +142,12 @@ class Engine:
         for view, node in self._plan.outputs:
             view.sink.advance(node.frontier)
 
+    def _install_chunk(self, arrangement: TableArrangement, chunk: list[Row]) -> None:
+        self.counters["snapshot_chunks"] += 1
+        for row in chunk:
+            arrangement.load(row)
+        self._step({arrangement.schema.table: [Delta(row, SNAPSHOT_TIME, 1) for row in chunk]})
+
     def _step(self, batches: dict[str, list[Delta[Row]]]) -> None:
         outputs: dict[int, list[Delta[Row]]] = {}
         for op in self._plan.operators:
@@ -155,3 +164,37 @@ class Engine:
         for view, node in self._plan.outputs:
             if out := outputs.get(id(node)):
                 view.sink.accept(consolidate(out))
+
+
+class SnapshotLoader:
+    """Buffers snapshot rows and pushes them through the engine in chunks."""
+
+    def __init__(
+        self, engine: Engine, arrangement: TableArrangement, max_rows: int, max_bytes: int
+    ) -> None:
+        self._engine = engine
+        self._arrangement = arrangement
+        self._max_rows = max_rows
+        self._max_bytes = max_bytes
+        self._chunk: list[Row] = []
+        self._bytes = 0
+
+    def add(self, row: Row) -> None:
+        self._chunk.append(row)
+        self._bytes += _approx_size(row)
+        if len(self._chunk) >= self._max_rows or self._bytes >= self._max_bytes:
+            self._flush()
+
+    def finish(self) -> None:
+        self._flush()
+
+    def _flush(self) -> None:
+        if self._chunk:
+            self._engine._install_chunk(self._arrangement, self._chunk)
+        self._chunk = []
+        self._bytes = 0
+
+
+def _approx_size(row: Row) -> int:
+    """Rough bytes held by a row: its strings and byte strings dominate."""
+    return 64 + sum(len(v) if isinstance(v, str | bytes) else 16 for v in (row[c] for c in row))

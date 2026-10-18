@@ -33,20 +33,18 @@ import psycopg
 
 from deltaflow.aio import run
 from deltaflow.core import Delta, Frontier, Row
-from deltaflow.devtools.loadgen import LoadStats, ModelDivergedError, load_state, run_load
+from deltaflow.devtools.loadgen import LoadStats, load_state, run_load
 from deltaflow.devtools.seed import seed_database
 from deltaflow.devtools.workload import TOAST_VALUE_MIN_LEN, OpKind, Workload
 from deltaflow.planner import Deltaflow
-from deltaflow.replication.changes import Transaction
-from deltaflow.replication.pgoutput import Message
 from deltaflow.runtime import Runner
 from deltaflow.sinks import MemorySink
 from deltaflow.sinks.memory import OnChange
+from tests.differential.lockstep import MARKER, execute, until_marker
 from tests.sql_oracle import first_difference, query_multiset
 
 LOCKSTEP_TXNS = 1_000
 BURST_TXNS = 600
-MARKER = "deltaflow.test"
 TIMEOUT_S = 900
 
 type Sql = psycopg.AsyncConnection[tuple[Any, ...]]
@@ -229,9 +227,9 @@ async def _scenario(dsn: str, seed: int) -> Report:
 
         # Phase 1: lockstep, compare after every transaction.
         for i in range(LOCKSTEP_TXNS):
-            committed = await _execute(sql, workload, report.load, marker=str(i))
+            committed = await execute(sql, workload, report.load, marker=str(i))
             if committed:
-                txn = await _until_marker(runner, str(i))
+                txn = await until_marker(runner, str(i))
                 await compare(sql, Frontier.at(txn.end_lsn), f"after transaction #{i}")
             else:
                 await compare(sql, runner.engine.frontier, f"after rolled-back #{i}")
@@ -242,7 +240,7 @@ async def _scenario(dsn: str, seed: int) -> Report:
                 await run_load(conn, workload, txns=BURST_TXNS, stats=report.load)
                 await conn.execute("SELECT pg_logical_emit_message(true, %s, 'end')", (MARKER,))
 
-        _, last = await asyncio.gather(load(), _until_marker(runner, "end"))
+        _, last = await asyncio.gather(load(), until_marker(runner, "end"))
         await compare(sql, Frontier.at(last.end_lsn), "after the concurrent burst")
 
         assert await load_state(sql) == workload.state, f"database != workload model; {context}"
@@ -250,33 +248,3 @@ async def _scenario(dsn: str, seed: int) -> Report:
         for arrangement in runner.engine.arrangements.values():
             report.counters.update(arrangement.counters)
     return report
-
-
-async def _execute(sql: Sql, workload: Workload, stats: LoadStats, *, marker: str) -> bool:
-    """Run the workload's next transaction; committed ones end with a
-    numbered marker message, so the consumer can tell when it has seen it."""
-    txn = workload.next_transaction()
-    async with sql.transaction(force_rollback=not txn.commit), sql.cursor() as cur:
-        for stmt in txn.statements:
-            await cur.execute(stmt.sql, stmt.params)
-            if cur.rowcount != stmt.expected_rowcount:
-                raise ModelDivergedError(f"{stmt.kind} affected {cur.rowcount} rows: {stmt.sql}")
-            stats.statements[stmt.kind] += 1
-        await cur.execute("SELECT pg_logical_emit_message(true, %s, %s)", (MARKER, marker))
-    if txn.commit:
-        stats.committed += 1
-    else:
-        stats.rolled_back += 1
-    return txn.commit
-
-
-async def _until_marker(runner: Runner, content: str) -> Transaction:
-    expected = content.encode()
-    while True:
-        txn = await runner.next_transaction()
-        for change in txn.changes:
-            if isinstance(change, Message) and change.prefix == MARKER:
-                if change.content == expected:
-                    return txn
-                if content != "end":
-                    raise AssertionError(f"marker {change.content!r} while waiting for {content}")

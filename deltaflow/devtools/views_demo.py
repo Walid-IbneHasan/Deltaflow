@@ -1,12 +1,12 @@
-"""Maintain two filtered views over the seed tables and print their changes.
+"""Maintain a filtered view and a join view over the seed tables and print their changes.
 
     python -m deltaflow.devtools.views_demo [--dsn DSN]
 
 Run `make load` in another terminal and watch the views follow it. Each line
 is one frontier advance, i.e. one committed transaction that changed the
 view: how many rows it added and retracted, and the view's size afterwards.
-State is in memory and the slot is temporary, so each start re-reads the
-snapshot.
+State is rebuilt on every start (temporary slot, fresh state store), so
+each start re-reads the snapshot.
 """
 
 from __future__ import annotations
@@ -58,11 +58,23 @@ class _Printer:
 
 async def _main(dsn: str) -> None:
     df = Deltaflow()
-    big, nl = _Printer("big_open_orders"), _Printer("dutch_customers")
-    df.view(big.name).source("public.orders").filter(big_open_order).select(
-        "id", "customer_id", "amount"
-    ).sink(big.sink)
-    df.view(nl.name).source("public.customers").filter(dutch).select("id", "name").sink(nl.sink)
+    big, nl = _Printer("big_open_orders"), _Printer("dutch_big_orders")
+    (
+        df.view(big.name)
+        .source("public.orders")
+        .filter(big_open_order)
+        .select("id", "customer_id", "amount")
+        .sink(big.sink)
+    )
+    (
+        df.view(nl.name)
+        .source("public.orders")
+        .filter(big_open_order)
+        .join("public.customers", on=("customer_id", "id"))
+        .filter(dutch)
+        .select("orders.id", "customers.name", "amount")
+        .sink(nl.sink)
+    )
     started = time.perf_counter()
     async with Runner(df, dsn, status_interval=2) as runner:
         print(

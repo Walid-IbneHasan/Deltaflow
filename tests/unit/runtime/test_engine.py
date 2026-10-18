@@ -224,3 +224,27 @@ def test_a_non_deterministic_map_is_caught_not_published(state_store: StateStore
     engine.start(CONSISTENT_POINT)
     with pytest.raises(NegativeMultiplicityError):
         engine.apply(txn(1, RowUpdate(T, Lsn(0), None, None, {"id": 1, "a": 2, "bio": None})))
+
+
+@pytest.mark.parametrize(
+    ("max_rows", "max_bytes", "chunks"),
+    [(1000, 1 << 20, 1), (3, 1 << 20, 4), (1000, 300, 5)],  # 10 rows of ~150 bytes
+)
+def test_snapshots_are_pushed_in_bounded_chunks(
+    state_store: StateStore, max_rows: int, max_bytes: int, chunks: int
+) -> None:
+    df = Deltaflow()
+    sink = MemorySink()
+    df.view("v").source("public.t").filter(a_positive).sink(sink)
+    engine = Engine(
+        df,
+        state_store,
+        namespace=uuid.uuid4().hex,
+        snapshot_chunk_rows=max_rows,
+        snapshot_chunk_bytes=max_bytes,
+    )
+    rows = [Row({"id": i, "a": i, "bio": "x" * 80}) for i in range(10)]
+    engine.install(T_SCHEMA, rows)
+    engine.start(CONSISTENT_POINT)
+    assert engine.counters["snapshot_chunks"] == chunks
+    assert sink.result == Multiset.of(r for r in rows if a_positive(r))

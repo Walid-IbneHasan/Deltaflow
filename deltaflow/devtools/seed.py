@@ -13,14 +13,16 @@ import psycopg
 
 from deltaflow import aio
 from deltaflow.config import pg_dsn
-from deltaflow.devtools.workload import TableState, initial_state
+from deltaflow.devtools.workload import TableState, WorkloadConfig, initial_state
 
 SCHEMA_SQL = files("deltaflow.devtools").joinpath("schema.sql").read_text(encoding="utf-8")
 
 
-async def seed_database(dsn: str, seed: int, customers: int, orders: int) -> TableState:
+async def seed_database(
+    dsn: str, seed: int, customers: int, orders: int, config: WorkloadConfig | None = None
+) -> TableState:
     """Drop and recreate the tables, load them, and return what was loaded."""
-    state = initial_state(seed=seed, customers=customers, orders=orders)
+    state = initial_state(seed=seed, customers=customers, orders=orders, config=config)
     async with await psycopg.AsyncConnection.connect(dsn) as conn:
         async with conn.transaction():
             await conn.execute(SCHEMA_SQL)

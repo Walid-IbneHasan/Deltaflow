@@ -164,12 +164,14 @@ class RowFactory:
         return Order(id_, customer_id, self.status(), self.amount(), self.note(), self.created_at())
 
 
-def initial_state(seed: int, customers: int, orders: int) -> TableState:
+def initial_state(
+    seed: int, customers: int, orders: int, config: WorkloadConfig | None = None
+) -> TableState:
     """Seed contents: ids 1..n, every order owned by a random customer."""
     if orders and not customers:
         raise ValueError("orders need at least one customer")
     rng = random.Random(seed)
-    rows = RowFactory(rng, WorkloadConfig())
+    rows = RowFactory(rng, config or WorkloadConfig())
     cs = {i: rows.customer(i) for i in range(1, customers + 1)}
     os_ = {i: rows.order(i, rng.randint(1, customers)) for i in range(1, orders + 1)}
     return TableState(cs, os_)

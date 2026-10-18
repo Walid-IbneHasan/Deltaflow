@@ -153,12 +153,13 @@ async def load_snapshot(
                 sql.SQL(", ").join(map(sql.Identifier, schema.columns)),
                 sql.Identifier(*table.split(".", 1)),
             )
-            rows = []
-            # Binary, server-side cursor: the table is streamed, not fetched
-            # into one result set.
+            # Binary, server-side cursor: the table is streamed into the
+            # engine in chunks, never held in memory as a whole.
+            loader = engine.begin_install(schema)
             async with conn.cursor(name="deltaflow_snapshot", binary=True) as cur:
+                cur.itersize = 200
                 await cur.execute(query)
                 async for record in cur:
-                    rows.append(Row(zip(schema.columns, record, strict=True)))
-            engine.install(schema, rows)
+                    loader.add(Row(zip(schema.columns, record, strict=True)))
+            loader.finish()
     engine.start(consistent_point)

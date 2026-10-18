@@ -35,7 +35,7 @@ tail:
 tail-drop:
 	$(UV) run python -m deltaflow.replication.tail --drop
 
-# Maintain two filtered views and print their changes (run `make load` alongside).
+# Maintain a filtered view and a join view and print their changes (run `make load` alongside).
 views:
 	$(UV) run python -m deltaflow.devtools.views_demo
 
