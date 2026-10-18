@@ -13,23 +13,26 @@ to the size of the change, not the size of the tables.
 | M0 — harness (compose Postgres, seed, load generator, CI) | done — [notes](docs/milestones/M0.md) |
 | M1 — hand-written `pgoutput` replication reader | done — [notes](docs/milestones/M1.md), [design](docs/replication.md) |
 | M2 — delta algebra, frontiers, map/filter views, in-memory sink | done — [notes](docs/milestones/M2.md), [design](docs/delta-algebra.md) |
-| M3–M7 | not started |
+| M3 — RocksDB state with a memory budget, incremental join | done — [notes](docs/milestones/M3.md), [design](docs/join.md) |
+| M4–M7 | not started |
 
-Views can filter, map and project a single source table, and their results
-live in memory. Joins, aggregates and durable state come in later
-milestones. This table is updated only when a milestone's acceptance test
-passes.
+Views can filter, map, project and inner-join source tables. Operator
+state lives in RocksDB under a memory budget, and view results live in
+memory. Aggregates and durable state come in later milestones. This table
+is updated only when a milestone's acceptance test passes.
 
 ```python
 df = Deltaflow()
 (
-    df.view("big_open_orders")
+    df.view("dutch_big_orders")
     .source("public.orders")
     .filter(lambda r: r["amount"] >= 4000 and r["status"] != "cancelled")
-    .select("id", "customer_id", "amount")
+    .join("public.customers", on=("customer_id", "id"))
+    .filter(lambda r: r["country"] == "NL")
+    .select("orders.id", "customers.name", "amount")
     .sink(sink := MemorySink())
 )
-async with Runner(df, dsn) as runner:
+async with Runner(df, dsn, memory_budget=64 << 20) as runner:
     await runner.run()  # sink.result == the view, exactly, as of sink.frontier
 ```
 
@@ -43,7 +46,7 @@ make seed    # customers + orders, deterministic
 make load    # randomized inserts/updates/deletes; prints a replayable seed
 make check   # ruff, mypy --strict, pytest
 make tail    # print the decoded replication stream
-make views   # two filtered views following the stream (run `make load` alongside)
+make views   # a filtered and a join view following the stream (run `make load` alongside)
 make differential  # acceptance tests (DELTAFLOW_SEED=N to replay a seed)
 ```
 
