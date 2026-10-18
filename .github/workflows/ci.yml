@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The supported floor and the newest release.
+        python: ["3.12", "3.14"]
+    env:
+      UV_PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      # Same compose file as local development, so CI tests the real harness
+      # (GitHub service containers cannot pass `-c wal_level=logical`).
+      - run: make up
+      - run: make check
+      - name: Postgres logs on failure
+        if: failure()
+        run: docker compose logs postgres
