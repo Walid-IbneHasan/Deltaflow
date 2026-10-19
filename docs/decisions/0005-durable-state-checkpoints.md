@@ -4,9 +4,9 @@ Status: accepted, 2026-10-19
 
 ## Context
 
-M5 needs exactly-once results that survive `kill -9`. The user chose
-(at the end of M4) to **resume from persisted state** instead of rebuilding
-from a fresh snapshot on every restart. A rebuild costs time proportional
+M5 needs exactly-once results that survive `kill -9`. The choice made
+at the end of M4 was to **resume from persisted state** instead of
+rebuilding from a fresh snapshot on every restart. A rebuild costs time proportional
 to the source tables; resuming costs time proportional to the gap since the
 crash.
 

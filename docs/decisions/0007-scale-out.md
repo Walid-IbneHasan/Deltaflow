@@ -2,8 +2,7 @@
 
 Status: accepted, 2026-10-19
 
-The user asked for the recommended options to be taken without stopping
-at each fork. These are the forks and the choices made.
+These are the forks and the choices made.
 
 ## Fork 1: how shards get their data
 
