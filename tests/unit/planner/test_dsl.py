@@ -154,10 +154,24 @@ def test_chained_joins_keep_left_rows_qualified() -> None:
     assert second.left_on == ("orders.customer_id",)
 
 
+def test_a_left_join_is_recorded() -> None:
+    df = Deltaflow()
+    view = (
+        df.view("v")
+        .source("public.customers")
+        .join("public.orders", on=("id", "customer_id"), how="left")
+        .sink(MemorySink())
+    )
+    (join,) = view.steps
+    assert isinstance(join, JoinStep)
+    assert join.how == "left"
+
+
 @pytest.mark.parametrize(
     ("build", "message"),
     [
-        (lambda b: b.join("public.c", on=("a", "b"), how="left"), "only inner joins"),
+        (lambda b: b.join("public.c", on=("a", "b"), how="right"), "inner and left"),
+        (lambda b: b.join("public.c", on=("a", "b"), how="full"), "inner and left"),
         (lambda b: b.join("public.orders", on=("id", "id")), "same name"),
         (lambda b: b.join("other.orders", on=("id", "id")), "same name"),
         (lambda b: b.join("customers", on=("a", "b")), "schema-qualified"),

@@ -127,6 +127,33 @@ CASES: dict[str, Case] = {
         " FROM orders o JOIN customers c ON c.id = o.customer_id"
         " WHERE o.status = 'pending' AND c.country IN ('NL', 'DE', 'FR')",
     ),
+    # Left joins, both ways. Every order has its customer (a foreign key, and
+    # deleting a customer cascades), so orders ⟕ customers is padded only
+    # during the bootstrap: orders load first, padded, and loading customers
+    # retracts it. A customer is padded until its first order arrives, and
+    # again when its last one is deleted or moved to another customer.
+    "orders_left_customers": Case(
+        lambda df, s: (
+            df.view("orders_left_customers")
+            .source("public.orders")
+            .join("public.customers", on=("customer_id", "id"), how="left")
+            .select("orders.id", "customers.id", "country")
+            .sink(s)
+        ),
+        'SELECT o.id AS "orders.id", c.id AS "customers.id", c.country'
+        " FROM orders o LEFT JOIN customers c ON c.id = o.customer_id",
+    ),
+    "customers_left_orders": Case(
+        lambda df, s: (
+            df.view("customers_left_orders")
+            .source("public.customers")
+            .join("public.orders", on=("id", "customer_id"), how="left")
+            .select("customers.id", "orders.id", "status")
+            .sink(s)
+        ),
+        'SELECT c.id AS "customers.id", o.id AS "orders.id", o.status'
+        " FROM customers c LEFT JOIN orders o ON o.customer_id = c.id",
+    ),
 }
 
 

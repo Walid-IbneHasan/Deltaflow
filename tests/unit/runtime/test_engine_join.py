@@ -8,10 +8,12 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
+import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
 from deltaflow.core import Frontier, Multiset, Row
+from deltaflow.operators import JoinStateError
 from deltaflow.planner import Deltaflow
 from deltaflow.replication.changes import Change, RowDelete, RowInsert, RowUpdate, Transaction
 from deltaflow.replication.lsn import Lsn
@@ -118,3 +120,46 @@ def test_join_view_matches_the_model_after_every_transaction(  # noqa: PLR0912 -
         engine.apply(Transaction(n, commit, Lsn(commit + 8), at, None, tuple(changes)))
         assert sink.frontier == Frontier.at(Lsn(commit + 8))
         assert sink.result == expected(orders, customers)
+
+
+def _left_join_engine(state_store: StateStore) -> tuple[Engine, MemorySink]:
+    df = Deltaflow()
+    sink = MemorySink()
+    (
+        df.view("orders_left_customers")
+        .source("public.orders")
+        .join("public.customers", on=("cid", "id"), how="left")
+        .select("orders.id", "country")
+        .sink(sink)
+    )
+    return Engine(df, state_store, namespace=uuid.uuid4().hex), sink
+
+
+ORDERS_SCHEMA = TableSchema("public.orders", ("id", "cid", "amt"), ("id",))
+CUSTOMERS_SCHEMA = TableSchema("public.customers", ("id", "country", "bio"), ("id",))
+
+
+def test_a_left_join_loads_its_left_table_first_once_schemas_are_declared(
+    state_store: StateStore,
+) -> None:
+    """The snapshot loader installs tables in source order: the left table
+    first, while the right index is still empty, so every left row is padded
+    and the right table's install then retracts the padding. That needs the
+    right table's columns before its rows: load_snapshot declares every
+    schema first."""
+    engine, sink = _left_join_engine(state_store)
+    engine.declare(CUSTOMERS_SCHEMA)
+    engine.install(
+        ORDERS_SCHEMA, [Row({"id": 1, "cid": 7, "amt": 5}), Row({"id": 2, "cid": 8, "amt": 5})]
+    )
+    engine.install(CUSTOMERS_SCHEMA, [Row({"id": 7, "country": "NL", "bio": None})])
+    engine.start(CP)
+    assert sink.result == Multiset.of(
+        [Row({"orders.id": 1, "country": "NL"}), Row({"orders.id": 2, "country": None})]
+    )
+
+
+def test_a_left_join_refuses_to_guess_the_right_columns(state_store: StateStore) -> None:
+    engine, _ = _left_join_engine(state_store)
+    with pytest.raises(JoinStateError, match="declare every table's schema"):
+        engine.install(ORDERS_SCHEMA, [Row({"id": 1, "cid": 7, "amt": 5})])

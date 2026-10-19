@@ -54,6 +54,8 @@ class JoinStep:
     #: None when the left rows are already qualified by an earlier join
     left_prefix: str | None
     right_prefix: str
+    #: "inner" or "left" (left outer)
+    how: str = "inner"
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,15 +199,17 @@ class ViewBuilder:
         on: tuple[str, str] | Sequence[tuple[str, str]],
         how: str = "inner",
     ) -> ViewBuilder:
-        """Inner equi-join with source table `table`: `on=("customer_id", "id")`
-        or a list of such pairs for a composite key (left column, right column)."""
+        """Equi-join with source table `table`: `on=("customer_id", "id")` or a
+        list of such pairs for a composite key (left column, right column).
+        `how="left"` keeps left rows without a match, with NULL right columns,
+        as SQL's LEFT JOIN does."""
         self._check_usable()
         if self._source is None:
             raise PlanError(f"view {self._name!r}: call .source(table) before .join()")
-        if how != "inner":
+        if how not in ("inner", "left"):
             raise PlanError(
-                f"only inner joins are maintained incrementally so far; "
-                f"how={how!r} is not supported"
+                f"only inner and left joins are maintained incrementally; how={how!r} is not "
+                "supported (a right join is a left join with the tables swapped)"
             )
         if not _TABLE_NAME.fullmatch(table):
             raise PlanError(
@@ -232,6 +236,7 @@ class ViewBuilder:
                 tuple(right for _, right in pairs),
                 left_prefix,
                 prefix,
+                how,
             )
         )
         self._prefixes.append(prefix)

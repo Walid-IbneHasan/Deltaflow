@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import functools
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from deltaflow.operators import Distinct, Filter, GroupBy, Join, Map, Operator, Source
@@ -33,9 +34,16 @@ class Plan:
     nodes: dict[int, Node]
 
 
-def compile_views(views: Sequence[View], store: StateStore, namespace: str = "") -> Plan:
+def compile_views(
+    views: Sequence[View],
+    store: StateStore,
+    namespace: str = "",
+    columns_of: Callable[[str], tuple[str, ...]] = lambda table: (),
+) -> Plan:
     """Operators are listed after their inputs. A join's right-hand source is
-    created where the join first needs it, which keeps that order."""
+    created where the join first needs it, which keeps that order.
+    `columns_of(table)` gives a source table's columns once they are known
+    (a left join pads with them)."""
     sources: dict[str, Source] = {}
     operators: list[Operator] = []
     outputs: list[tuple[View, Operator]] = []
@@ -77,6 +85,8 @@ def compile_views(views: Sequence[View], store: StateStore, namespace: str = "")
                         right_prefix=step.right_prefix,
                         store=store,
                         name=f"{namespace}{view.name}.{i}",
+                        left_outer=step.how == "left",
+                        right_columns=functools.partial(columns_of, step.table),
                     )
                 case GroupStep():
                     node = GroupBy(

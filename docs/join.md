@@ -43,6 +43,70 @@ Tests:
 - **Mutations:** ignoring the match multiplicity, or never folding the right
   side, make both fail.
 
+## 1b. The left outer join (added after M7)
+
+`.join(table, on=..., how="left")` is SQL's LEFT JOIN: the inner join, plus
+every left row whose key matches no right row, with NULL right columns
+(`pad`). A right join is the same with the tables swapped. Full outer
+joins are not supported.
+
+For one key k with left rows L_k and c_k right rows, the padded part of
+the result is pad(L_k) when c_k = 0, and nothing otherwise. Within a step
+the left batch runs first, then the right batch, as for the inner join:
+
+1. **Left batch.** c_k has not changed yet, so the padded part changes by
+   pad(ΔL_k) if c_k = 0. The probe of the right index that the inner part
+   does anyway says whether c_k = 0: its entries never have multiplicity
+   0. A left row with a NULL key matches nothing, so it is always padded.
+2. **Right batch.** It moves c_k to c_k'. If c_k = 0 < c_k', the key
+   gained a match: pad(L'_k) is retracted. If c_k > 0 = c_k', it lost its
+   last match: pad(L'_k) is added. L'_k is the left index, which already
+   includes ΔL; the inner part probes it anyway.
+
+Summed with the inner part, that is the change of the left join:
+pad(L'_k)·[c_k' = 0] − pad(L_k)·[c_k = 0]. c_k is stored per key
+(`join:<view>.<step>:right_count`), so a right batch learns it without
+scanning the right side; a step that changes one order of a customer with
+thousands does not read them all.
+
+**Padding needs the right table's columns.** A NULL-padded row has every
+right column, as in SQL, so a map after the join can read
+`r["customers.name"]` and get None. The columns come from the table's
+schema. The snapshot loader installs tables one by one, in source order,
+so for `orders ⟕ customers` the orders arrive while the customers index is
+still empty: every order is padded, and loading customers retracts the
+padding. `load_snapshot` therefore declares every table's schema before
+loading any rows (`Engine.declare`). A resumed engine has them from its
+checkpoint. If they were still missing, the join would raise rather than
+make a row with columns missing
+(`test_a_left_join_refuses_to_guess_the_right_columns`).
+
+**Sharding.** A co-partitioned left join is exact shard by shard: a key's
+left rows and all of its right rows live on one shard, so that shard knows
+c_k. The partials are disjoint and merge by union.
+
+**Tests.**
+
+- `test_incremental_left_join_equals_left_join_of_accumulated_inputs`
+  (property-based, as the inner join's test): random batches on both
+  sides, NULL keys, duplicates. After every step the accumulated output
+  equals a naive LEFT JOIN of the accumulated inputs. Two mutations make
+  it fail:
+  - not re-padding when a count crosses zero;
+  - not padding NULL keys.
+- The differential test compares two left-join views with Postgres's own
+  LEFT JOIN after every one of about 8,000 commits:
+  - `customers ⟕ orders`: padding comes and goes as a customer's first
+    order arrives and its last one is deleted or moved;
+  - `orders ⟕ customers`: padded during the bootstrap, as above.
+- The sharded property test (`test_merged_shards_equal_the_unsharded_engine`)
+  covers both directions, with customers deleted while their orders stay,
+  and orders moving between shards.
+
+**Not counted by `Count()`.** `Count()` is SQL's `count(*)`: it counts a
+padded row too. SQL's `count(column)`, which skips NULLs, has no
+counterpart yet.
+
 ## 2. Why the indices may forget time
 
 The indices store accumulated multiplicities, with no timestamps. That is
@@ -215,7 +279,8 @@ not only its in-memory fast path.
 
 ## Not done (M3)
 
-- **Outer joins, self-joins, joins of same-named tables.** Rejected at
+- **Full outer joins, self-joins, joins of same-named tables.** (Left joins
+  were added after M7, §1b.) Rejected at
   registration.
 - **Projection pushdown.** Joined source rows are stored whole in the
   index.

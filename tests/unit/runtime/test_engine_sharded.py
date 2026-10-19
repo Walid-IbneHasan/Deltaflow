@@ -44,7 +44,8 @@ SHARD_BY = {"public.orders": "cid", "public.customers": "id"}
 
 def registry(shards: int | None) -> tuple[Deltaflow, dict[str, MemorySink]]:
     df = Deltaflow(shards=shards, shard_by=SHARD_BY) if shards else Deltaflow()
-    sinks = {n: MemorySink() for n in ("joined", "per_country", "totals", "distinct_cids")}
+    names = ("joined", "per_country", "totals", "distinct_cids", "orders_left", "customers_left")
+    sinks = {n: MemorySink() for n in names}
     (
         df.view("joined")
         .source("public.orders")
@@ -70,6 +71,24 @@ def registry(shards: int | None) -> tuple[Deltaflow, dict[str, MemorySink]]:
     df.view("distinct_cids").source("public.orders").select("cid").distinct().sink(
         sinks["distinct_cids"]
     )
+    # Left joins, co-partitioned like the inner one: a key's left rows and
+    # all its right rows are on one shard, so each shard knows whether a
+    # left row has a match. Deleting a customer here leaves its orders,
+    # which are then padded.
+    (
+        df.view("orders_left")
+        .source("public.orders")
+        .join("public.customers", on=("cid", "id"), how="left")
+        .select("orders.id", "country")
+        .sink(sinks["orders_left"])
+    )
+    (
+        df.view("customers_left")
+        .source("public.customers")
+        .join("public.orders", on=("id", "cid"), how="left")
+        .select("customers.id", "orders.id", "amt")
+        .sink(sinks["customers_left"])
+    )
     return df, sinks
 
 
@@ -94,6 +113,7 @@ def test_merged_shards_equal_the_unsharded_engine(  # noqa: PLR0912, PLR0915 - o
     for shard in [None, *range(SHARDS)]:
         df, sinks = (whole, whole_sinks) if shard is None else registry(SHARDS)
         engine = Engine(df, state_store, namespace=uuid.uuid4().hex, shard=shard)
+        engine.declare(C_SCHEMA)  # as load_snapshot does: a left join pads with it
         engine.install(O_SCHEMA, map(Row, orders.values()))
         engine.install(C_SCHEMA, map(Row, customers.values()))
         engine.start(CP)
@@ -155,6 +175,7 @@ def test_each_row_lives_in_exactly_one_shard(state_store: StateStore) -> None:
     for shard in range(SHARDS):
         df, _ = registry(SHARDS)
         engine = Engine(df, state_store, namespace=uuid.uuid4().hex, shard=shard)
+        engine.declare(C_SCHEMA)
         engine.install(O_SCHEMA, orders)
         engine.install(C_SCHEMA, [])
         sizes.append(len(engine.arrangements["public.orders"]))
@@ -171,6 +192,7 @@ def test_moving_into_a_shard_with_an_unchanged_toast_value_is_refused(
     source = next(c for c in range(100) if shard_of(c, SHARDS) == 0)
     df, _ = registry(SHARDS)
     engine = Engine(df, state_store, namespace=uuid.uuid4().hex, shard=1)
+    engine.declare(C_SCHEMA)
     engine.install(O_SCHEMA, [Row({"id": 1, "cid": source, "amt": Decimal(1)})])
     engine.install(C_SCHEMA, [])
     engine.start(CP)

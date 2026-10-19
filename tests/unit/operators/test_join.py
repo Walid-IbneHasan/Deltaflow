@@ -1,6 +1,8 @@
 """The incremental join is bilinear: Δ(L ⋈ R) = ΔL ⋈ R + L' ⋈ ΔR, where L'
 already includes ΔL. Applying it batch by batch and accumulating must equal
-joining the accumulated inputs, after every batch."""
+joining the accumulated inputs, after every batch. The left outer join adds
+the left rows without a match, padded with NULLs; that part changes when a
+key's right-hand count crosses zero."""
 
 from __future__ import annotations
 
@@ -20,7 +22,9 @@ from deltaflow.state.store import StateStore
 _names = itertools.count()
 
 
-def make_join(store: StateStore, left_prefix: str | None = "l") -> Join:
+def make_join(
+    store: StateStore, left_prefix: str | None = "l", *, left_outer: bool = False
+) -> Join:
     return Join(
         Source("public.l"),
         Source("public.r"),
@@ -30,6 +34,8 @@ def make_join(store: StateStore, left_prefix: str | None = "l") -> Join:
         right_prefix="r",
         store=store,
         name=f"j{next(_names)}",
+        left_outer=left_outer,
+        right_columns=(lambda: ("k", "w")) if left_outer else None,
     )
 
 
@@ -42,6 +48,16 @@ def naive_join(left: Multiset[Row], right: Multiset[Row]) -> Multiset[Row]:
                 merged = {f"l.{c}": v for c, v in l_row.items()}
                 merged |= {f"r.{c}": v for c, v in r_row.items()}
                 out.add(Row(merged), nl * nr)
+    return out
+
+
+def naive_left_join(left: Multiset[Row], right: Multiset[Row]) -> Multiset[Row]:
+    """SQL's LEFT JOIN: the inner join, plus every left row that matches no
+    right row (a NULL key matches nothing), with NULL right columns."""
+    out = naive_join(left, right)
+    for l_row, nl in left.items():
+        if not any(l_row["k"] is not None and l_row["k"] == r["k"] for r, _ in right.items()):
+            out.add(Row({**{f"l.{c}": v for c, v in l_row.items()}, "r.k": None, "r.w": None}), nl)
     return out
 
 
@@ -89,6 +105,55 @@ def test_incremental_join_equals_join_of_accumulated_inputs(
         assert all(d.time == t for d in produced)
         output += produced
         assert accumulate(output) == naive_join(left, right)
+
+
+@given(steps)
+def test_incremental_left_join_equals_left_join_of_accumulated_inputs(
+    state_store: StateStore, script: list[Any]
+) -> None:
+    join = make_join(state_store, left_outer=True)
+    left: Multiset[Row] = Multiset()
+    right: Multiset[Row] = Multiset()
+    output: list[Delta[Row]] = []
+    for n, ((l_adds, l_removes), (r_adds, r_removes)) in enumerate(script):
+        t = Lsn(n)
+        produced = join.process(0, step_deltas(left, l_adds, l_removes, t))
+        produced += join.process(1, step_deltas(right, r_adds, r_removes, t))
+        assert all(d.time == t for d in produced)
+        output += produced
+        assert accumulate(output) == naive_left_join(left, right)
+
+
+def test_padding_follows_the_right_hand_count_across_zero(state_store: StateStore) -> None:
+    join = make_join(state_store, left_outer=True)
+    a = Row({"k": 1, "v": 0})
+    padded = Row({"l.k": 1, "l.v": 0, "r.k": None, "r.w": None})
+    assert join.process(0, [Delta(a, Lsn(1), 2)]) == [Delta(padded, Lsn(1), 2)]
+    first, second = Row({"k": 1, "w": 1}), Row({"k": 1, "w": 2})
+    out = accumulate(join.process(1, [Delta(first, Lsn(2), 1), Delta(second, Lsn(2), 1)]))
+    assert out.count(padded) == -2  # the key gained matches: the padding goes
+    out = accumulate(join.process(1, [Delta(first, Lsn(3), -1)]))
+    assert out.count(padded) == 0  # one match left: still no padding
+    out = accumulate(join.process(1, [Delta(second, Lsn(4), -1)]))
+    assert out.count(padded) == 2  # no match left: the padding is back
+
+
+def test_a_left_row_with_a_null_key_is_always_padded(state_store: StateStore) -> None:
+    join = make_join(state_store, left_outer=True)
+    row = Row({"k": None, "v": 0})
+    out = join.process(0, [Delta(row, Lsn(1), 1)])
+    assert out == [Delta(Row({"l.k": None, "l.v": 0, "r.k": None, "r.w": None}), Lsn(1), 1)]
+    assert join.process(1, [Delta(Row({"k": None, "w": 0}), Lsn(1), 1)]) == []
+
+
+def test_padding_needs_the_right_tables_columns(state_store: StateStore) -> None:
+    join = Join(
+        Source("public.l"), Source("public.r"), left_on=("k",), right_on=("k",),
+        left_prefix="l", right_prefix="r", store=state_store, name=f"j{next(_names)}",
+        left_outer=True, right_columns=lambda: (),
+    )  # fmt: skip
+    with pytest.raises(JoinStateError, match="columns of the right-hand table"):
+        join.process(0, [Delta(Row({"k": 1, "v": 0}), Lsn(1), 1)])
 
 
 def test_unconsolidated_batches_and_duplicates(state_store: StateStore) -> None:

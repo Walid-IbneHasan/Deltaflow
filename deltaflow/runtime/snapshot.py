@@ -146,9 +146,14 @@ async def load_snapshot(
         await conn.execute(
             sql.SQL("SET TRANSACTION SNAPSHOT {}").format(sql.Literal(snapshot_name))
         )
+        schemas = []
         for table in tables if tables is not None else engine.sources:
             schema = await describe_table(conn, table)
             await check_publication(conn, publication, schema)
+            engine.declare(schema)  # a left join may pad with it before it loads
+            schemas.append(schema)
+        for schema in schemas:
+            table = schema.table
             query = sql.SQL("SELECT {} FROM {}").format(
                 sql.SQL(", ").join(map(sql.Identifier, schema.columns)),
                 sql.Identifier(*table.split(".", 1)),

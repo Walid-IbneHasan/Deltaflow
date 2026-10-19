@@ -84,7 +84,9 @@ class Engine:
         self._store = store
         self._namespace = namespace
         self._chunk_limits = (snapshot_chunk_rows, snapshot_chunk_bytes)
-        self._plan = compile_views(registry.views, store, namespace)
+        #: every source table's schema, once declared (or loaded, or resumed)
+        self._schemas: dict[str, TableSchema] = {}
+        self._plan = compile_views(registry.views, store, namespace, self._columns_of)
         #: per operator: [deltas in, deltas out, seconds], by id(operator)
         self.operator_stats: dict[int, list[float]] = {
             id(op): [0, 0, 0.0] for op in self._plan.operators
@@ -128,6 +130,7 @@ class Engine:
             )
         for table, info in meta["arrangements"].items():
             schema = TableSchema(table, tuple(info["columns"]), tuple(info["key"]))
+            self._schemas[table] = schema
             self._arrangements[table] = TableArrangement(
                 schema,
                 self._store.keyspace(f"{self._namespace}arr:{table}"),
@@ -179,6 +182,19 @@ class Engine:
     def arrangements(self) -> dict[str, TableArrangement]:
         return dict(self._arrangements)
 
+    def declare(self, schema: TableSchema) -> None:
+        """Make a source table's schema known before its rows arrive. A left
+        join pads rows with its right table's columns, possibly while
+        another table's snapshot is being loaded; load_snapshot therefore
+        declares every table first."""
+        if schema.table not in self._plan.sources:
+            raise PlanError(f"no view reads {schema.table}")
+        self._schemas[schema.table] = schema
+
+    def _columns_of(self, table: str) -> tuple[str, ...]:
+        schema = self._schemas.get(table)
+        return () if schema is None else schema.columns
+
     def install(self, schema: TableSchema, rows: Iterable[Row]) -> None:
         """Load one source table's snapshot."""
         loader = self.begin_install(schema)
@@ -194,6 +210,7 @@ class Engine:
             raise RuntimeError("snapshots must be installed before start()")
         if schema.table in self._arrangements:
             raise RuntimeError(f"snapshot of {schema.table} already installed")
+        self._schemas[schema.table] = schema
         arrangement = TableArrangement(
             schema,
             self._store.keyspace(f"{self._namespace}arr:{schema.table}"),
@@ -328,7 +345,18 @@ def fingerprint(registry: Deltaflow) -> str:
             case MapStep():
                 return ["map", getattr(s.fn, "__qualname__", repr(s.fn))]
             case JoinStep():
-                return ["join", s.table, s.left_on, s.right_on, s.left_prefix, s.right_prefix]
+                # `how` only when not inner, so existing checkpoints keep
+                # their fingerprint
+                kind = [] if s.how == "inner" else [s.how]
+                return [
+                    "join",
+                    s.table,
+                    s.left_on,
+                    s.right_on,
+                    s.left_prefix,
+                    s.right_prefix,
+                    *kind,
+                ]
             case GroupStep():
                 aggs = {k: repr(v) for k, v in s.aggregates.items()}
                 return ["group", s.keys, s.output_keys, aggs]

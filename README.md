@@ -19,7 +19,7 @@ to the size of the change, not the size of the tables.
 | M6 — metrics, JSON logs, Next.js console, backpressure, measured benchmark | done — [notes](docs/milestones/M6.md), [design](docs/operations.md) |
 | M7 — scale-out: sharded views, Postgres leases with epoch fencing, failover | done — [notes](docs/milestones/M7.md), [design](docs/scale-out.md) |
 
-Views can filter, map, project, inner-join and aggregate source tables.
+Views can filter, map, project, join (inner and left) and aggregate source tables.
 Operator state lives in RocksDB under a memory budget, and checkpoints
 make it survive crashes. Results go to Postgres tables exactly once, each
 with a watermark committed in the same transaction. This table
