@@ -108,10 +108,18 @@ class PostgresSink(Sink):
         write_table: str | None = None,
     ) -> None:
         """Called by the runner with the table's shape and stored watermark.
-        `columns` and `key` are the view's, without the shard column."""
+        `columns` and `key` are the view's, without the shard column.
+
+        Binding starts a session: whatever an earlier session buffered and
+        never flushed is dropped, and the frontier starts over. A runner
+        restarting in-process replays from its checkpoint, and must not
+        apply the failed session's leftovers on top of the replay."""
         self.view, self.columns, self.key, self.watermark = view, columns, key, watermark
         self.shard = shard
         self.write_table = write_table or self.table
+        self._frontier = MutableFrontier(Frontier.at(Lsn(0)))
+        self._pending = []
+        self._writes = {}
         self._bound = True
 
     @property

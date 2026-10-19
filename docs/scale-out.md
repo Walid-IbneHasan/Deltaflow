@@ -88,6 +88,16 @@ Each worker (`runtime/cluster.py`) loops every `heartbeat` seconds:
   persistent slot from there. The sinks drop what is at or below their
   watermark. Exactly-once is the M5 argument, per shard.
 
+**A shard pipeline fails on a live worker** (a lost connection, a
+missing sink table):
+
+- the worker releases the shard and takes it again at a new epoch;
+- it waits first, starting at 0.5 s and doubling up to 30 s, and starts
+  over after a minute of running. Retrying on every heartbeat would bump
+  the epoch and reconnect several times a second for as long as the cause
+  lasted. `test_a_failing_shard_is_retried_with_backoff` counts the
+  attempts: at most 5 in 5 s, where one per heartbeat was 43.
+
 **A worker hangs but its connections stay open** (the dangerous case):
 
 - its heartbeat stops, the survivors want its shards, and the advisory

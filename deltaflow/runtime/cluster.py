@@ -30,6 +30,11 @@ pipelines of the shards it owns. Ownership works as follows:
   it. The epoch bump also runs under a lock timeout, so the coordinator
   loop never blocks on one. A shard's replication slot is taken from a
   stale holder the same way. Fencing covers anything still in flight.
+* **Failures.** A shard pipeline that stops on its own (a lost
+  connection, a missing sink table, a fenced flush) is released and taken
+  again, at a new epoch, after a delay that doubles from 0.5 s up to 30 s
+  and starts over once a pipeline has run for a minute. Without the delay,
+  a lasting cause would bump the epoch and reconnect on every heartbeat.
 
 Why not Raft: docs/decisions/0007-scale-out.md.
 """
@@ -87,6 +92,11 @@ class _Owned:
     epoch: int
     stop: asyncio.Event
     task: asyncio.Task[None]
+    started: float  # loop time
+
+
+#: retry delays after a shard pipeline stopped on its own, seconds
+RETRY_FIRST, RETRY_MAX, RETRY_STABLE_AFTER = 0.5, 30.0, 60.0
 
 
 @dataclass
@@ -129,6 +139,8 @@ class ClusterWorker:
         self._ttl = ttl
         self._runner_options = runner_options or {}
         self.owned: dict[int, _Owned] = {}
+        #: shard -> (loop time before which it is not taken again, last delay)
+        self._retry: dict[int, tuple[float, float]] = {}
         self.stats = ClusterStats()
         self._lock_conn: Conn | None = None
         self._lock_pid = 0
@@ -229,12 +241,26 @@ class ClusterWorker:
                     exc_info=error,
                 )
                 await self._release(shard, reason="pipeline stopped")
+                self._back_off(shard, owned)
+        now = asyncio.get_running_loop().time()
         for shard in sorted(desired - set(self.owned)):
-            await self._acquire(shard)
+            if self._retry.get(shard, (0.0, 0.0))[0] <= now:
+                await self._acquire(shard)
         for shard in sorted(set(self.owned) - desired):
             await self._release(
                 shard, reason=f"now owned by {owner(shard, live)} (live {sorted(live)})"
             )
+
+    def _back_off(self, shard: int, owned: _Owned) -> None:
+        now = asyncio.get_running_loop().time()
+        _, last = self._retry.get(shard, (0.0, 0.0))
+        stable = now - owned.started >= RETRY_STABLE_AFTER
+        delay = RETRY_FIRST if stable or not last else min(last * 2, RETRY_MAX)
+        self._retry[shard] = (now + delay, delay)
+        log.info(
+            "retrying shard after a delay",
+            extra={"worker": self.worker_id, "shard": shard, "delay": delay},
+        )
 
     async def _acquire(self, shard: int) -> None:
         assert self._conn is not None
@@ -257,7 +283,7 @@ class ClusterWorker:
             return
         stop = asyncio.Event()
         task = asyncio.create_task(self._run_shard(shard, epoch, stop), name=f"shard-{shard}")
-        self.owned[shard] = _Owned(epoch, stop, task)
+        self.owned[shard] = _Owned(epoch, stop, task, asyncio.get_running_loop().time())
         self.stats.acquired[shard] += 1
         log.info("acquired shard", extra={"worker": self.worker_id, "shard": shard, "epoch": epoch})
 

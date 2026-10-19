@@ -118,3 +118,42 @@ def test_a_hung_lock_holder_is_evicted_and_its_shard_taken_over(dsn: str, tmp_pa
     assert outcome["lease"] == ("live", 6)  # one past the zombie's epoch: it is fenced
     assert outcome["zombie_alive"] is False
     assert outcome["evictions"] == 1
+
+
+def test_a_failing_shard_is_retried_with_backoff(dsn: str, tmp_path: Path) -> None:
+    """A shard whose pipeline cannot start (here its partial sink table is
+    missing) is retried, but with a doubling delay: not on every heartbeat,
+    which would bump its epoch and reconnect several times a second for as
+    long as the cause lasts."""
+    prefix = f"it_cl_{uuid.uuid4().hex[:6]}"
+
+    async def go() -> tuple[int, int]:
+        await seed_database(dsn, seed=1, customers=20, orders=60)
+        async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as sql:
+            await sql.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
+            await setup(dsn, 1, "deltaflow_it_cluster")
+            await sql.execute("DELETE FROM _deltaflow.workers")
+            await sql.execute("DELETE FROM _deltaflow.shard_leases")
+            await sql.execute(f"DROP TABLE {SCHEMA}.order_totals__shards CASCADE")
+            worker = ClusterWorker(
+                lambda: views(1), dsn, worker_id="live", state_root=tmp_path, slot_prefix=prefix,
+                publication="deltaflow_it_cluster", heartbeat=0.1, ttl=1.0,
+            )  # fmt: skip
+            stop = asyncio.Event()
+            task = asyncio.create_task(worker.run(stop))
+            try:
+                await asyncio.sleep(5.0)
+            finally:
+                stop.set()
+                await task
+                await sql.execute(
+                    "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots"
+                    " WHERE slot_name LIKE %s AND NOT active",
+                    (f"{prefix}%",),
+                )
+        return worker.stats.acquired[0], worker.stats.runner_failures[0]
+
+    acquired, failures = run(go())
+    assert failures >= 2  # it kept trying
+    # 0.5 + 1 + 2 s of backoff fit in 5 s; one try per 0.1 s heartbeat would be ~50
+    assert acquired <= 5, acquired

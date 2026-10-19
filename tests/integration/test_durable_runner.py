@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,14 @@ async def drop(dsn: str, slot: str) -> None:
             await drop_slot(repl, slot)
         finally:
             await repl.close()
+
+
+async def until(check: Callable[[], bool], timeout: float = 60.0) -> None:
+    async with asyncio.timeout(timeout):
+        while True:
+            if check():
+                return
+            await asyncio.sleep(0.05)
 
 
 async def load_and_sync(dsn: str, runner: DurableRunner, sql: Sql, seed: int, txns: int) -> None:
@@ -257,3 +266,59 @@ def test_an_idle_source_does_not_pin_wal_on_a_busy_server(dsn: str, tmp_path: Pa
     assert outcome["idle_advances"] >= 1, outcome
     assert outcome["differences"] == [], outcome
 
+
+def test_serve_rides_out_dropped_connections_exactly_once(dsn: str, tmp_path: Path) -> None:
+    """Mid-load, the walsender and then the runner's other sessions are
+    terminated, as a server restart or a network failure would. serve()
+    restarts the pipeline in-process, resuming from its checkpoint, and the
+    sinks stay exact: nothing lost, nothing applied twice."""
+    slot = f"it_durable_{uuid.uuid4().hex[:8]}"
+
+    async def go() -> tuple[dict[str, int], list[str]]:
+        await fresh(dsn)
+        async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as sql:
+            runner = DurableRunner(
+                views(), dsn, state_dir=tmp_path, slot=slot, publication="it_durable",
+                flush_interval=0.05, checkpoint_interval=0.2, status_interval=0.2,
+            )  # fmt: skip
+            stop = asyncio.Event()
+            task = asyncio.create_task(runner.serve(stop, first_delay=0.1))
+            try:
+                await until(lambda: runner.counters["bootstraps"] > 0)
+                async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as conn:
+                    load = asyncio.create_task(
+                        run_load(conn, Workload(4, await load_state(conn)), txns=400)
+                    )
+                    await asyncio.sleep(0.5)
+                    await sql.execute(
+                        "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots"
+                        " WHERE slot_name = %s AND active_pid IS NOT NULL",
+                        (slot,),
+                    )
+                    await until(lambda: runner.counters["restarts"] > 0)
+                    await asyncio.sleep(1.0)
+                    # the sink connection (and the slot monitor's)
+                    await sql.execute(
+                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity"
+                        " WHERE application_name = 'deltaflow' AND backend_type = 'client backend'"
+                    )
+                    await load
+                caught_up = asyncio.create_task(wait_caught_up(sql, await emit_marker(sql)))
+                await asyncio.wait({task, caught_up}, return_when=asyncio.FIRST_COMPLETED)
+                if task.done():
+                    caught_up.cancel()
+                    task.result()
+                await caught_up
+                differences = await sink_differences(sql)
+            finally:
+                stop.set()
+                await asyncio.gather(task, return_exceptions=True)
+                await runner.close()
+                await drop(dsn, slot)
+        return dict(runner.counters), differences
+
+    counters, differences = run(go())
+    assert counters["bootstraps"] == 1, counters
+    assert counters["restarts"] >= 2, counters
+    assert counters["resumes"] >= 2, counters
+    assert differences == []

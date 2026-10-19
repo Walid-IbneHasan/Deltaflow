@@ -40,8 +40,10 @@ the slot, create it again with an exported snapshot, load the snapshot,
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import logging
+import ssl
 import time
 from collections import Counter
 from datetime import UTC, datetime
@@ -59,8 +61,13 @@ from deltaflow.planner import Deltaflow, PlanError
 from deltaflow.replication.changes import Transaction
 from deltaflow.replication.lsn import Lsn
 from deltaflow.replication.slot import create_publication, create_slot, drop_slot, slot_exists
-from deltaflow.replication.stream import Progress, ReplicationStream
-from deltaflow.replication.wire import ReplicationConnection
+from deltaflow.replication.stream import Progress, ReplicationEndedError, ReplicationStream
+from deltaflow.replication.wire import (
+    PgError,
+    ReplicationConnection,
+    TlsUnavailableError,
+    WireProtocolError,
+)
 from deltaflow.runtime.engine import Engine, fingerprint
 from deltaflow.runtime.runner import DEFAULT_MEMORY_BUDGET
 from deltaflow.runtime.snapshot import load_snapshot
@@ -79,6 +86,29 @@ from deltaflow.state.store import StateStore
 log = logging.getLogger(__name__)
 
 type Conn = psycopg.AsyncConnection[tuple[Any, ...]]
+
+#: SQLSTATEs (classes, or one code) a restart can outlive: connection
+#: exceptions, insufficient resources (too many connections), operator
+#: intervention (a server shutting down, restarting or starting up), and a
+#: slot still held by a walsender that has not noticed its client died.
+_TRANSIENT_SQLSTATES = ("08", "53", "57", "55006")
+
+
+def is_transient(exc: BaseException) -> bool:
+    """Whether waiting and restarting can fix `exc`. Restarting is *safe*
+    after any failure (it resumes from the last checkpoint), but after a
+    misconfiguration, a drifted sink, a fenced shard or a bug it would only
+    repeat the failure, so those are raised instead."""
+    if isinstance(exc, PgError):
+        return exc.sqlstate.startswith(_TRANSIENT_SQLSTATES)
+    if isinstance(exc, psycopg.Error):
+        # sqlstate is None when the client lost the connection by itself
+        return exc.sqlstate is None or exc.sqlstate.startswith(_TRANSIENT_SQLSTATES)
+    if isinstance(exc, ssl.SSLCertVerificationError | TlsUnavailableError | WireProtocolError):
+        return False
+    return isinstance(
+        exc, OSError | asyncio.IncompleteReadError | ReplicationEndedError
+    )  # OSError covers ConnectionError, TimeoutError and ssl.SSLError
 
 
 class DurableRunner:
@@ -149,6 +179,10 @@ class DurableRunner:
     # --- start: resume or bootstrap ------------------------------------------
 
     async def start(self) -> None:
+        # A session: a restart replays from the checkpoint, so progress and
+        # commit times of the previous session no longer apply.
+        self._progress_lsn = None
+        self._pending_commits.clear()
         self._sql = await psycopg.AsyncConnection.connect(
             self._sink_dsn, autocommit=True, application_name=self._app
         )
@@ -308,6 +342,48 @@ class DurableRunner:
 
     # --- the loop -------------------------------------------------------------
 
+    async def serve(
+        self,
+        stop: asyncio.Event,
+        *,
+        first_delay: float = 0.5,
+        max_delay: float = 30.0,
+        stable_after: float = 60.0,
+    ) -> None:
+        """Start (unless started) and run until `stop`, restarting after
+        transient failures (`is_transient`): a dropped connection, a server
+        restarting, a slot not yet released. Each restart resumes from the
+        last checkpoint, which keeps the results exactly-once (the argument
+        at the top of this module). The delay doubles from `first_delay` up
+        to `max_delay`, and starts over after a run of `stable_after`
+        seconds. Every other failure is raised."""
+        delay = first_delay
+        while not stop.is_set():
+            began = time.monotonic()
+            try:
+                if self._stream is None:
+                    await self.start()
+                await self.run(stop)
+                return
+            except Exception as exc:
+                if not is_transient(exc):
+                    raise
+                # Close what is left of the failed session; that may fail
+                # too, on connections already gone, and must not mask `exc`.
+                with contextlib.suppress(Exception):
+                    await self.close(final_checkpoint=False)
+                if time.monotonic() - began >= stable_after:
+                    delay = first_delay
+                self.counters["restarts"] += 1
+                log.warning(
+                    "pipeline interrupted (%r); restarting in %.1f s",
+                    exc, delay, extra={"error": repr(exc), "delay": delay},
+                )  # fmt: skip
+                with contextlib.suppress(TimeoutError):
+                    async with asyncio.timeout(delay):
+                        await stop.wait()
+                delay = min(delay * 2, max_delay)
+
     async def run(self, stop: asyncio.Event | None = None) -> None:
         stop = stop or asyncio.Event()
         monitor = asyncio.create_task(self._watch_slot(stop), name="deltaflow-slot-lag")
@@ -386,7 +462,14 @@ class DurableRunner:
             m.op_deltas.labels(operator=node["id"], direction="in").value = node["deltas_in"]
             m.op_deltas.labels(operator=node["id"], direction="out").value = node["deltas_out"]
             m.op_seconds.labels(operator=node["id"]).value = node["seconds"]
-        for name in ("bootstraps", "resumes", "checkpoints", "flushes", "idle_advances"):
+        for name in (
+            "bootstraps",
+            "resumes",
+            "checkpoints",
+            "flushes",
+            "idle_advances",
+            "restarts",
+        ):
             m.events.labels(event=name).value = self.counters[name]
         return m.registry
 

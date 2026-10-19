@@ -126,3 +126,21 @@ def test_unbound_or_behind_the_frontier() -> None:
     sink.advance(at(5))
     with pytest.raises(FrontierViolationError):
         sink.accept([Delta(nl(1), Lsn(4), 1)])
+
+
+def test_binding_again_starts_a_fresh_session() -> None:
+    """A runner that restarts in-process (after a dropped connection)
+    re-binds its sinks and replays from its checkpoint. Deltas and net
+    writes the failed session never flushed must not survive into the new
+    one, or the replay would apply them twice; nor may its frontier, or the
+    replay would be rejected as behind it."""
+    sink = bound()
+    sink.accept([Delta(nl(1), Lsn(1), 1)])
+    sink.advance(at(2))  # a net write, never taken (the flush failed)
+    sink.accept([Delta(nl(2), Lsn(3), 1)])  # pending, incomplete
+    sink.bind(view="per_country", columns=COLUMNS, key=("country",), watermark=None)
+    assert sink.frontier == at(0)
+    sink.accept([Delta(nl(1), Lsn(1), 1)])  # the replay
+    sink.advance(at(2))
+    writes = sink.take()
+    assert writes.inserts == [nl(1)]  # once

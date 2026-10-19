@@ -179,6 +179,41 @@ one checkpoint per checkpoint interval while idle.
   - repeated and lower positions are not reported;
   - progress is opt-in.
 
+## Restarting in-process
+
+A crash and a restart are exactly-once by the argument above, so a runner
+whose connection drops could always be restarted by a supervisor. With
+`DurableRunner.serve()` it restarts itself: on a transient failure it
+closes what is left without a final checkpoint (as a crash would), waits,
+and starts again, resuming from C. The wait doubles from 0.5 s up to
+30 s, and starts over after a minute of running.
+
+**What "transient" means** (`is_transient`, `test_restart_policy.py`):
+
+| Transient (waiting can fix it) | Raised (a restart would only repeat it) |
+|---|---|
+| connection errors; resets; timeouts; EOF mid-message; the server ending replication | wrong password, missing privilege or slot (by SQLSTATE) |
+| SQLSTATE classes 08 (connection), 53 (resources, e.g. too many connections) and 57 (server shutting down or starting) | certificate verification failure; TLS unavailable under sslmode=require |
+| 55006: the slot still held by a dying walsender | settings that cannot be honoured; protocol violations |
+| | drift between view and table; a fenced shard; changed views; bugs |
+
+**One thing a process restart gives for free, and an in-process one does
+not:** fresh objects. The views' sinks belong to the registry and outlive a
+runner session. A sink that kept the failed session's unflushed net writes
+would apply them on top of the replay, and one that kept its frontier
+would reject the replay as behind it. So `PostgresSink.bind()`, which every
+start calls, begins a new session.
+
+**Test.** `test_serve_rides_out_dropped_connections_exactly_once`
+terminates, in the middle of a load:
+
+1. the walsender;
+2. then the runner's other sessions.
+
+The runner restarts at least twice, bootstraps only once, and the sinks
+are exact. Without the sink reset it fails at the first restart with a
+`FrontierRegressionError`.
+
 ## The chaos suite
 
 `tests/chaos/test_kill9.py` runs the real worker
