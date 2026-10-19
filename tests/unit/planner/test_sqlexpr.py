@@ -66,6 +66,7 @@ def test_postgres_semantics(sql: str, value: object) -> None:
     assert result == value
     assert type(result) is type(value)
     if isinstance(value, Decimal):
+        assert isinstance(result, Decimal)
         assert result.as_tuple().exponent == value.as_tuple().exponent
 
 
