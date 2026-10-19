@@ -47,10 +47,10 @@ import pickle
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
-from fractions import Fraction
 from typing import Any
 
 from deltaflow.core import Delta, FrontierViolationError, Row
+from deltaflow.core.numeric import EXACT, numeric_div, scale_of
 from deltaflow.operators.base import Operator
 from deltaflow.replication.lsn import Lsn
 from deltaflow.state.codec import (
@@ -63,9 +63,8 @@ from deltaflow.state.codec import (
 from deltaflow.state.store import Keyspace, StateStore
 
 _COUNT = 8
-_EXACT = decimal.Context(
-    prec=1000, traps=[decimal.Inexact, decimal.Overflow, decimal.InvalidOperation]
-)
+_EXACT = EXACT
+__all__ = ["numeric_avg", "scale_of"]  # re-exported for callers and tests
 
 
 class AggregateError(RuntimeError):
@@ -110,46 +109,13 @@ class CountDistinct:
 
 type Aggregate = Count | Sum | Min | Max | Avg | CountDistinct
 
-#: from Postgres's numeric.c: significant digits a division keeps at least,
-#: decimal digits per base-10000 digit, and the largest display scale
-_MIN_SIG_DIGITS, _DEC_DIGITS, _MAX_DISPLAY_SCALE = 16, 4, 1000
-
-
-def scale_of(value: int | Decimal) -> int:
-    """A number's display scale: digits after the decimal point."""
-    if isinstance(value, int):
-        return 0
-    exponent = value.as_tuple().exponent
-    assert isinstance(exponent, int), f"not a finite number: {value!r}"
-    return max(0, -exponent)
-
-
-def _weight_and_first(value: int | Decimal) -> tuple[int, int]:
-    """Postgres's numeric layout of |value| in base 10000: the weight of its
-    first non-zero digit, and that digit (0, 0 for zero)."""
-    if value == 0:
-        return 0, 0
-    magnitude = abs(Fraction(value))
-    # copy_abs, not abs(): abs rounds to the context's 28 digits
-    weight = Decimal(value).copy_abs().adjusted() // _DEC_DIGITS
-    return weight, int(magnitude / Fraction(10) ** (_DEC_DIGITS * weight))
-
 
 def numeric_avg(total: int | Decimal, n: int, scale: int) -> Decimal:
-    """`total / n` as Postgres's avg returns it: numeric_div(sum, count).
-
-    The result scale is select_div_scale's: enough decimals for 16
-    significant digits (from an estimate of the quotient's weight), but no
-    fewer than the sum's scale (`scale`) and at most 1000. The quotient is
-    exact and rounded half away from zero (div_var with round = true)."""
-    weight1, first1 = _weight_and_first(total)
-    weight2, first2 = _weight_and_first(n)
-    qweight = weight1 - weight2 - (1 if first1 <= first2 else 0)
-    rscale = min(max(_MIN_SIG_DIGITS - qweight * _DEC_DIGITS, scale, 0), _MAX_DISPLAY_SCALE)
-    scaled = Fraction(total) / n * 10**rscale
-    magnitude = (2 * abs(scaled.numerator) + scaled.denominator) // (2 * scaled.denominator)
-    sign = 1 if scaled < 0 and magnitude else 0
-    return Decimal((sign, tuple(int(c) for c in str(magnitude)), -rscale))
+    """`total / n` as Postgres's avg returns it: numeric_div(sum, count),
+    where the sum's display scale is `scale`, the largest scale among the
+    values summed (a total that once held more decimals keeps them in its
+    Decimal, so the scale is passed rather than read off it)."""
+    return numeric_div(total, n, scale_a=scale)
 
 
 @dataclass(slots=True)
