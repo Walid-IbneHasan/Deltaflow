@@ -37,7 +37,8 @@ GROUP BY c.id;
 
 ```sh
 deltaflow run views.sql --slot analytics
-deltaflow cluster views.sql --worker-id w1 --slot-prefix analytics     --shards 6 --shard-by public.orders=customer_id --shard-by public.customers=id
+deltaflow cluster views.sql --worker-id w1 --slot-prefix analytics \
+    --shards 6 --shard-by public.orders=customer_id --shard-by public.customers=id
 ```
 
 Before anything streams (`runtime/sqlviews.py`):
@@ -61,6 +62,7 @@ Before anything streams (`runtime/sqlviews.py`):
    create the table. A cluster gets partial tables (`<table>__shards`, led
    by `shard`) and merge views over them.
 
+## What is maintained
 
 | Clause | Supported |
 |---|---|
