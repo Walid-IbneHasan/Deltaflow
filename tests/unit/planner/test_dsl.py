@@ -214,7 +214,7 @@ def test_group_by_agg_and_distinct_steps() -> None:
         (lambda b: b.group_by(), "at least one column"),
         (lambda b: b.group_by("a", "a"), "more than once"),
         (lambda b: b.group_by("a").agg(a=Count()), "collides with a group_by column"),
-        (lambda b: b.group_by("a").agg(n="count"), "Count, Sum, Min or Max"),
+        (lambda b: b.group_by("a").agg(n="count"), "Count, Sum, Min, Max, Avg or CountDistinct"),
         (lambda b: b.agg(), "at least one aggregate"),
         (lambda b: b.agg(n=Count()).join("public.c", on=("a", "b")), "after an aggregation"),
         (lambda b: b.distinct().join("public.c", on=("a", "b")), "after an aggregation"),

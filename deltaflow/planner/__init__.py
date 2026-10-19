@@ -1,6 +1,6 @@
 """View DSL -> operator graph, with validation at registration time."""
 
-from deltaflow.operators import Count, Max, Min, Sum
+from deltaflow.operators import Avg, Count, CountDistinct, Max, Min, Sum
 from deltaflow.planner.dsl import (
     Deltaflow,
     DistinctStep,
@@ -16,7 +16,9 @@ from deltaflow.planner.dsl import (
 )
 
 __all__ = [
+    "Avg",
     "Count",
+    "CountDistinct",
     "Deltaflow",
     "DistinctStep",
     "FilterStep",

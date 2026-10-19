@@ -24,6 +24,13 @@ emitted.
   the current extreme removes its entry (or decrements its count), and the
   next entry *is* the new extreme. Nothing is recomputed from the source,
   at the price of storing every value. See docs/aggregates.md.
+* **CountDistinct** keeps the same multiset; the count changes when a
+  value's multiplicity crosses zero. Numerically equal values (1.5, 1.50)
+  are one entry, as SQL compares them.
+* **Avg** keeps Sum's count and exact total, plus a multiset of the values'
+  scales: Postgres's avg is numeric_div(sum, count), whose result scale
+  depends on the sum's, which is the largest scale among the values summed
+  (`numeric_avg`).
 
 SQL semantics:
 - NULL group keys form one group;
@@ -40,6 +47,7 @@ import pickle
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
+from fractions import Fraction
 from typing import Any
 
 from deltaflow.core import Delta, FrontierViolationError, Row
@@ -86,14 +94,71 @@ class Max:
     column: str
 
 
-type Aggregate = Count | Sum | Min | Max
+@dataclass(frozen=True, slots=True)
+class Avg:
+    """AVG(column) of int and Decimal values, exactly as Postgres computes it."""
+
+    column: str
+
+
+@dataclass(frozen=True, slots=True)
+class CountDistinct:
+    """COUNT(DISTINCT column): the number of distinct non-NULL values."""
+
+    column: str
+
+
+type Aggregate = Count | Sum | Min | Max | Avg | CountDistinct
+
+#: from Postgres's numeric.c: significant digits a division keeps at least,
+#: decimal digits per base-10000 digit, and the largest display scale
+_MIN_SIG_DIGITS, _DEC_DIGITS, _MAX_DISPLAY_SCALE = 16, 4, 1000
+
+
+def scale_of(value: int | Decimal) -> int:
+    """A number's display scale: digits after the decimal point."""
+    if isinstance(value, int):
+        return 0
+    exponent = value.as_tuple().exponent
+    assert isinstance(exponent, int), f"not a finite number: {value!r}"
+    return max(0, -exponent)
+
+
+def _weight_and_first(value: int | Decimal) -> tuple[int, int]:
+    """Postgres's numeric layout of |value| in base 10000: the weight of its
+    first non-zero digit, and that digit (0, 0 for zero)."""
+    if value == 0:
+        return 0, 0
+    magnitude = abs(Fraction(value))
+    # copy_abs, not abs(): abs rounds to the context's 28 digits
+    weight = Decimal(value).copy_abs().adjusted() // _DEC_DIGITS
+    return weight, int(magnitude / Fraction(10) ** (_DEC_DIGITS * weight))
+
+
+def numeric_avg(total: int | Decimal, n: int, scale: int) -> Decimal:
+    """`total / n` as Postgres's avg returns it: numeric_div(sum, count).
+
+    The result scale is select_div_scale's: enough decimals for 16
+    significant digits (from an estimate of the quotient's weight), but no
+    fewer than the sum's scale (`scale`) and at most 1000. The quotient is
+    exact and rounded half away from zero (div_var with round = true)."""
+    weight1, first1 = _weight_and_first(total)
+    weight2, first2 = _weight_and_first(n)
+    qweight = weight1 - weight2 - (1 if first1 <= first2 else 0)
+    rscale = min(max(_MIN_SIG_DIGITS - qweight * _DEC_DIGITS, scale, 0), _MAX_DISPLAY_SCALE)
+    scaled = Fraction(total) / n * 10**rscale
+    magnitude = (2 * abs(scaled.numerator) + scaled.denominator) // (2 * scaled.denominator)
+    sign = 1 if scaled < 0 and magnitude else 0
+    return Decimal((sign, tuple(int(c) for c in str(magnitude)), -rscale))
 
 
 @dataclass(slots=True)
 class _Group:
     rows: int
     #: per aggregate: Count -> non-NULL count; Sum -> (non-NULL count, total);
-    #: Min/Max -> non-NULL count (the values themselves are in the keyspace)
+    #: Avg -> (non-NULL count, total, {scale: count of values});
+    #: Min/Max -> non-NULL count; CountDistinct -> distinct values (the values
+    #: themselves are in the keyspace)
     states: list[Any]
     out: dict[str, Any] | None
 
@@ -189,10 +254,27 @@ class GroupBy(Operator):
             return state + sum(d.diff for d in changes if d.row[column] is not None)
         if isinstance(agg, Sum):
             return self._fold_sum(agg.column, state, changes)
+        if isinstance(agg, Avg):
+            n, total, scales = state
+            n, total = self._fold_sum(agg.column, (n, total), changes, what="Avg")
+            for d in changes:
+                v = d.row[agg.column]
+                if v is not None:
+                    s = scale_of(v)
+                    scales[s] = scales.get(s, 0) + d.diff
+                    if not scales[s]:
+                        del scales[s]
+            return (n, total, scales)
+        if isinstance(agg, CountDistinct):
+            return self._fold_distinct(i, agg.column, kb, state, changes)
         return self._fold_extreme(i, agg.column, kb, state, changes)
 
     def _fold_sum(
-        self, column: str, state: tuple[int, int | Decimal], changes: list[Delta[Row]]
+        self,
+        column: str,
+        state: tuple[int, int | Decimal],
+        changes: list[Delta[Row]],
+        what: str = "Sum",
     ) -> tuple[int, int | Decimal]:
         n, total = state
         for d in changes:
@@ -201,7 +283,7 @@ class GroupBy(Operator):
                 continue
             if isinstance(v, bool) or not isinstance(v, int | Decimal):
                 raise AggregateError(
-                    f"{self.name}: Sum({column!r}) got {type(v).__name__} {v!r}; only "
+                    f"{self.name}: {what}({column!r}) got {type(v).__name__} {v!r}; only "
                     "int and Decimal are summed (float addition is not associative, "
                     "so an incremental sum could differ from a recompute)"
                 )
@@ -236,9 +318,28 @@ class GroupBy(Operator):
                 self._bump(entry, diff, v)
         return n
 
-    def _bump(self, entry: bytes, diff: int, value: Any) -> None:
+    def _fold_distinct(
+        self, i: int, column: str, kb: bytes, distinct: int, changes: list[Delta[Row]]
+    ) -> int:
+        """CountDistinct: the values go into the keyspace as for Min/Max;
+        the count moves when a value's multiplicity crosses zero."""
+        pending: dict[bytes, tuple[int, Any]] = {}
+        for d in changes:
+            v = d.row[column]
+            if v is not None:
+                entry = bytes([i]) + kb + encode_ordered(v)
+                seen, _ = pending.get(entry, (0, v))
+                pending[entry] = (seen + d.diff, v)
+        for entry, (diff, v) in pending.items():
+            if diff:
+                before, after = self._bump(entry, diff, v)
+                distinct += (after > 0) - (before > 0)
+        return distinct
+
+    def _bump(self, entry: bytes, diff: int, value: Any) -> tuple[int, int]:
         current = self._values.get(entry)
-        n = diff + (0 if current is None else int.from_bytes(current[:_COUNT], "big", signed=True))
+        before = 0 if current is None else int.from_bytes(current[:_COUNT], "big", signed=True)
+        n = before + diff
         if n < 0:
             raise AggregateError(f"{self.name}: value {value!r} would have a negative count")
         if n == 0:
@@ -246,6 +347,7 @@ class GroupBy(Operator):
         else:
             blob = current[_COUNT:] if current is not None else pickle.dumps(value, protocol=5)
             self._values.put(entry, n.to_bytes(_COUNT, "big", signed=True) + blob)
+        return before, n
 
     def _output(self, key: tuple[Any, ...], kb: bytes, group: _Group) -> Iterator[tuple[str, Any]]:
         yield from zip(self.names, key, strict=True)
@@ -259,6 +361,11 @@ class GroupBy(Operator):
                 case Sum():
                     n, total = state
                     yield name, total if n else None
+                case Avg():
+                    n, total, scales = state
+                    yield name, numeric_avg(total, n, max(scales)) if n else None
+                case CountDistinct():
+                    yield name, state
                 case Min() | Max():
                     if not state:
                         yield name, None
@@ -273,11 +380,19 @@ class GroupBy(Operator):
                     yield name, pickle.loads(found[1][_COUNT:])
 
     def _new_group(self) -> _Group:
-        states: list[Any] = [(0, 0) if isinstance(a, Sum) else 0 for a in self.aggregates.values()]
+        states: list[Any] = [_initial(a) for a in self.aggregates.values()]
         return _Group(0, states, None)
 
     def _save(self, kb: bytes, group: _Group) -> None:
         self._groups.put(kb, pickle.dumps((group.rows, group.states, group.out), protocol=5))
+
+
+def _initial(agg: Aggregate) -> Any:
+    if isinstance(agg, Sum):
+        return (0, 0)
+    if isinstance(agg, Avg):
+        return (0, 0, {})
+    return 0
 
 
 class Distinct(Operator):

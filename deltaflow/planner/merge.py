@@ -25,7 +25,7 @@ from typing import Any
 from psycopg import sql
 
 from deltaflow.core import Multiset, Row
-from deltaflow.operators import Count, Max, Min, Sum
+from deltaflow.operators import Avg, Count, CountDistinct, Max, Min, Sum
 from deltaflow.planner.dsl import DistinctStep, GroupStep, View
 
 SHARD_COLUMN = "shard"
@@ -67,6 +67,8 @@ def merge_partials(view: View, partials: Iterable[Multiset[Row]]) -> Multiset[Ro
 
 
 def _combine(agg: object, a: Any, b: Any) -> Any:
+    if isinstance(agg, Avg | CountDistinct):
+        raise ValueError(f"{agg!r} partials cannot be merged (registration refuses them)")
     if isinstance(agg, Count):
         return a + b
     if a is None:

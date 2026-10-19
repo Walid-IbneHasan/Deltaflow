@@ -103,9 +103,9 @@ c_k. The partials are disjoint and merge by union.
   covers both directions, with customers deleted while their orders stay,
   and orders moving between shards.
 
-**Not counted by `Count()`.** `Count()` is SQL's `count(*)`: it counts a
-padded row too. SQL's `count(column)`, which skips NULLs, has no
-counterpart yet.
+**Counting after a left join.** `Count()` is SQL's `count(*)`, so it
+counts a padded row too. `Count("orders.id")` is `count(o.id)`: it skips
+the NULLs of padded rows, as SQL does.
 
 ## 2. Why the indices may forget time
 

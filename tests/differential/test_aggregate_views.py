@@ -42,7 +42,7 @@ from deltaflow.core import Frontier, Row
 from deltaflow.devtools.loadgen import LoadStats, load_state
 from deltaflow.devtools.seed import seed_database
 from deltaflow.devtools.workload import COUNTRIES, STATUSES, OpKind, Workload, WorkloadConfig
-from deltaflow.planner import Count, Deltaflow, Max, Min, Sum
+from deltaflow.planner import Avg, Count, CountDistinct, Deltaflow, Max, Min, Sum
 from deltaflow.runtime import Runner
 from deltaflow.sinks import MemorySink
 from tests.differential.lockstep import MARKER, Sql, execute, until_marker
@@ -133,11 +133,13 @@ CASES: dict[str, Case] = {
                 last=Max("created_at"),
                 noted=Count("note"),
                 note_chars=Sum("note_len"),
+                avg_note=Avg("note_len"),
             )
             .sink(s)
         ),
         "SELECT customer_id, min(created_at) AS first, max(created_at) AS last,"
-        " count(note) AS noted, sum(length(note)) AS note_chars FROM orders GROUP BY customer_id",
+        " count(note) AS noted, sum(length(note)) AS note_chars, avg(length(note)) AS avg_note"
+        " FROM orders GROUP BY customer_id",
     ),
     # Text min/max (code-point order) and a nullable text max.
     "country_names": Case(
@@ -157,6 +159,29 @@ CASES: dict[str, Case] = {
         'SELECT country, count(*) AS n, count(email) AS emails, min(name COLLATE "C") AS first,'
         ' max(name COLLATE "C") AS last, max(email COLLATE "C") AS top_email'
         " FROM customers GROUP BY country",
+    ),
+    # avg as Postgres computes it (its numeric scale included), and
+    # count(DISTINCT ...) over a key and over a nullable text.
+    "status_averages": Case(
+        lambda df, s: (
+            df.view("status_averages")
+            .source("public.orders")
+            .group_by("status")
+            .agg(mean=Avg("amount"), customers=CountDistinct("customer_id"))
+            .sink(s)
+        ),
+        "SELECT status, avg(amount) AS mean, count(DISTINCT customer_id) AS customers"
+        " FROM orders GROUP BY status",
+    ),
+    "distinct_emails": Case(
+        lambda df, s: (
+            df.view("distinct_emails")
+            .source("public.customers")
+            .agg(emails=CountDistinct("email"), countries=CountDistinct("country"))
+            .sink(s)
+        ),
+        "SELECT count(DISTINCT email) AS emails, count(DISTINCT country) AS countries"
+        " FROM customers",
     ),
     "totals": Case(
         lambda df, s: (

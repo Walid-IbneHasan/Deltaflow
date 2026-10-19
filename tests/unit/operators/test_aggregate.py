@@ -5,6 +5,7 @@ group's min or max is the case min/max must survive."""
 
 from __future__ import annotations
 
+import decimal
 import itertools
 from decimal import Decimal
 from typing import Any
@@ -17,7 +18,9 @@ from deltaflow.core import Delta, FrontierViolationError, Multiset, Row, accumul
 from deltaflow.operators import (
     Aggregate,
     AggregateError,
+    Avg,
     Count,
+    CountDistinct,
     Distinct,
     GroupBy,
     Max,
@@ -25,6 +28,7 @@ from deltaflow.operators import (
     Source,
     Sum,
 )
+from deltaflow.operators.aggregate import numeric_avg, scale_of
 from deltaflow.replication.lsn import Lsn
 from deltaflow.state.store import StateStore
 
@@ -36,6 +40,8 @@ AGGS: dict[str, Aggregate] = {
     "s": Sum("v"),
     "lo": Min("v"),
     "hi": Max("v"),
+    "avg": Avg("v"),
+    "nd": CountDistinct("v"),
 }
 
 
@@ -43,6 +49,11 @@ def group_by(store: StateStore, keys: tuple[str, ...] = ("g",)) -> GroupBy:
     return GroupBy(
         Source("public.t"), keys=keys, aggregates=AGGS, store=store, name=f"g{next(_names)}"
     )
+
+
+def exact_sum(values: list[Any]) -> Any:
+    with decimal.localcontext(prec=1000):  # the default 28 digits round
+        return sum(values)
 
 
 def naive(rows: Multiset[Row], keys: tuple[str, ...]) -> Multiset[Row]:
@@ -63,14 +74,24 @@ def naive(rows: Multiset[Row], keys: tuple[str, ...]) -> Multiset[Row]:
                     "s": sum(values) if values else None,
                     "lo": min(values) if values else None,
                     "hi": max(values) if values else None,
+                    # Postgres's avg of exactly these values; its scale rule
+                    # is checked against Postgres in test_avg_matches_postgres
+                    "avg": numeric_avg(exact_sum(values), len(values), max(map(scale_of, values)))
+                    if values
+                    else None,
+                    "nd": len(set(values)),  # numerically equal values are one
                 }
             )
         )
     return out
 
 
+# Equal numbers at different scales (1.5, 1.50): one value for distinct,
+# but the largest scale present decides the scale of an average.
 values = st.one_of(
-    st.none(), st.integers(-5, 5), st.sampled_from([Decimal("1.50"), Decimal("-2.25")])
+    st.none(),
+    st.integers(-5, 5),
+    st.sampled_from([Decimal("1.50"), Decimal("1.5"), Decimal("-2.25"), Decimal("7.125")]),
 )
 rows = st.builds(
     lambda g, v: Row({"g": g, "v": v}), st.one_of(st.none(), st.integers(0, 2)), values
@@ -147,8 +168,8 @@ def test_an_update_inside_a_group_is_one_retraction_and_one_insertion(
         0, [Delta(Row({"g": 1, "v": 2}), Lsn(2), -1), Delta(Row({"g": 1, "v": 7}), Lsn(2), 1)]
     )
     assert [(dict(d.row), d.diff) for d in out] == [
-        ({"g": 1, "n": 1, "nn": 1, "s": 2, "lo": 2, "hi": 2}, -1),
-        ({"g": 1, "n": 1, "nn": 1, "s": 7, "lo": 7, "hi": 7}, 1),
+        ({"g": 1, "n": 1, "nn": 1, "s": 2, "lo": 2, "hi": 2, "avg": Decimal(2), "nd": 1}, -1),
+        ({"g": 1, "n": 1, "nn": 1, "s": 7, "lo": 7, "hi": 7, "avg": Decimal(7), "nd": 1}, 1),
     ]
     # A change that leaves the group's result unchanged emits nothing.
     same = op.process(
@@ -249,3 +270,22 @@ def test_distinct_equals_the_set_of_present_rows(
         batch += removals(model, [("any", p) for p in picks], t)
         output += op.process(0, batch)
         assert accumulate(output) == Multiset.of(r for r, _ in model.items())
+
+
+def test_numeric_avg_follows_postgres_scale_rules() -> None:
+    """Spot checks of numeric_div's scale (select_div_scale): at least 16
+    significant digits, never fewer decimals than the sum has, and half
+    away from zero. Each value here is what Postgres 16 prints."""
+    assert f"{numeric_avg(3, 2, 0):f}" == "1.5000000000000000"  # avg(1, 2)
+    assert f"{numeric_avg(0, 2, 0):f}" == "0.00000000000000000000"  # avg(0, 0)
+    assert f"{numeric_avg(Decimal('3.75'), 2, 2):f}" == "1.8750000000000000"
+    assert f"{numeric_avg(-2, 3, 0):f}" == "-0.66666666666666666667"  # half away from zero
+    # a 20-digit quotient already has 16 significant digits: no decimals
+    assert f"{numeric_avg(10**20, 3, 0):f}" == "33333333333333333333"
+
+
+def test_avg_refuses_floats(state_store: StateStore) -> None:
+    op = GroupBy(Source("public.t"), keys=(), aggregates={"a": Avg("v")}, store=state_store,
+                 name=f"g{next(_names)}")  # fmt: skip
+    with pytest.raises(AggregateError, match="float"):
+        op.process(0, [Delta(Row({"v": 1.5}), Lsn(1), 1)])

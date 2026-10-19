@@ -41,7 +41,8 @@ necessity.
 | distinct | `DISTINCT` of the union |
 | group_by + Count / Sum / Min / Max | Count and Sum add across shards; the min of the shards' minima is the minimum (and so for max); a NULL partial is skipped, as SQL does |
 
-Anything else is refused at registration (`test_views_that_cannot_be_sharded_exactly_are_refused`):
+Anything else is refused at registration (`test_views_that_cannot_be_sharded_exactly_are_refused`),
+including `Avg` and `CountDistinct`, whose shard results do not combine:
 
 - a join not on both shard columns;
 - a map before the join (it could change the key);

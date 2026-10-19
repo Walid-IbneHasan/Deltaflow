@@ -1,10 +1,13 @@
-"""Dataflow operators: sources, map and filter (M2), inner equi-join (M3),
-group_by with count/sum/min/max, and distinct (M4)."""
+"""Dataflow operators: sources, map and filter (M2), equi-join (M3; left
+outer since), group_by with count/sum/min/max (M4; avg and count distinct
+since), and distinct (M4)."""
 
 from deltaflow.operators.aggregate import (
     Aggregate,
     AggregateError,
+    Avg,
     Count,
+    CountDistinct,
     Distinct,
     GroupBy,
     Max,
@@ -18,7 +21,9 @@ from deltaflow.operators.linear import Filter, Map, MapFunction, Predicate
 __all__ = [
     "Aggregate",
     "AggregateError",
+    "Avg",
     "Count",
+    "CountDistinct",
     "Distinct",
     "Filter",
     "GroupBy",

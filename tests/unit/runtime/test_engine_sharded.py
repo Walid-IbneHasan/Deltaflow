@@ -16,7 +16,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from deltaflow.core import Row
-from deltaflow.planner import Count, Deltaflow, Max, Min, PlanError, Sum
+from deltaflow.planner import Avg, Count, CountDistinct, Deltaflow, Max, Min, PlanError, Sum
 from deltaflow.planner.merge import merge_partials
 from deltaflow.replication.changes import Change, RowDelete, RowInsert, RowUpdate, Transaction
 from deltaflow.replication.lsn import Lsn
@@ -207,6 +207,14 @@ def test_moving_into_a_shard_with_an_unchanged_toast_value_is_refused(
     ("build", "message"),
     [
         (lambda df: df.view("v").source("public.other"), "no shard column"),
+        (
+            lambda df: df.view("v").source("public.orders").group_by("cid").agg(a=Avg("amt")),
+            "cannot be merged",
+        ),
+        (
+            lambda df: df.view("v").source("public.orders").agg(n=CountDistinct("cid")),
+            "cannot be merged",
+        ),
         (
             lambda df: (
                 df.view("v").source("public.orders").join("public.customers", on=("id", "id"))

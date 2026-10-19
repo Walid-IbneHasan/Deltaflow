@@ -25,7 +25,17 @@ from dataclasses import dataclass
 from typing import Any
 
 from deltaflow.core import Row
-from deltaflow.operators import Aggregate, Count, MapFunction, Max, Min, Predicate, Sum
+from deltaflow.operators import (
+    Aggregate,
+    Avg,
+    Count,
+    CountDistinct,
+    MapFunction,
+    Max,
+    Min,
+    Predicate,
+    Sum,
+)
 from deltaflow.sinks import Sink
 
 _VIEW_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}")
@@ -286,10 +296,19 @@ class ViewBuilder:
         if self._source is None:
             raise PlanError(f"view {self._name!r}: call .source(table) before .agg()")
         for name, agg in aggregates.items():
-            if not isinstance(agg, Count | Sum | Min | Max):
+            if not isinstance(agg, Count | Sum | Min | Max | Avg | CountDistinct):
                 raise PlanError(
-                    f"aggregate {name}={agg!r}: expected Count, Sum, Min or Max "
-                    "(other aggregates are not maintained incrementally yet)"
+                    f"aggregate {name}={agg!r}: expected Count, Sum, Min, Max, Avg or "
+                    "CountDistinct (other aggregates are not maintained incrementally yet)"
+                )
+            if self._registry.shards and isinstance(agg, Avg | CountDistinct):
+                # Per-shard averages, or per-shard distinct counts, cannot be
+                # combined into the whole's: that needs each shard's sum and
+                # count, or its set of values.
+                raise PlanError(
+                    f"aggregate {name}={agg!r} in a sharded view: shard results cannot be "
+                    "merged exactly (aggregate Sum and Count per shard instead, and divide "
+                    "in a query over the merge view)"
                 )
             if name in (names or keys):
                 raise PlanError(f"aggregate name {name!r} collides with a group_by column")
