@@ -15,6 +15,17 @@ that position is reported as flushed, so it is the only position the server
 may discard WAL up to. Transactions received but not acknowledged are
 re-sent after a reconnect, which makes delivery at-least-once; exactly-once
 is the sink's job (M5).
+
+With `progress=True` the stream also yields `Progress(lsn)` events, from
+keepalives that arrive *between* transactions. The walsender reports there
+how far it has decoded, and every transaction committing before that point
+has already been sent (or skipped, having no published changes). So once
+everything before a Progress event is processed, its position may be
+acknowledged. Without that, a slot whose tables are idle never advances
+while the rest of the server writes WAL, and the server keeps all of it.
+A keepalive *inside* a transaction is never progress: the walsender sends
+a transaction while decoding its commit record, so the position it reports
+is past a transaction the consumer has only partly received.
 """
 
 from __future__ import annotations
@@ -23,6 +34,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Final
 
@@ -40,9 +52,16 @@ class ReplicationEndedError(Exception):
     """The server ended the replication stream without being asked to."""
 
 
+@dataclass(frozen=True, slots=True)
+class Progress:
+    """Every transaction committing before `lsn` has been delivered."""
+
+    lsn: Lsn
+
+
 _END: Final = object()
 LSN_ZERO: Final = Lsn(0)
-type Event = Transaction | Message
+type Event = Transaction | Message | Progress
 
 
 class ReplicationStream:
@@ -56,6 +75,7 @@ class ReplicationStream:
         messages: bool = True,
         status_interval: float = 10.0,
         max_pending: int = 32,
+        progress: bool = False,
     ) -> None:
         self._conn = conn
         self.slot = check_name(slot, "slot")
@@ -67,6 +87,9 @@ class ReplicationStream:
         self._assembler = TransactionAssembler()
         self._received = start_lsn
         self._flushed = start_lsn
+        self._progress = progress
+        #: the highest position delivered: a transaction's end, or progress
+        self._delivered = start_lsn
         self._closing = False
         self._reader: asyncio.Task[None] | None = None
         self._heartbeat: asyncio.Task[None] | None = None
@@ -111,7 +134,7 @@ class ReplicationStream:
             raise StopAsyncIteration
         if isinstance(item, BaseException):
             raise item
-        assert isinstance(item, Transaction | Message)
+        assert isinstance(item, Transaction | Message | Progress)
         return item
 
     def ack(self, lsn: Lsn) -> None:
@@ -137,14 +160,25 @@ class ReplicationStream:
                 if isinstance(msg, PrimaryKeepalive):
                     if msg.reply_requested:
                         await self.send_status()
+                    if (
+                        self._progress
+                        and not self._assembler.in_transaction
+                        and msg.wal_end > self._delivered
+                        and not self._closing
+                    ):
+                        self._received = max(self._received, msg.wal_end)
+                        self._delivered = msg.wal_end
+                        await self._queue.put(Progress(msg.wal_end))
                     continue
                 self._received = max(self._received, msg.wal_start)
                 event = self._assembler.feed(msg.wal_start, decode_message(msg.payload))
                 if event is None or self._closing:
                     continue
-                if isinstance(event, Transaction) and event.end_lsn <= self._start_lsn:
-                    log.info("skipping already-acknowledged transaction %s", event.xid)
-                    continue
+                if isinstance(event, Transaction):
+                    if event.end_lsn <= self._start_lsn:
+                        log.info("skipping already-acknowledged transaction %s", event.xid)
+                        continue
+                    self._delivered = max(self._delivered, event.end_lsn)
                 await self._queue.put(event)
             # The server sent CopyDone: either our close() asked for it, or it
             # ended the stream on its own.

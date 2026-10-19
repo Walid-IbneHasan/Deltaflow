@@ -16,7 +16,7 @@ The durable worker serves them on `--http-port` (default 9187, bound to
 | `deltaflow_operator_deltas_total{operator,direction}` | **per-operator throughput**: deltas into and out of each operator (rates via `rate()`) |
 | `deltaflow_operator_seconds_total{operator}` | time spent in each operator |
 | `deltaflow_state_bytes{kind}` | **state size**: SST and blob files on disk, memtables, cache usage |
-| `deltaflow_slot_lag_bytes` | **slot lag**: WAL the server retains for the slot (`pg_current_wal_lsn() − confirmed_flush_lsn`), polled every 2 s on its own connection |
+| `deltaflow_slot_lag_bytes` | **slot lag**: WAL the server retains for the slot (`pg_current_wal_lsn() − confirmed_flush_lsn`), polled every 2 s on its own connection. It stays bounded even while the views' tables are idle: the runner acknowledges keepalive progress at every checkpoint (`idle_advances` event) |
 | `deltaflow_apply_lag_bytes` | WAL received but not yet applied by the engine |
 | `deltaflow_stream_queued` | decoded transactions waiting for the engine; at its bound (32) the reader stops reading: backpressure |
 | `deltaflow_lsn{position}` | engine frontier, sink watermark, checkpoint LSN |

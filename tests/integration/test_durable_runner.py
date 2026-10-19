@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from pathlib import Path
+from typing import Any
 
 import psycopg
 import pytest
@@ -16,7 +17,8 @@ from deltaflow.devtools.seed import seed_database
 from deltaflow.devtools.worker import SINK_DDL, views
 from deltaflow.devtools.workload import Workload
 from deltaflow.planner import Count, Deltaflow, Max, PlanError, Sum
-from deltaflow.replication.slot import drop_slot, slot_exists
+from deltaflow.replication.lsn import Lsn
+from deltaflow.replication.slot import drop_slot, slot_confirmed_flush, slot_exists
 from deltaflow.replication.wire import ReplicationConnection
 from deltaflow.runtime import DurableRunner
 from deltaflow.sinks import MemorySink, PostgresSink
@@ -185,3 +187,73 @@ def test_resume_far_behind_the_sinks_replays_without_applying_twice(
             await drop(dsn, slot)
 
     run(go())
+
+
+def test_an_idle_source_does_not_pin_wal_on_a_busy_server(dsn: str, tmp_path: Path) -> None:
+    """The views' tables are quiet while another table is busy. Postgres
+    sends the slot nothing (it skips transactions with no published
+    changes), so a runner that acknowledges only applied transactions never
+    moves the slot, and the server keeps every byte of WAL since the last
+    published change: the source's disk fills. The runner must advance to
+    the keepalive positions instead, through a flush and a checkpoint, so
+    exactly-once still holds."""
+    slot = f"it_durable_{uuid.uuid4().hex[:8]}"
+
+    async def go() -> dict[str, Any]:
+        await fresh(dsn)
+        async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as sql:
+            await sql.execute("DROP TABLE IF EXISTS public.unrelated_busy")
+            await sql.execute(
+                "CREATE TABLE public.unrelated_busy (id bigserial PRIMARY KEY, payload text)"
+            )
+            runner = DurableRunner(
+                views(), dsn, state_dir=tmp_path, slot=slot, publication="it_durable",
+                flush_interval=0.05, checkpoint_interval=0.3, status_interval=0.2,
+            )  # fmt: skip
+            await runner.start()
+            stop = asyncio.Event()
+            task = asyncio.create_task(runner.run(stop))
+            try:
+                before = await slot_confirmed_flush(sql, slot)
+                for _ in range(20):  # about 2 MB of WAL, none of it published
+                    await sql.execute(
+                        "INSERT INTO public.unrelated_busy (payload)"
+                        " SELECT repeat('x', 1000) FROM generate_series(1, 100)"
+                    )
+                async with sql.cursor() as cur:
+                    await cur.execute("SELECT pg_current_wal_lsn()::text")
+                    row = await cur.fetchone()
+                assert row is not None
+                busy_end = Lsn.parse(str(row[0]))
+                deadline = asyncio.get_running_loop().time() + 20
+                confirmed = before
+                while confirmed < busy_end and asyncio.get_running_loop().time() < deadline:
+                    await asyncio.sleep(0.2)
+                    confirmed = await slot_confirmed_flush(sql, slot)
+                applied = runner.counters["transactions"]
+                # A published change still arrives, and the views are exact.
+                async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as conn:
+                    await run_load(conn, Workload(3, await load_state(conn)), txns=20)
+                await wait_caught_up(sql, await emit_marker(sql))
+                differences = await sink_differences(sql)
+            finally:
+                stop.set()
+                await task
+                await runner.close()
+                await sql.execute("DROP TABLE public.unrelated_busy")
+                await drop(dsn, slot)
+        return {
+            "advanced": confirmed >= busy_end,
+            "confirmed": str(confirmed),
+            "busy_end": str(busy_end),
+            "applied_while_busy": applied,
+            "idle_advances": runner.counters["idle_advances"],
+            "differences": differences,
+        }
+
+    outcome = run(go())
+    assert outcome["applied_while_busy"] == 0, outcome  # nothing published changed
+    assert outcome["advanced"], outcome
+    assert outcome["idle_advances"] >= 1, outcome
+    assert outcome["differences"] == [], outcome
+

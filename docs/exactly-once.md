@@ -125,6 +125,60 @@ The deterministic regression test
 `test_resume_far_behind_the_sinks_replays_without_applying_twice` fails
 without the first fix, in 16 seconds, on the third guard.
 
+## Idle sources: moving A without a transaction
+
+**The problem.** A slot advances only when the consumer acknowledges.
+Before this change the runner acknowledged only checkpoints, and the
+engine's frontier moved only with applied transactions. Now suppose the
+views' tables are quiet while the rest of the database is busy. Postgres
+sends the slot nothing: since PostgreSQL 15 it skips transactions with no
+published changes. So C never moves, A never moves, and the server keeps
+every byte of WAL written since the last published change. On a busy
+server that fills the disk. This is the well-known heartbeat problem of
+CDC tools.
+
+**What the server does say.** Between transactions, keepalives carry the
+position up to which the walsender has decoded. Every transaction
+committing before that point has already been sent, or skipped for having
+no published changes. Postgres's own subscriber acknowledges these
+positions. A keepalive *inside* a transaction is different: the
+walsender sends a whole transaction while decoding its commit record, so
+the position is past a transaction the consumer has only partly received.
+Acknowledging it could lose that transaction.
+
+**What the runner does.** The stream turns keepalives between
+transactions into `Progress(P)` events, in stream order
+(`replication/stream.py`, `progress=True`). The runner remembers the
+latest P. When a checkpoint is due and nothing is pending, it:
+
+1. advances the engine to P, which is valid: every transaction before P
+   has been applied (stream order), and any applied after it already moved
+   the frontier past P;
+2. flushes the sinks through P. No rows change, only the watermark: W = P;
+3. checkpoints at P, so C = P;
+4. acknowledges P, so A = P.
+
+This is the same order as for transactions, so A ≤ C ≤ W holds and the
+argument above is unchanged. Every later transaction commits at or after
+P, so the frontier still admits it. The cost is one watermark flush and
+one checkpoint per checkpoint interval while idle.
+
+**Tests.**
+
+- `test_an_idle_source_does_not_pin_wal_on_a_busy_server` writes about
+  2 MB of WAL to an unpublished table, then checks:
+  - the slot's `confirmed_flush_lsn` passes the end of that WAL, with
+    zero transactions applied;
+  - a later published change still arrives;
+  - the views stay exact.
+
+  Without progress events it fails: the slot stays at its bootstrap
+  position.
+- The unit tests in `test_stream_progress.py` cover:
+  - a keepalive inside a transaction is not progress;
+  - repeated and lower positions are not reported;
+  - progress is opt-in.
+
 ## The chaos suite
 
 `tests/chaos/test_kill9.py` runs the real worker

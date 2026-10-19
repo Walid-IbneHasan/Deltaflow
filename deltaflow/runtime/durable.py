@@ -20,6 +20,16 @@ most the work after C. On restart:
 Changes are neither lost (nothing after C was acknowledged) nor applied
 twice (the watermark commits atomically with the rows it covers).
 
+**Idle sources.** When the views' tables are quiet, no transaction arrives,
+so without more the slot would never advance while the rest of the server
+writes WAL, and the server would keep all of it. The stream therefore
+reports progress between transactions (stream.py): a position P before
+which every transaction has been delivered. When a checkpoint is due and
+nothing is pending, the runner advances the engine to P, flushes the
+watermark P (no rows), checkpoints at P and acknowledges it: the same
+order of operations, so the same argument. Every later transaction commits
+at or after P, so the frontier still admits it.
+
 If there is no usable checkpoint, the runner bootstraps instead and says
 so in the log and in `counters["bootstraps"]`. Reasons: first start, a
 missing slot, changed views, missing watermarks. Bootstrapping means: drop
@@ -41,6 +51,7 @@ from typing import Any
 
 import psycopg
 
+from deltaflow.core import Frontier
 from deltaflow.faults import crash_point
 from deltaflow.observability.memory import rss
 from deltaflow.observability.metrics import Registry
@@ -48,7 +59,7 @@ from deltaflow.planner import Deltaflow, PlanError
 from deltaflow.replication.changes import Transaction
 from deltaflow.replication.lsn import Lsn
 from deltaflow.replication.slot import create_publication, create_slot, drop_slot, slot_exists
-from deltaflow.replication.stream import ReplicationStream
+from deltaflow.replication.stream import Progress, ReplicationStream
 from deltaflow.replication.wire import ReplicationConnection
 from deltaflow.runtime.engine import Engine, fingerprint
 from deltaflow.runtime.runner import DEFAULT_MEMORY_BUDGET
@@ -132,6 +143,8 @@ class DurableRunner:
         self._sql: Conn | None = None
         self.flushed_lsn: Lsn | None = None
         self.checkpointed_lsn: Lsn | None = None
+        #: the latest progress the stream reported (idle sources)
+        self._progress_lsn: Lsn | None = None
 
     # --- start: resume or bootstrap ------------------------------------------
 
@@ -167,6 +180,7 @@ class DurableRunner:
                 publications=[self.publication],
                 start_lsn=start_lsn,
                 status_interval=self._status_interval,
+                progress=True,
             )
             await self._stream.start()
             self._stream.ack(start_lsn)
@@ -372,7 +386,7 @@ class DurableRunner:
             m.op_deltas.labels(operator=node["id"], direction="in").value = node["deltas_in"]
             m.op_deltas.labels(operator=node["id"], direction="out").value = node["deltas_out"]
             m.op_seconds.labels(operator=node["id"]).value = node["seconds"]
-        for name in ("bootstraps", "resumes", "checkpoints", "flushes"):
+        for name in ("bootstraps", "resumes", "checkpoints", "flushes", "idle_advances"):
             m.events.labels(event=name).value = self.counters[name]
         return m.registry
 
@@ -403,13 +417,12 @@ class DurableRunner:
             if due:
                 await self._flush()
                 pending = 0
-            if (
-                not pending
-                and self._state_lsn() != self.checkpointed_lsn
-                and now - last_checkpoint >= self._checkpoint_interval
-            ):
-                await self._checkpoint()
-                last_checkpoint = now
+            if not pending and now - last_checkpoint >= self._checkpoint_interval:
+                if self._advance_idle():
+                    await self._flush()
+                if self._state_lsn() != self.checkpointed_lsn:
+                    await self._checkpoint()
+                    last_checkpoint = now
 
     async def _next(self, timeout: float) -> Transaction | None:
         assert self._stream is not None
@@ -419,8 +432,23 @@ class DurableRunner:
                     event = await anext(self._stream)
                     if isinstance(event, Transaction):
                         return event
+                    if isinstance(event, Progress):
+                        self._progress_lsn = event.lsn
         except TimeoutError:
             return None
+
+    def _advance_idle(self) -> bool:
+        """Advance the engine to the latest reported progress, if that is
+        ahead of it. Called with nothing pending: every transaction before
+        that position has been applied (the stream delivers in order), and
+        any applied after it moved the frontier past it already."""
+        assert self.engine is not None
+        lsn = self._progress_lsn
+        if lsn is None or lsn <= self._state_lsn():
+            return False
+        self.engine.advance(Frontier.at(lsn))
+        self.counters["idle_advances"] += 1
+        return True
 
     def _state_lsn(self) -> Lsn:
         """Where the operator state is: the engine's frontier."""

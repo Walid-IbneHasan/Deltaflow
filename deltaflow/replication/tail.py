@@ -96,7 +96,7 @@ async def _tail(dsn: str, slot: str, publication: str) -> None:
             if isinstance(event, Transaction):
                 print(format_transaction(event), flush=True)
                 stream.ack(event.end_lsn)
-            else:
+            elif isinstance(event, Message):
                 print(f"MESSAGE {event.prefix}: {event.content!r} (non-transactional)")
     except asyncio.CancelledError:
         pass
