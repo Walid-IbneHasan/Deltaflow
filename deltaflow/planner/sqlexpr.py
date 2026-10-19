@@ -290,6 +290,12 @@ def expression(sql: str, kinds: dict[str, str] | None = None) -> Callable[[Row],
     return lambda row: output(compiled(row))
 
 
+def truth(value: Any) -> bool | None:
+    """A value as a condition: TRUE, FALSE or NULL (an untyped literal is
+    read as a boolean, as Postgres reads it)."""
+    return _boolean(value)
+
+
 def output(value: Any) -> Any:
     """A value as it leaves an expression: an untyped literal is text."""
     return str(value) if isinstance(value, Untyped) else value

@@ -138,6 +138,14 @@ class Deltaflow:
             raise PlanError(f"view {name!r} is already registered")
         return ViewBuilder(self, name)
 
+    def sql(self, sql: str, *, name: str | None = None, sink: Sink | None = None) -> View:
+        """Register a view written in SQL (planner/sql.py):
+        `CREATE [MATERIALIZED] VIEW schema.name AS SELECT ...` names the
+        view and its sink table; a bare SELECT needs `name` and `sink`."""
+        from deltaflow.planner.sql import sql_view  # noqa: PLC0415 - sql.py imports this module
+
+        return sql_view(self, sql, name=name, sink=sink)
+
     def freeze(self) -> None:
         self._frozen = True
 

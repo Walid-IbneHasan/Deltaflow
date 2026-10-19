@@ -20,7 +20,8 @@ to the size of the change, not the size of the tables.
 | M7 — scale-out: sharded views, Postgres leases with epoch fencing, failover | done — [notes](docs/milestones/M7.md), [design](docs/scale-out.md) |
 | After M7 — hardening: TLS, idle sources, restarts, the `deltaflow` command, left joins, avg and count distinct | done — [notes](docs/milestones/hardening.md) |
 
-Views can filter, map, project, join (inner and left) and aggregate source tables.
+Views can filter, map, project, join (inner and left) and aggregate source tables,
+written in SQL ([docs/sql.md](docs/sql.md)) or as Python steps.
 Operator state lives in RocksDB under a memory budget, and checkpoints
 make it survive crashes. Results go to Postgres tables exactly once, each
 with a watermark committed in the same transaction. This table
