@@ -1,8 +1,11 @@
 """SCRAM-SHA-256 client (RFC 5802 / RFC 7677), as used by PostgreSQL authentication.
 
-Channel binding (SCRAM-SHA-256-PLUS) is not supported because the replication
-connection does not use TLS. SASLprep is not implemented, so non-ASCII
-passwords are refused up front instead of failing authentication obscurely.
+Channel binding (SCRAM-SHA-256-PLUS) is not supported. Its tls-server-end-point
+type hashes the server certificate with the hash of the certificate's own
+signature algorithm, which the ssl module does not expose; so
+`channel_binding=require` is refused (conninfo.py) rather than pretended.
+SASLprep is not implemented, so non-ASCII passwords are refused up front
+instead of failing authentication obscurely.
 """
 
 from __future__ import annotations
@@ -44,6 +47,12 @@ class ScramSha256:
         self._nonce = nonce if nonce is not None else secrets.token_urlsafe(18)
         self._first_bare = f"n={username},r={self._nonce}"
         self._server_signature: bytes | None = None
+        self._verified = False
+
+    @property
+    def verified(self) -> bool:
+        """Whether the server proved it knows the password (server-final)."""
+        return self._verified
 
     def client_first(self) -> bytes:
         return (_GS2_HEADER + self._first_bare).encode()
@@ -79,3 +88,4 @@ class ScramSha256:
         received = base64.b64decode(attrs.get("v", ""))
         if not hmac.compare_digest(received, self._server_signature):
             raise ScramError("server signature mismatch: the server does not know the password")
+        self._verified = True

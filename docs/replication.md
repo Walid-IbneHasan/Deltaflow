@@ -166,4 +166,6 @@ loader honours the offset either way.
   against the new column list. Mapping a view's columns onto a changed table
   is a planner concern. Since M2 a column change on a live source raises
   `SchemaChangedError`.
-- TLS on the replication connection. See decision 0002.
+- SCRAM channel binding (`channel_binding=require` is refused). TLS
+  itself is supported, with libpq's settings and semantics: decision 0002,
+  amendment.

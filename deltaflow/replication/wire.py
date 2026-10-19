@@ -4,12 +4,18 @@ psycopg has no support for the streaming replication sub-protocol (CopyBoth),
 so the replication connection speaks the protocol directly. Only what
 replication needs is implemented:
 
+* TLS, negotiated as libpq does for every `sslmode` (conninfo.py resolves
+  the settings, environment variables included, and refuses those it
+  cannot honour);
 * startup with `replication=database`, authentication by trust, cleartext
-  password, MD5 or SCRAM-SHA-256;
+  password, MD5 or SCRAM-SHA-256, restricted by `require_auth` if set;
 * simple queries (replication commands such as CREATE_REPLICATION_SLOT);
 * CopyBoth mode for START_REPLICATION.
 
-There is no TLS: connect over localhost or a trusted network only.
+TLS is negotiated on the raw socket before any stream exists: after the
+server's one-byte "S", everything must be TLS. Bytes a man in the middle
+appends to that answer (CVE-2021-23222) then fail the handshake instead of
+being read as the server's first messages.
 """
 
 from __future__ import annotations
@@ -18,18 +24,19 @@ import asyncio
 import contextlib
 import hashlib
 import logging
+import socket
+import ssl
 import struct
 import sys
-from typing import Any
 
-from psycopg.conninfo import conninfo_to_dict
-
-from deltaflow.replication import scram
+from deltaflow.replication import conninfo, scram
 from deltaflow.replication._buffer import ByteReader
+from deltaflow.replication.conninfo import AuthPolicy, ConnectSettings
 
 log = logging.getLogger(__name__)
 
 _PROTOCOL_V3 = 3 << 16
+_SSL_REQUEST = struct.pack(">ii", 8, 80877103)
 _HEADER = struct.Struct(">ci")
 _I32 = struct.Struct(">i")
 
@@ -51,6 +58,20 @@ class PgError(Exception):
 
 class WireProtocolError(Exception):
     """The server sent a message that is not valid at this point of the protocol."""
+
+
+class TlsUnavailableError(ConnectionError):
+    """The server does not accept TLS connections, and sslmode requires TLS."""
+
+
+class _NoTls(Exception):
+    """The server answered "N" to SSLRequest."""
+
+
+#: authentication request codes, as require_auth names them
+_METHODS = {
+    AUTH_CLEARTEXT: "password", AUTH_MD5: "md5", AUTH_SASL: "scram-sha-256", 7: "gss", 9: "sspi",
+}  # fmt: skip
 
 
 def _cstr(s: str) -> bytes:
@@ -77,26 +98,86 @@ class ReplicationConnection:
     async def connect(
         cls, dsn: str, *, application_name: str = "deltaflow", timeout: float = 10.0
     ) -> ReplicationConnection:
-        info: dict[str, Any] = conninfo_to_dict(dsn)
-        host = str(info.get("host") or "localhost")
-        port = int(info.get("port") or 5432)
-        user = str(info["user"])
-        dbname = str(info.get("dbname") or user)
-        password = info.get("password")
-        async with asyncio.timeout(timeout):
-            if host.startswith("/") and sys.platform != "win32":
-                reader, writer = await asyncio.open_unix_connection(f"{host}/.s.PGSQL.{port}")
-            else:
-                reader, writer = await asyncio.open_connection(host, port)
-            conn = cls(reader, writer)
+        """Connect as libpq would for `dsn`. `timeout` applies unless the
+        settings give a `connect_timeout` (0 there means no limit)."""
+        settings = conninfo.resolve(dsn)
+        limit = timeout if settings.connect_timeout is None else settings.connect_timeout or None
+        async with asyncio.timeout(limit):
+            return await cls._negotiate(settings, application_name)
+
+    @classmethod
+    async def _negotiate(cls, s: ConnectSettings, app: str) -> ReplicationConnection:
+        """libpq's order of attempts for each sslmode. Unix sockets never use
+        TLS, as in libpq."""
+        if s.unix_socket or s.sslmode == "disable":
+            return await cls._attempt(s, app, None)
+        tls = conninfo.ssl_context(s)
+        assert tls is not None
+        if s.sslmode == "allow":
             try:
-                await conn._startup(
-                    user, dbname, None if password is None else str(password), application_name
-                )
+                return await cls._attempt(s, app, None)
+            except PgError as plaintext_refused:
+                log.info("plaintext connection refused (%s); retrying with TLS", plaintext_refused)
+                try:
+                    return await cls._attempt(s, app, tls)
+                except _NoTls:
+                    raise plaintext_refused from None
+        if s.sslmode == "prefer":
+            try:
+                # A server without TLS answers "N", and the same connection
+                # continues in plaintext.
+                return await cls._attempt(s, app, tls, plaintext_if_refused=True)
+            except (ssl.SSLError, ConnectionError) as exc:
+                log.warning(
+                    "TLS handshake with %s:%s failed (%s); retrying without TLS",
+                    s.host, s.port, exc,
+                )  # fmt: skip
+            return await cls._attempt(s, app, None)
+        try:
+            return await cls._attempt(s, app, tls)
+        except _NoTls:
+            raise TlsUnavailableError(
+                f"{s.host}:{s.port} does not accept TLS connections, and sslmode={s.sslmode} "
+                "requires TLS"
+            ) from None
+
+    @classmethod
+    async def _attempt(
+        cls,
+        s: ConnectSettings,
+        app: str,
+        tls: ssl.SSLContext | None,
+        *,
+        plaintext_if_refused: bool = False,
+    ) -> ReplicationConnection:
+        if s.unix_socket and sys.platform != "win32":
+            reader, writer = await asyncio.open_unix_connection(f"{s.host}/.s.PGSQL.{s.port}")
+        else:
+            sock = await _tcp_connect(s)
+            try:
+                if tls is not None and await _request_tls(sock):
+                    reader, writer = await asyncio.open_connection(
+                        sock=sock, ssl=tls, server_hostname=conninfo.server_hostname(s)
+                    )
+                elif tls is None or plaintext_if_refused:
+                    reader, writer = await asyncio.open_connection(sock=sock)
+                else:
+                    raise _NoTls
             except BaseException:
-                conn._abort()
+                sock.close()
                 raise
+        conn = cls(reader, writer)
+        try:
+            await conn._startup(s, app)
+        except BaseException:
+            conn._abort()
+            raise
         return conn
+
+    @property
+    def tls(self) -> bool:
+        """Whether this connection is encrypted."""
+        return self._writer.get_extra_info("ssl_object") is not None
 
     # -- framing -----------------------------------------------------------
 
@@ -126,10 +207,10 @@ class ReplicationConnection:
 
     # -- startup -----------------------------------------------------------
 
-    async def _startup(self, user: str, dbname: str, password: str | None, app: str) -> None:
+    async def _startup(self, s: ConnectSettings, app: str) -> None:
         params = {
-            "user": user,
-            "database": dbname,
+            "user": s.user,
+            "database": s.dbname,
             "replication": "database",
             "application_name": app,
             "client_encoding": "UTF8",
@@ -139,18 +220,32 @@ class ReplicationConnection:
             "TimeZone": "UTC",
             "extra_float_digits": "3",
         }
+        if s.options:
+            params["options"] = s.options
         body = _I32.pack(_PROTOCOL_V3) + b"".join(_cstr(k) + _cstr(v) for k, v in params.items())
         body += b"\0"
         self._writer.write(_I32.pack(len(body) + 4) + body)
 
         exchange: scram.ScramSha256 | None = None
+        method = "none"
         while True:
             tag, payload = await self._read()
             if self._background(tag, payload):
                 continue
             match tag:
                 case b"R":
-                    exchange = self._authenticate(payload, user, password, exchange)
+                    code = _I32.unpack_from(payload)[0]
+                    if code == AUTH_OK:
+                        _check_policy(s.require_auth, method, "authenticated the connection with")
+                        if exchange is not None and not exchange.verified:
+                            raise WireProtocolError(
+                                "server accepted the connection before completing SCRAM "
+                                "authentication, so it never proved it knows the password"
+                            )
+                    elif code in _METHODS and method != _METHODS[code]:
+                        method = _METHODS[code]
+                        _check_policy(s.require_auth, method, "asks for")
+                    exchange = self._authenticate(payload, s.user, s.password, exchange)
                 case b"K":
                     self.backend_pid = _I32.unpack_from(payload)[0]
                 case b"Z":
@@ -295,3 +390,47 @@ class ReplicationConnection:
     def _abort(self) -> None:
         self._closed = True
         self._writer.close()
+
+
+def _check_policy(policy: AuthPolicy, method: str, what: str) -> None:
+    """Refuse a method require_auth does not allow, before answering it."""
+    if not policy.allows(method):
+        raise WireProtocolError(
+            f"server {what} {method} authentication, which require_auth={policy.spec} "
+            "does not allow"
+        )
+
+
+async def _tcp_connect(s: ConnectSettings) -> socket.socket:
+    """A connected, non-blocking TCP socket to the first address that answers."""
+    loop = asyncio.get_running_loop()
+    infos = await loop.getaddrinfo(s.host, s.port, type=socket.SOCK_STREAM)
+    error: OSError | None = None
+    for family, kind, proto, _, address in infos:
+        sock = socket.socket(family, kind, proto)
+        try:
+            sock.setblocking(False)
+            await loop.sock_connect(sock, address)
+        except OSError as exc:
+            sock.close()
+            error = exc
+            continue
+        except BaseException:
+            sock.close()
+            raise
+        conninfo.apply_keepalives(sock, s)
+        return sock
+    raise error or OSError(f"could not resolve {s.host!r}")
+
+
+async def _request_tls(sock: socket.socket) -> bool:
+    """SSLRequest, and whether the server agreed. Exactly one byte of the
+    answer is read, so nothing sent after it can bypass the handshake."""
+    loop = asyncio.get_running_loop()
+    await loop.sock_sendall(sock, _SSL_REQUEST)
+    answer = await loop.sock_recv(sock, 1)
+    if answer in (b"S", b"N"):
+        return answer == b"S"
+    if not answer:
+        raise ConnectionError("server closed the connection during TLS negotiation")
+    raise WireProtocolError(f"unexpected answer {answer!r} to SSLRequest")

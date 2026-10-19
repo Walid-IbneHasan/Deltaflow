@@ -21,6 +21,7 @@ import psycopg
 from deltaflow.aio import run
 from deltaflow.observability.memory import rss
 from deltaflow.planner import Deltaflow
+from deltaflow.replication.wire import ReplicationConnection
 from deltaflow.runtime import Runner
 from deltaflow.sinks import MemorySink
 from tests.differential.lockstep import until_marker
@@ -44,7 +45,13 @@ async def main(dsn: str, budget: int) -> dict[str, object]:
         .select("orders.id", "country")
         .sink(sink)
     )
-    # Everything imported and connected-to-nothing: the process's own floor.
+    # The process's own floor: everything imported, and one connection of
+    # each kind opened and closed. The first connection initialises a TLS
+    # library, once per process and independent of any state: libpq's
+    # OpenSSL for psycopg, Python's for the replication connection (about
+    # 6 MiB together, measured; nothing more for later connections).
+    await (await psycopg.AsyncConnection.connect(dsn)).close()
+    await (await ReplicationConnection.connect(dsn)).close()
     baseline = rss().current
     started = time.perf_counter()
     async with Runner(

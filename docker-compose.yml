@@ -17,6 +17,16 @@ services:
       - max_replication_slots=16
       - -c
       - max_wal_senders=16
+      # TLS, with the certificate the image ships for "localhost". Clients
+      # default to sslmode=prefer, so every harness connection, replication
+      # included, is encrypted (tests/integration/test_tls.py). The key is
+      # the same in every copy of the image: for the harness only.
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem
+      - -c
+      - ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
       # wal_sender_timeout is left at its default (60s) and not set here:
       # command-line settings override ALTER SYSTEM, and the backpressure
       # test lowers it with ALTER SYSTEM.

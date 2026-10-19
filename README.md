@@ -70,7 +70,7 @@ everything else measuring found:
 Requires Docker, [uv](https://docs.astral.sh/uv/) and GNU make.
 
 ```sh
-make up      # Postgres 16 with wal_level=logical on localhost:55432
+make up      # Postgres 16 with wal_level=logical and TLS on localhost:55432
 make seed    # customers + orders, deterministic
 make load    # randomized inserts/updates/deletes; prints a replayable seed
 make check   # ruff, mypy --strict, pytest

@@ -12,7 +12,9 @@ SQL and reports its memory.
 What is asserted, and why:
 
 * `peak_rss - baseline_rss <= budget + UNBUDGETED`. The baseline is the
-  child's resident set after imports, before the engine exists. The peak is
+  child's resident set after imports and one throwaway connection of each
+  kind (which initialises the TLS libraries once), before the engine
+  exists. The peak is
   the OS's high-water mark for the whole run, snapshot included. The budget
   bounds RocksDB's cache, memtables and index/filter blocks. UNBUDGETED
   covers what the budget does not:
