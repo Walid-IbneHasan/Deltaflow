@@ -221,3 +221,165 @@ def test_a_views_spec_that_does_not_resolve_is_reported() -> None:
     result = deltaflow("run", "no_such_module_xyz:views", "--slot", "x")
     assert result.returncode == 2
     assert "cannot import no_such_module_xyz" in result.stderr
+
+
+# --- views written in SQL ------------------------------------------------------------
+
+SQL_VIEWS = {
+    "cli_sql.revenue_by_country": (
+        "SELECT c.country, count(*) AS orders, sum(o.amount) AS revenue, avg(o.amount) AS mean"
+        " FROM orders o JOIN customers c ON c.id = o.customer_id"
+        " WHERE o.status <> 'cancelled' GROUP BY c.country"
+    ),
+    "cli_sql.spend": (
+        "SELECT c.id AS customer, count(o.id) AS orders, COALESCE(sum(o.amount), 0) AS spent"
+        " FROM customers c LEFT JOIN orders o ON o.customer_id = c.id GROUP BY c.id"
+    ),
+    "cli_sql.paid_orders": (
+        "SELECT o.id, o.customer_id, o.amount FROM orders o WHERE o.status = 'paid'"
+    ),
+}
+
+
+def sql_file(path: Path, views: dict[str, str], *, materialized: str = "") -> Path:
+    path.write_text(
+        "\n".join(f"CREATE {materialized}VIEW {name} AS\n{q};\n" for name, q in views.items()),
+        encoding="utf-8",
+    )
+    return path
+
+
+def catalog(dsn: str, table: str) -> tuple[list[tuple[str, str]], list[str]]:
+    with psycopg.connect(dsn) as sql:
+        columns = sql.execute(
+            "SELECT attname::text, format_type(atttypid, atttypmod) FROM pg_attribute"
+            " WHERE attrelid = to_regclass(%s) AND attnum > 0 AND NOT attisdropped ORDER BY attnum",
+            (table,),
+        ).fetchall()
+        key = sql.execute(
+            "SELECT a.attname::text FROM pg_index i JOIN pg_attribute a"
+            " ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)"
+            " WHERE i.indrelid = to_regclass(%s) AND i.indisprimary ORDER BY a.attnum",
+            (table,),
+        ).fetchall()
+    return [(str(n), str(t)) for n, t in columns], [str(k) for (k,) in key]
+
+
+def test_run_a_sql_file_creating_its_sink_tables(dsn: str, tmp_path: Path) -> None:
+    prepare(dsn)
+    with psycopg.connect(dsn, autocommit=True) as sql:
+        sql.execute("DROP SCHEMA IF EXISTS cli_sql CASCADE")
+        sql.execute(
+            "DELETE FROM _deltaflow.watermarks WHERE view = ANY (%s)",
+            (["revenue_by_country", "spend", "paid_orders"],),
+        )
+    slot = f"it_cli_{uuid.uuid4().hex[:8]}"
+    views = sql_file(tmp_path / "views.sql", SQL_VIEWS)
+    log = tmp_path / "worker.log"
+    proc = spawn(
+        log, "run", str(views), "--dsn", dsn, "--slot", slot, "--publication", "it_cli_sql",
+        "--state-dir", str(tmp_path / "state"), "--http-port", "-1",
+        "--flush-interval", "0.05", "--checkpoint-interval", "0.3", "--log-format", "text",
+    )  # fmt: skip
+    try:
+        wait_for(log, r"(3) SQL views checked by Postgres", proc)
+        wait_for(log, r"worker pid=\d+ (bootstrapped);", proc)
+        # sink tables made from Postgres's own types, keyed by the views' keys
+        assert catalog(dsn, "cli_sql.revenue_by_country") == (
+            [
+                ("country", "text"),
+                ("orders", "bigint"),
+                ("revenue", "numeric"),
+                ("mean", "numeric"),
+            ],
+            ["country"],
+        )
+        assert catalog(dsn, "cli_sql.spend")[1] == ["customer"]
+        assert catalog(dsn, "cli_sql.paid_orders")[1] == ["id"]
+        marker = run(load_then_marker(dsn))
+        deadline = time.monotonic() + 60
+        for view in ("revenue_by_country", "spend", "paid_orders"):
+            while (w := watermark(dsn, view)) is None or w <= marker:
+                assert time.monotonic() < deadline, f"{view} never caught up"
+                time.sleep(0.1)
+        for table, query in SQL_VIEWS.items():
+            assert rows(dsn, f"SELECT * FROM {table}") == rows(dsn, query), table
+    finally:
+        proc.terminate()
+        proc.wait(timeout=30)
+    wait_inactive(dsn, slot)
+    deltaflow("reset", "--dsn", dsn, "--slot", slot)
+
+
+def test_a_sql_file_is_checked_before_anything_starts(dsn: str, tmp_path: Path) -> None:
+    """Postgres's own message for a mistake, and no slot created for it."""
+    slot = f"it_cli_{uuid.uuid4().hex[:8]}"
+    bad = sql_file(tmp_path / "bad.sql", {"cli_sql.bad": "SELECT o.id, o.nope FROM orders o"})
+    result = deltaflow("run", str(bad), "--dsn", dsn, "--slot", slot)
+    assert result.returncode == 2
+    assert "column o.nope does not exist" in result.stderr
+    keyless = sql_file(
+        tmp_path / "keyless.sql",
+        {
+            "cli_sql.pairs": (
+                "SELECT c.id, o.id AS order_id"
+                " FROM customers c LEFT JOIN orders o ON o.customer_id = c.id"
+            )
+        },
+    )
+    result = deltaflow("run", str(keyless), "--dsn", dsn, "--slot", slot)
+    assert result.returncode == 2
+    assert "the right side of a left join can be NULL" in result.stderr
+    with psycopg.connect(dsn) as sql:
+        assert (
+            sql.execute(
+                "SELECT 1 FROM pg_replication_slots WHERE slot_name = %s", (slot,)
+            ).fetchone()
+            is None
+        )
+
+
+def test_a_cluster_runs_a_sql_file(dsn: str, tmp_path: Path) -> None:
+    prepare(dsn)
+    with psycopg.connect(dsn, autocommit=True) as sql:
+        sql.execute("DROP SCHEMA IF EXISTS cli_sqlc CASCADE")
+        # a previous run's watermarks would make the wait below end at once
+        sql.execute("DELETE FROM _deltaflow.watermarks WHERE view LIKE 'per\\_customer@%%'")
+        sql.execute("DELETE FROM _deltaflow.shard_leases")
+        sql.execute("DELETE FROM _deltaflow.workers")
+    query = (
+        "SELECT o.customer_id, count(*) AS n, sum(o.amount) AS spent"
+        " FROM orders o GROUP BY o.customer_id"
+    )
+    views = sql_file(
+        tmp_path / "cluster.sql", {"cli_sqlc.per_customer": query}, materialized="MATERIALIZED "
+    )
+    prefix = f"it_clis_{uuid.uuid4().hex[:6]}"
+    log = tmp_path / "cluster.log"
+    proc = spawn(
+        log, "cluster", str(views), "--dsn", dsn, "--worker-id", "solo", "--slot-prefix", prefix,
+        "--publication", "it_cli_sql_cluster", "--shards", "2",
+        "--shard-by", "public.orders=customer_id", "--state-root", str(tmp_path / "cluster"),
+        "--http-port", "-1", "--ttl", "3", "--checkpoint-interval", "0.3", "--log-format", "text",
+    )  # fmt: skip
+    try:
+        wait_for(log, r"(1) SQL views checked by Postgres", proc)
+        # the partial table, led by the shard column, and the merge view over it
+        columns, key = catalog(dsn, "cli_sqlc.per_customer__shards")
+        assert columns[0] == ("shard", "integer")
+        assert key == ["shard", "customer_id"]
+        deadline = time.monotonic() + 90
+        while not all(watermark(dsn, f"per_customer@{n}") for n in (0, 1)):
+            assert time.monotonic() < deadline, "the shards never flushed"
+            time.sleep(0.2)
+        assert rows(dsn, "SELECT * FROM cli_sqlc.per_customer") == rows(dsn, query)
+    finally:
+        proc.terminate()
+        proc.wait(timeout=30)
+        wait_inactive(dsn, f"{prefix}%")
+        with psycopg.connect(dsn, autocommit=True) as sql:
+            sql.execute(
+                "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots"
+                " WHERE slot_name LIKE %s AND NOT active",
+                (f"{prefix}%",),
+            )

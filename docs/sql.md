@@ -20,7 +20,47 @@ df.sql("""
   rebuilds it; a Python view's function bodies are invisible to the
   fingerprint.
 
-## What is maintained
+## From a file, with the `deltaflow` command
+
+```sql
+-- views.sql
+CREATE VIEW analytics.revenue_by_country AS
+SELECT c.country, count(*) AS orders, sum(o.amount) AS revenue
+FROM orders o JOIN customers c ON c.id = o.customer_id
+GROUP BY c.country;
+
+CREATE VIEW analytics.spend AS
+SELECT c.id AS customer, count(o.id) AS orders, COALESCE(sum(o.amount), 0) AS spent
+FROM customers c LEFT JOIN orders o ON o.customer_id = c.id
+GROUP BY c.id;
+```
+
+```sh
+deltaflow run views.sql --slot analytics
+deltaflow cluster views.sql --worker-id w1 --slot-prefix analytics     --shards 6 --shard-by public.orders=customer_id --shard-by public.customers=id
+```
+
+Before anything streams (`runtime/sqlviews.py`):
+
+1. **Types.** The source tables' column types are read from the catalog,
+   so expressions are typed exactly as Postgres types them.
+2. **Validation.** Postgres checks every view itself: each is created as a
+   temporary view in a transaction that is rolled back. A mistake stops the
+   start with Postgres's own message ("column o.nope does not exist"),
+   before any slot or state exists.
+3. **Sink tables.** Missing ones are created with Postgres's column types
+   (`--no-create-sinks` requires them to exist instead). The primary key
+   is the view's key:
+   - the GROUP BY columns, which must be in the SELECT list;
+   - all columns of a DISTINCT view;
+   - or the source tables' primary keys, which the SELECT list must
+     include.
+
+   A plain left join's right side can be NULL and a primary key cannot,
+   so such a view is refused: aggregate it, or COALESCE the right key and
+   create the table. A cluster gets partial tables (`<table>__shards`, led
+   by `shard`) and merge views over them.
+
 
 | Clause | Supported |
 |---|---|

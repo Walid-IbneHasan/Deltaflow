@@ -89,8 +89,25 @@ make cluster-reset         # drop the cluster's slots, partial tables, leases an
 
 ## Run your own views
 
-Write the views in a module, create their sink tables, and point the
-`deltaflow` command at them:
+Write the views in SQL and point the `deltaflow` command at the file. Postgres
+checks every view before anything starts, and missing sink tables are created
+with Postgres's own column types ([docs/sql.md](docs/sql.md)):
+
+```sql
+-- views.sql
+CREATE VIEW analytics.revenue_by_country AS
+SELECT c.country, count(*) AS orders, sum(o.amount) AS revenue
+FROM orders o JOIN customers c ON c.id = o.customer_id
+WHERE o.status <> 'cancelled'
+GROUP BY c.country;
+```
+
+```sh
+deltaflow run views.sql --slot app
+```
+
+Or write them as Python steps in a module, create their sink tables, and
+point the command at the module:
 
 ```python
 # app/views.py

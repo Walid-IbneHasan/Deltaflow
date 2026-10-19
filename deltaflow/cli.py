@@ -1,6 +1,7 @@
 """The deltaflow command: run your own views.
 
     deltaflow run     app.views:registry --slot NAME                one durable worker
+    deltaflow run     views.sql --slot NAME                          views written in SQL
     deltaflow cluster app.views:make --worker-id ID --slot-prefix P one worker of a cluster
     deltaflow status  [--json]                 slots, lag, watermarks, workers, shard leases
     deltaflow reset   --slot NAME | --slot-prefix P              drop slots and their state
@@ -8,6 +9,12 @@
 `app.views:registry` names a `Deltaflow` registry, or a function that
 returns one, importable from the current directory. A cluster needs the
 function: every shard runs its own copy of the views, with its own sinks.
+
+A `.sql` file holds `CREATE [MATERIALIZED] VIEW schema.name AS SELECT ...;`
+statements (docs/sql.md). Before streaming, every view is checked by
+Postgres itself and typed from the catalog, and missing sink tables are
+created (`--no-create-sinks` to refuse instead); runtime/sqlviews.py. For
+a cluster, give `--shards` and `--shard-by table=column` for each table.
 
 Connection settings come from --dsn, else $DELTAFLOW_DSN, else libpq's
 environment variables (PGHOST, PGUSER, PGPASSWORD, PGSSLMODE, ...), which
@@ -43,7 +50,8 @@ import psycopg
 from deltaflow import aio
 from deltaflow.observability import logs
 from deltaflow.observability.http import Handler, MonitorServer, json_handler
-from deltaflow.planner import Deltaflow
+from deltaflow.planner import Deltaflow, PlanError
+from deltaflow.runtime import sqlviews
 from deltaflow.runtime.cluster import ClusterWorker, prepare_cluster
 from deltaflow.runtime.durable import DurableRunner
 from deltaflow.state.durable import StateDirectory
@@ -119,10 +127,16 @@ def parser() -> argparse.ArgumentParser:
         sub.add_argument("--http-port", type=int, default=9187, help="-1 disables; 0 picks one")
 
     run = commands.add_parser("run", help="run views in one durable worker")
-    run.add_argument("views", help="module:attribute naming the registry")
+    run.add_argument("views", help="module:attribute naming the registry, or a .sql file")
     run.add_argument("--slot", required=True, help="replication slot")
     run.add_argument("--publication", help="default: the slot's name")
     run.add_argument("--state-dir", help="default: .deltaflow/<slot>")
+    run.add_argument(
+        "--no-create-sinks",
+        dest="create_sinks",
+        action="store_false",
+        help="for a .sql file: require the sink tables to exist",
+    )
     run.add_argument(
         "--no-restart",
         dest="restart",
@@ -133,7 +147,23 @@ def parser() -> argparse.ArgumentParser:
     common(run)
 
     cluster = commands.add_parser("cluster", help="run one worker of a sharded cluster")
-    cluster.add_argument("views", help="module:function returning the sharded registry")
+    cluster.add_argument(
+        "views", help="module:function returning the sharded registry, or a .sql file"
+    )
+    cluster.add_argument("--shards", type=int, help="for a .sql file: the number of shards")
+    cluster.add_argument(
+        "--shard-by",
+        action="append",
+        default=[],
+        metavar="TABLE=COLUMN",
+        help="for a .sql file: a source table's shard column (once per table)",
+    )
+    cluster.add_argument(
+        "--no-create-sinks",
+        dest="create_sinks",
+        action="store_false",
+        help="for a .sql file: require the partial tables to exist",
+    )
     cluster.add_argument("--worker-id", required=True)
     cluster.add_argument("--slot-prefix", required=True, help="shard n streams <prefix>_s<n>")
     cluster.add_argument("--publication", help="default: the slot prefix")
@@ -216,7 +246,29 @@ async def serve_runner(
         print(f"stopped: {dict(runner.counters)}", flush=True)
 
 
-async def _run(args: argparse.Namespace, make: Callable[[], Deltaflow]) -> None:
+def _is_sql_file(spec: str) -> bool:
+    return spec.endswith(".sql")
+
+
+async def _sql_registry(
+    args: argparse.Namespace, *, shards: int | None = None, shard_by: dict[str, str] | None = None
+) -> Callable[[], Deltaflow]:
+    """The views of a .sql file, prepared against the database (checked,
+    typed, sinks created); a function building a fresh registry of them."""
+    try:
+        views = sqlviews.read_sql_file(args.views)
+    except OSError as exc:
+        raise CliError(f"cannot read {args.views}: {exc}") from None
+    catalog = await sqlviews.prepare(
+        args.dsn, views, create=args.create_sinks, shards=shards, shard_by=shard_by
+    )
+    print(f"{len(views)} SQL views checked by Postgres: {', '.join(v.table for v in views)}")
+    return lambda: sqlviews.build(views, catalog, shards=shards, shard_by=shard_by)
+
+
+async def _run(args: argparse.Namespace, make: Callable[[], Deltaflow] | None) -> None:
+    if make is None:
+        make = await _sql_registry(args)
     runner = DurableRunner(
         make(),
         args.dsn,
@@ -231,7 +283,14 @@ async def _run(args: argparse.Namespace, make: Callable[[], Deltaflow]) -> None:
     await serve_runner(runner, args, restart=args.restart)
 
 
-async def _cluster(args: argparse.Namespace, make: Callable[[], Deltaflow]) -> None:
+async def _cluster(args: argparse.Namespace, make: Callable[[], Deltaflow] | None) -> None:
+    if make is None:
+        if not args.shards or not args.shard_by:
+            raise CliError("a .sql file in a cluster needs --shards and --shard-by table=column")
+        shard_by = dict(_shard_column(item) for item in args.shard_by)
+        make = await _sql_registry(args, shards=args.shards, shard_by=shard_by)
+    elif args.shards or args.shard_by:
+        raise CliError("--shards and --shard-by are for .sql files; a registry defines its own")
     publication = args.publication or args.slot_prefix
     registry = make()
     await prepare_cluster(args.dsn, registry, publication)
@@ -265,6 +324,15 @@ async def _cluster(args: argparse.Namespace, make: Callable[[], Deltaflow]) -> N
     finally:
         if monitor is not None:
             await monitor.close()
+
+
+def _shard_column(item: str) -> tuple[str, str]:
+    table, eq, column = item.partition("=")
+    if not eq or not table or not column:
+        raise CliError(
+            f"--shard-by {item!r}: expected TABLE=COLUMN, e.g. public.orders=customer_id"
+        )
+    return table if "." in table else f"public.{table}", column
 
 
 async def status_report(dsn: str) -> dict[str, Any]:
@@ -401,11 +469,10 @@ def main(argv: list[str] | None = None) -> None:
         sys.stdout.reconfigure(errors="backslashreplace")
     try:
         if args.command == "run":
-            make = load_views(args.views)
-            command = _run(args, make)
+            command = _run(args, None if _is_sql_file(args.views) else load_views(args.views))
         elif args.command == "cluster":
-            make = load_views(args.views, factory=True)
-            command = _cluster(args, make)
+            sql_file = _is_sql_file(args.views)
+            command = _cluster(args, None if sql_file else load_views(args.views, factory=True))
         elif args.command == "status":
             command = _status(args)
         else:
@@ -414,7 +481,7 @@ def main(argv: list[str] | None = None) -> None:
             return
         with contextlib.suppress(KeyboardInterrupt):
             aio.run(command)
-    except CliError as exc:
+    except (CliError, PlanError) as exc:  # a mistake in the command or the views
         print(f"deltaflow: error: {exc}", file=sys.stderr)
         sys.exit(2)
 
