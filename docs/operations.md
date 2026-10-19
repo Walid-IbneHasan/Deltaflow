@@ -10,6 +10,20 @@ The durable worker serves them on `--http-port` (default 9187, bound to
 127.0.0.1). Format and server are hand-written
 ([decision 0006](decisions/0006-metrics-without-prometheus-client.md)).
 
+A cluster worker (`deltaflow cluster`) serves the same metrics for every
+shard it runs, at one endpoint and each labelled `shard="<n>"`. A family
+appears once, which the format requires, so the shards cannot simply be
+listed one after another (`observability.metrics.merge`). The worker adds
+its own metrics:
+
+- `deltaflow_cluster_owned_shards`;
+- `deltaflow_cluster_shard_events_total{event,shard}` (acquired, released,
+  failed);
+- `deltaflow_cluster_zombies_terminated_total`.
+
+Its `/api/stats` gives each shard's runner stats under `shards`, keyed by
+shard number.
+
 | Metric | What it measures |
 |---|---|
 | `deltaflow_end_to_end_lag_seconds` (histogram) | **freshness**: per transaction, source commit → commit of the sink transaction that made it visible |

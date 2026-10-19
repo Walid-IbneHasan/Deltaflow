@@ -20,11 +20,8 @@ resumes.
 from __future__ import annotations
 
 import argparse
-import asyncio
 import contextlib
 import io
-import os
-import signal
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -33,10 +30,10 @@ from typing import Any
 import psycopg
 
 from deltaflow import aio
+from deltaflow.cli import serve_runner
 from deltaflow.config import pg_dsn
 from deltaflow.core import Row
 from deltaflow.observability import logs
-from deltaflow.observability.http import MonitorServer, json_handler
 from deltaflow.planner import Count, Deltaflow, Max, Min, Sum
 from deltaflow.runtime import DurableRunner
 from deltaflow.sinks import PostgresSink
@@ -140,41 +137,8 @@ async def _main(args: argparse.Namespace) -> None:
         checkpoint_interval=args.checkpoint_interval,
         status_interval=2,
     )
-    stop = asyncio.Event()
-    if sys.platform != "win32":
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, stop.set)
-    await runner.start()
-    monitor = None
-    if args.http_port >= 0:
-        monitor = MonitorServer(
-            {
-                "/metrics": lambda: (
-                    "text/plain; version=0.0.4",
-                    runner.collect().expose().encode(),
-                ),
-                "/api/stats": json_handler(runner.stats),
-                "/healthz": lambda: ("text/plain", b"ok\n"),
-            },
-            host=args.http_host,
-            port=args.http_port,
-        )
-        await monitor.start()
-        print(f"metrics on http://{args.http_host}:{monitor.port}/metrics", flush=True)
-    how = "resumed" if runner.counters["resumes"] else "bootstrapped"
-    print(
-        f"worker pid={os.getpid()} {how}; checkpoint {runner.checkpointed_lsn}, "
-        f"sinks written through {runner.flushed_lsn}",
-        flush=True,
-    )
-    try:
-        await runner.run(stop)
-    finally:
-        if monitor is not None:
-            await monitor.close()
-        await runner.close()
-        print(f"stopped cleanly: {dict(runner.counters)}", flush=True)
+    # The same loop as `deltaflow run`: restarts after transient failures.
+    await serve_runner(runner, args)
 
 
 async def _reset(args: argparse.Namespace) -> None:

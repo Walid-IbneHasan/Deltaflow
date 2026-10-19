@@ -46,6 +46,7 @@ import logging
 import ssl
 import time
 from collections import Counter
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
@@ -173,6 +174,8 @@ class DurableRunner:
         self._sql: Conn | None = None
         self.flushed_lsn: Lsn | None = None
         self.checkpointed_lsn: Lsn | None = None
+        #: how the last start() went: "resumed" or "bootstrapped"
+        self.started_by: str | None = None
         #: the latest progress the stream reported (idle sources)
         self._progress_lsn: Lsn | None = None
 
@@ -203,11 +206,13 @@ class DurableRunner:
             reason = await self._why_not_resume(checkpoint, have_slot)
             if reason is None and checkpoint is not None:
                 start_lsn = await self._resume(checkpoint, shapes)
+                self.started_by = "resumed"
             else:
                 log.warning(
                     "bootstrapping from a fresh snapshot: %s", reason, extra={"reason": reason}
                 )
                 start_lsn = await self._bootstrap(repl, have_slot, shapes)
+                self.started_by = "bootstrapped"
             self._stream = ReplicationStream(
                 repl,
                 slot=self.slot,
@@ -349,6 +354,7 @@ class DurableRunner:
         first_delay: float = 0.5,
         max_delay: float = 30.0,
         stable_after: float = 60.0,
+        on_start: Callable[[], None] | None = None,
     ) -> None:
         """Start (unless started) and run until `stop`, restarting after
         transient failures (`is_transient`): a dropped connection, a server
@@ -356,13 +362,16 @@ class DurableRunner:
         last checkpoint, which keeps the results exactly-once (the argument
         at the top of this module). The delay doubles from `first_delay` up
         to `max_delay`, and starts over after a run of `stable_after`
-        seconds. Every other failure is raised."""
+        seconds. Every other failure is raised. `on_start` is called after
+        every successful start."""
         delay = first_delay
         while not stop.is_set():
             began = time.monotonic()
             try:
                 if self._stream is None:
                     await self.start()
+                    if on_start is not None:
+                        on_start()
                 await self.run(stop)
                 return
             except Exception as exc:

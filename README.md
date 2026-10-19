@@ -85,5 +85,46 @@ make cluster-worker ID=w1  # sharded worker; start w2, w3 alongside, kill any of
 make cluster-reset         # drop the cluster's slots, partial tables, leases and state
 ```
 
+## Run your own views
+
+Write the views in a module, create their sink tables, and point the
+`deltaflow` command at them:
+
+```python
+# app/views.py
+from deltaflow.planner import Count, Deltaflow, Sum
+from deltaflow.sinks import PostgresSink
+
+def registry() -> Deltaflow:
+    df = Deltaflow()
+    (
+        df.view("orders_by_status")
+        .source("public.orders")
+        .group_by("status")
+        .agg(orders=Count(), revenue=Sum("amount"))
+        .sink(PostgresSink("analytics.orders_by_status"))  # PRIMARY KEY (status)
+    )
+    return df
+```
+
+```sh
+deltaflow run app.views:registry --slot app     # one durable worker; metrics on :9187
+deltaflow status                                # slots and the WAL they retain, watermarks, leases
+deltaflow reset --slot app                      # drop the slot and the state (refused while in use)
+deltaflow cluster app.views:sharded --worker-id w1 --slot-prefix app   # one worker of a cluster
+```
+
+Some details:
+
+- **Connection settings** come from `--dsn`, or `$DELTAFLOW_DSN`, or
+  libpq's `PG*` variables. They are resolved as libpq resolves them,
+  `sslmode` included, for the replication connection too.
+- **Restarts.** `run` restarts after transient failures, resuming from its
+  checkpoint, so results stay exactly-once.
+- **Clusters.** A cluster needs a sharded registry
+  (`Deltaflow(shards=N, shard_by=...)`) and, per view, a partial table
+  `<table>__shards` with a leading `shard` column. `cluster` creates the
+  merge view `<table>` over it ([docs/scale-out.md](docs/scale-out.md)).
+
 Design decisions are in [`docs/decisions/`](docs/decisions/), and per-milestone
 notes are in [`docs/milestones/`](docs/milestones/).

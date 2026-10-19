@@ -63,6 +63,28 @@ Python (`merge_partials`) for the property test:
   fail. The global `smallest` comes out as the largest of the shards'
   minima.
 
+## Running a cluster
+
+```sh
+deltaflow cluster app.views:sharded --worker-id w1 --slot-prefix app   # on each worker
+```
+
+`app.views:sharded` is a function returning a fresh sharded registry: every
+shard runs its own copy, with its own sinks. Before starting, the worker
+runs `prepare_cluster`, under an advisory lock so that workers starting
+together do it once:
+
+- the coordination tables;
+- each view's merge view `<table>` over the partial table
+  `<table>__shards`. You create the partial table: a leading `shard`
+  column, which also leads its primary key, then the view's columns;
+- a publication covering the views' tables. Missing tables are added,
+  nothing is dropped.
+
+`deltaflow status` shows the workers' heartbeats and the shard leases.
+`deltaflow reset --slot-prefix app` drops the shard slots and state, and
+is refused while any of them is in use.
+
 ## 3. Shards to workers, and what happens when one dies
 
 Each worker (`runtime/cluster.py`) loops every `heartbeat` seconds:

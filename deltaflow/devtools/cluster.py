@@ -25,16 +25,13 @@ from pathlib import Path
 from typing import Any
 
 import psycopg
-from psycopg import sql
 
 from deltaflow import aio
 from deltaflow.config import pg_dsn
 from deltaflow.core import Row
 from deltaflow.observability import logs
 from deltaflow.planner import Count, Deltaflow, Max, Min, Sum
-from deltaflow.planner.merge import merge_view_sql
-from deltaflow.replication.slot import create_publication
-from deltaflow.runtime.cluster import CLUSTER_DDL, ClusterWorker
+from deltaflow.runtime.cluster import CLUSTER_DDL, ClusterWorker, prepare_cluster
 from deltaflow.sinks import PostgresSink
 from deltaflow.sinks.postgres import ensure_watermark_table
 
@@ -125,47 +122,15 @@ def views(shards: int) -> Deltaflow:
 
 
 async def setup(dsn: str, shards: int, publication: str) -> None:
-    """Partial tables, merge views, publication; once, whoever gets there first."""
-    async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as conn:
-        async with conn.transaction():
-            await conn.execute("SELECT pg_advisory_xact_lock(%s)", (SETUP_LOCK,))
-            await conn.execute(PARTIAL_DDL)
-            await conn.execute(CLUSTER_DDL)
-            await ensure_watermark_table(conn)
-            for view in views(shards).views:
-                assert isinstance(view.sink, PostgresSink)
-                partial = f"{view.sink.table}__shards"
-                schema, name = partial.split(".", 1)
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        "SELECT attname::text FROM pg_attribute WHERE attrelid = %s::regclass"
-                        " AND attnum > 0 AND NOT attisdropped ORDER BY attnum",
-                        (f"{schema}.{name}",),
-                    )
-                    columns = [str(r[0]) for r in await cur.fetchall()][1:]  # minus shard
-                await conn.execute(merge_view_sql(view, view.sink.table, partial, columns))
-        # Make sure the publication covers both tables. Recreating the tables
-        # (make seed) silently drops them from it. ALTER, never DROP: other
-        # workers may be streaming from it.
-        tables = ["public.orders", "public.customers"]
-        async with conn.cursor() as cur:
-            await cur.execute("SELECT 1 FROM pg_publication WHERE pubname = %s", (publication,))
-            exists = await cur.fetchone() is not None
-            await cur.execute(
-                "SELECT schemaname || '.' || tablename FROM pg_publication_tables"
-                " WHERE pubname = %s",
-                (publication,),
-            )
-            covered = {str(r[0]) for r in await cur.fetchall()}
-        if not exists:
-            await create_publication(conn, publication, tables)
-        for table in tables:
-            if table not in covered and exists:
-                await conn.execute(
-                    sql.SQL("ALTER PUBLICATION {} ADD TABLE {}").format(
-                        sql.Identifier(publication), sql.Identifier(*table.split("."))
-                    )
-                )
+    """Partial tables, then what every sharded registry needs (merge views,
+    publication, coordination tables): once, whoever gets there first."""
+    async with (
+        await psycopg.AsyncConnection.connect(dsn, autocommit=True) as conn,
+        conn.transaction(),
+    ):
+        await conn.execute("SELECT pg_advisory_xact_lock(%s)", (SETUP_LOCK,))
+        await conn.execute(PARTIAL_DDL)
+    await prepare_cluster(dsn, views(shards), publication)
 
 
 async def _main(args: argparse.Namespace) -> None:

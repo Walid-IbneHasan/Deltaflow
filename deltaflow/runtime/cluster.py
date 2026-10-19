@@ -52,11 +52,16 @@ from pathlib import Path
 from typing import Any
 
 import psycopg
+from psycopg import sql
 
-from deltaflow.planner import Deltaflow
+from deltaflow.observability.metrics import Registry, merge
+from deltaflow.planner import Deltaflow, PlanError
+from deltaflow.planner.merge import merge_view_sql
+from deltaflow.replication.slot import create_publication
 from deltaflow.replication.wire import PgError
 from deltaflow.runtime.durable import DurableRunner
 from deltaflow.sharding import owner
+from deltaflow.sinks.postgres import SHARD_COLUMN, PostgresSink, SinkError, ensure_watermark_table
 
 log = logging.getLogger(__name__)
 
@@ -99,6 +104,91 @@ class _Owned:
 RETRY_FIRST, RETRY_MAX, RETRY_STABLE_AFTER = 0.5, 30.0, 60.0
 
 
+class ClusterMetrics:
+    """The worker's own metrics; its shards' come from their runners."""
+
+    def __init__(self) -> None:
+        r = self.registry = Registry()
+        self.owned = r.gauge("deltaflow_cluster_owned_shards", "Shards this worker owns")
+        self.shard_events = r.counter(
+            "deltaflow_cluster_shard_events_total",
+            "Shard acquisitions, releases and pipeline failures on this worker",
+            labels=("event", "shard"),
+        )
+        self.zombies = r.counter(
+            "deltaflow_cluster_zombies_terminated_total",
+            "Stale holders of a shard lock whose sessions this worker terminated",
+        )
+
+
+#: advisory lock serialising prepare_cluster() between workers starting together
+PREPARE_LOCK = 0x0DE1F11
+
+
+async def prepare_cluster(dsn: str, registry: Deltaflow, publication: str) -> None:
+    """What a sharded registry needs in the database before its workers
+    start, done once by whichever worker gets there first:
+
+    - the coordination tables and the watermark table;
+    - for each view, the merge view `<table>` over its partial table
+      `<table>__shards` (which must exist, with a leading `shard` column
+      that also leads its primary key);
+    - a publication covering the views' tables. Missing tables are added;
+      nothing is ever dropped, because other workers may be streaming."""
+    if registry.shards is None:
+        raise PlanError(
+            "a cluster needs a sharded registry: Deltaflow(shards=N, shard_by={table: column})"
+        )
+    async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(%s)", (PREPARE_LOCK,))
+            await conn.execute(CLUSTER_DDL)
+            await ensure_watermark_table(conn)
+            for view in registry.views:
+                if not isinstance(view.sink, PostgresSink):
+                    raise PlanError(f"view {view.name!r}: a cluster needs PostgresSink sinks")
+                partial = f"{view.sink.table}__shards"
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT attname::text FROM pg_attribute WHERE attrelid = to_regclass(%s)"
+                        " AND attnum > 0 AND NOT attisdropped ORDER BY attnum",
+                        (partial,),
+                    )
+                    columns = [str(r[0]) for r in await cur.fetchall()]
+                if not columns or columns[0] != SHARD_COLUMN:
+                    raise SinkError(
+                        f"view {view.name!r} needs the partial table {partial}, starting with a "
+                        f"{SHARD_COLUMN!r} column that leads its primary key (docs/scale-out.md)"
+                    )
+                await conn.execute(merge_view_sql(view, view.sink.table, partial, columns[1:]))
+        await _cover(conn, publication, registry.sources)
+
+
+async def _cover(
+    conn: psycopg.AsyncConnection[tuple[Any, ...]], publication: str, tables: tuple[str, ...]
+) -> None:
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT 1 FROM pg_publication WHERE pubname = %s", (publication,))
+        exists = await cur.fetchone() is not None
+        await cur.execute(
+            "SELECT schemaname || '.' || tablename FROM pg_publication_tables WHERE pubname = %s",
+            (publication,),
+        )
+        covered = {str(r[0]) for r in await cur.fetchall()}
+    if not exists:
+        await create_publication(conn, publication, tables)
+        return
+    for table in tables:
+        if table not in covered:
+            # e.g. a table dropped and recreated: DROP TABLE takes it out of
+            # every publication, silently
+            await conn.execute(
+                sql.SQL("ALTER PUBLICATION {} ADD TABLE {}").format(
+                    sql.Identifier(publication), sql.Identifier(*table.split("."))
+                )
+            )
+
+
 @dataclass
 class ClusterStats:
     acquired: Counter[int] = field(default_factory=Counter)
@@ -139,6 +229,9 @@ class ClusterWorker:
         self._ttl = ttl
         self._runner_options = runner_options or {}
         self.owned: dict[int, _Owned] = {}
+        #: the pipeline currently running for each owned shard
+        self.runners: dict[int, DurableRunner] = {}
+        self.metrics = ClusterMetrics()
         #: shard -> (loop time before which it is not taken again, last delay)
         self._retry: dict[int, tuple[float, float]] = {}
         self.stats = ClusterStats()
@@ -381,6 +474,7 @@ class ClusterWorker:
     async def _run_shard(self, shard: int, epoch: int, stop: asyncio.Event) -> None:
         for attempt in range(40):
             runner = self._runner(shard, epoch)
+            self.runners[shard] = runner
             try:
                 await runner.start()
             except PgError as exc:
@@ -404,7 +498,37 @@ class ClusterWorker:
             finally:
                 with contextlib.suppress(Exception):
                     await runner.close(final_checkpoint=clean)
+                if self.runners.get(shard) is runner:
+                    del self.runners[shard]
             return
+
+    def collect(self) -> str:
+        """Prometheus text for the worker and every shard it runs: the
+        cluster's own metrics, then each runner's under a `shard` label."""
+        m = self.metrics
+        m.owned.set(len(self.owned))
+        for name, counts in (
+            ("acquired", self.stats.acquired),
+            ("released", self.stats.released),
+            ("failed", self.stats.runner_failures),
+        ):
+            for shard, n in counts.items():
+                m.shard_events.labels(event=name, shard=str(shard)).value = n
+        m.zombies.labels().value = self.stats.zombies_terminated
+        shards = {str(s): r.collect() for s, r in sorted(self.runners.items())}
+        return m.registry.expose() + merge(shards, label="shard")
+
+    def stats_json(self) -> dict[str, Any]:
+        """The worker's view of the cluster, JSON-able."""
+        return {
+            "worker": self.worker_id,
+            "owned": {str(s): {"epoch": o.epoch} for s, o in sorted(self.owned.items())},
+            "shards": {str(s): r.stats() for s, r in sorted(self.runners.items())},
+            "acquired": dict(self.stats.acquired),
+            "released": dict(self.stats.released),
+            "runner_failures": dict(self.stats.runner_failures),
+            "zombies_terminated": self.stats.zombies_terminated,
+        }
 
     async def _take_slot(self, slot: str) -> None:
         assert self._conn is not None

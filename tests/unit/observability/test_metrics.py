@@ -6,7 +6,7 @@ import logging
 import pytest
 
 from deltaflow.observability.logs import JsonFormatter
-from deltaflow.observability.metrics import Registry
+from deltaflow.observability.metrics import Registry, merge
 
 
 def test_prometheus_text_exposition() -> None:
@@ -91,3 +91,31 @@ def test_an_unlabelled_metric_is_exposed_before_it_is_touched() -> None:
     reg = Registry()
     reg.counter("deltaflow_untouched_total", "x")
     assert "deltaflow_untouched_total 0\n" in reg.expose()
+
+
+def test_registries_merge_under_a_label() -> None:
+    """A cluster worker serves all its shards' metrics at once: one HELP and
+    TYPE per family, and every sample labelled with its shard."""
+    shards = {}
+    for shard in ("0", "1"):
+        r = Registry()
+        r.counter("deltaflow_transactions_total", "Transactions").inc(int(shard) + 1)
+        r.counter("deltaflow_events_total", "Events", labels=("event",)).labels(event="flush").inc()
+        h = r.histogram("deltaflow_lag_seconds", "Lag", buckets=(0.1, 1.0))
+        h.observe(0.05)
+        shards[shard] = r
+    text = merge(shards, label="shard")
+    lines = text.splitlines()
+    assert lines.count("# TYPE deltaflow_transactions_total counter") == 1
+    assert 'deltaflow_transactions_total{shard="0"} 1' in lines
+    assert 'deltaflow_transactions_total{shard="1"} 2' in lines
+    assert 'deltaflow_events_total{event="flush",shard="1"} 1' in lines
+    assert 'deltaflow_lag_seconds_bucket{shard="0",le="0.1"} 1' in lines
+    assert 'deltaflow_lag_seconds_count{shard="1"} 1' in lines
+    # every family's samples directly follow its own header
+    families = [ln.split()[2] for ln in lines if ln.startswith("# TYPE")]
+    assert families == [
+        "deltaflow_transactions_total",
+        "deltaflow_events_total",
+        "deltaflow_lag_seconds",
+    ]

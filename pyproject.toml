@@ -9,6 +9,9 @@ dependencies = [
     "rocksdict>=0.3.29",
 ]
 
+[project.scripts]
+deltaflow = "deltaflow.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest>=8.3",

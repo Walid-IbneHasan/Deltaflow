@@ -13,7 +13,7 @@ from __future__ import annotations
 import bisect
 import math
 import re
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
 _NAME = re.compile(r"[a-zA-Z_:][a-zA-Z0-9_:]*")
@@ -53,9 +53,17 @@ class _Metric:
             parts.append(extra)
         return "{" + ",".join(parts) + "}" if parts else ""
 
-    def expose(self) -> Iterator[str]:
+    def header(self) -> Iterator[str]:
         yield f"# HELP {self.name} {self.help}"
         yield f"# TYPE {self.name} {self.kind}"
+
+    def samples(self, extra: str = "") -> Iterator[str]:
+        """The sample lines; `extra` is one more rendered label, `k="v"`."""
+        return iter(())
+
+    def expose(self) -> Iterator[str]:
+        yield from self.header()
+        yield from self.samples()
 
 
 class _Value:
@@ -99,10 +107,9 @@ class _Family[V: _Value](_Metric):
         child = self._children.get(self._key(labels))
         return child.value if child else 0.0
 
-    def expose(self) -> Iterator[str]:
-        yield from super().expose()
+    def samples(self, extra: str = "") -> Iterator[str]:
         for key, child in self._children.items():
-            yield f"{self.name}{self._render_labels(key)} {_number(child.value)}"
+            yield f"{self.name}{self._render_labels(key, extra)} {_number(child.value)}"
 
     def snapshot(self) -> list[dict[str, Any]]:
         return [
@@ -164,14 +171,15 @@ class Histogram(_Metric):
                 return self.buckets[i] if i < len(self.buckets) else self.max
         return self.max
 
-    def expose(self) -> Iterator[str]:
-        yield from super().expose()
+    def samples(self, extra: str = "") -> Iterator[str]:
         seen = 0
+        prefix = f"{extra}," if extra else ""
         for bound, n in zip([*self.buckets, math.inf], self.counts, strict=True):
             seen += n
-            yield f'{self.name}_bucket{{le="{_number(bound)}"}} {seen}'
-        yield f"{self.name}_sum {_number(round(self.sum, 9))}"
-        yield f"{self.name}_count {self.count}"
+            yield f'{self.name}_bucket{{{prefix}le="{_number(bound)}"}} {seen}'
+        labels = f"{{{extra}}}" if extra else ""
+        yield f"{self.name}_sum{labels} {_number(round(self.sum, 9))}"
+        yield f"{self.name}_count{labels} {self.count}"
 
     def snapshot(self) -> list[dict[str, Any]]:
         return [
@@ -217,3 +225,26 @@ class Registry:
             if isinstance(m, Counter | Gauge | Histogram):
                 out[name] = m.snapshot()
         return out
+
+    def metrics(self) -> Iterator[_Metric]:
+        return iter(self._metrics.values())
+
+
+def merge(registries: Mapping[str, Registry], *, label: str) -> str:
+    """Several registries of the same metrics as one exposition: each family
+    once, its samples from every registry labelled `label="<key>"`. This is
+    how a cluster worker serves all of its shards at one endpoint; listing
+    the registries one after another would repeat every family, which the
+    format does not allow."""
+    if not _NAME.fullmatch(label):
+        raise ValueError(f"invalid label name {label!r}")
+    families: dict[str, list[tuple[str, _Metric]]] = {}
+    for key, registry in registries.items():
+        for metric in registry.metrics():
+            families.setdefault(metric.name, []).append((key, metric))
+    lines: list[str] = []
+    for members in families.values():
+        lines.extend(members[0][1].header())
+        for key, metric in members:
+            lines.extend(metric.samples(f'{label}="{_escape(key)}"'))
+    return "".join(line + "\n" for line in lines)
