@@ -204,7 +204,7 @@ class DurableRunner:
         max_transaction_changes: int = 10_000,
         sink_spill_after: int = 100_000,
         failover: bool | None = None,
-        max_batch_transactions: int = 256,
+        max_batch_transactions: int = 32,
     ) -> None:
         """With `shard`, this runner maintains that shard of a sharded
         registry: its sinks write partial rows to `<table>__shards`, its
@@ -259,6 +259,8 @@ class DurableRunner:
         self._max_txn_changes = max_transaction_changes
         self._spill_after = sink_spill_after
         self._failover = failover
+        #: a batch is what the stream has queued (32 events), so this rarely binds;
+        #: batches of 32 already gave nearly all the gain (operations.md)
         self._max_batch = max_batch_transactions
         #: an event read while gathering a batch that cannot join it
         self._held: Transaction | TransactionPart | None = None

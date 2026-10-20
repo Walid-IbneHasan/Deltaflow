@@ -241,8 +241,9 @@ output, RocksDB reads, key encoding and row hashing. Two changes help:
   encoding caches short strings, small varints and each row shape's
   sorted column names.
 - **Batches.** When the stream has already queued transactions behind
-  the one at hand, the runner applies up to 256 of them as one step
-  (`Engine.apply_batch`, `max_batch_transactions`). Their changes are
+  the one at hand, the runner applies them as one step
+  (`Engine.apply_batch`). A batch is at most what the stream has
+  queued (32 events; `max_batch_transactions` caps it too). Its changes are
   consolidated, so a key changed several times is read and written
   once. The runner never waits to fill a batch. Under light load each
   transaction is still its own step, so batching changes nothing for
@@ -260,7 +261,7 @@ at the same time:
 | before | 2,619 | |
 | hot paths, one transaction at a time | 3,276 | 1.25× |
 | batches of 32 | 4,787 | 1.83× |
-| batches of 256 | 4,857 | 1.85× |
+| batches of 256 (more than the runner's queue can hold) | 4,857 | 1.85× |
 
 The end-to-end `make bench` figures in the README are M6's; they were
 not measured again in this round (the host ran short of memory). The
