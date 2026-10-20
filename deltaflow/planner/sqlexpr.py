@@ -13,6 +13,10 @@ registration rather than being approximated:
   `IS [NOT] NULL`, `IS [NOT] TRUE/FALSE/UNKNOWN`, `[NOT] IN (...)`,
   `[NOT] BETWEEN [SYMMETRIC]`, `IS [NOT] DISTINCT FROM`, `[NOT] LIKE`,
   CASE, COALESCE, NULLIF, GREATEST, LEAST, `abs`, `round`, `length`;
+- json and jsonb: `-> ->> #> #>>`, jsonb `?`, jsonb `=`, casts to and from
+  text (core/values.py, verified against Postgres);
+- arrays: subscripts, `= ANY (...)` and the other comparisons with ANY and
+  ALL, `cardinality`, `array_length`;
 - `COLLATE "C"`, which ordering comparisons of text require: under any
   other collation the order is the locale's, which Python does not have.
 
@@ -55,11 +59,16 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
+import psycopg
 from pglast import ast, enums, parse_sql
 from pglast.stream import RawStream
+from psycopg.pq import Format
 
 from deltaflow.core import Row
+from deltaflow.core.jsontext import JsonError, jsonb_in
+from deltaflow.core.jsontext import parse as json_parse
 from deltaflow.core.numeric import EXACT, numeric_div, positive_zero, round_half_away
+from deltaflow.core.values import Json, Jsonb, PgArray, get, get_path, get_path_text, get_text
 from deltaflow.planner.dsl import PlanError
 
 INT8_MIN, INT8_MAX = -(2**63), 2**63 - 1
@@ -387,23 +396,9 @@ class _Compiler:
         op = str(node.name[-1].sval) if node.name else ""
         K = enums.A_Expr_Kind
         if kind == K.AEXPR_OP:
-            if node.lexpr is None:
-                return self._unary(op, self.node(node.rexpr), sql)
-            left, right = self.node(node.lexpr), self.node(node.rexpr)
-            collate = left.collate_c or right.collate_c
-            if op in _COMPARISONS:
-                return _fold(
-                    sql, [left, right], lambda a, b: _compare(op, a, b, collate), kind="bool"
-                )
-            if op in _ARITHMETIC:
-                result = _arith_kind(left.kind, right.kind)
-                return _fold(
-                    sql, [left, right], lambda a, b: _promote(_arith(op, a, b), result),
-                    kind=result,
-                )  # fmt: skip
-            if op == "||":
-                return _fold(sql, [left, right], _concat, kind="text")
-            raise SqlError(f"operator {op} is not supported: {sql}")
+            return self._operator(node, op, sql)
+        if kind in (K.AEXPR_OP_ANY, K.AEXPR_OP_ALL):
+            return self._any(node, op, sql, every=kind == K.AEXPR_OP_ALL)
         if kind in (K.AEXPR_DISTINCT, K.AEXPR_NOT_DISTINCT):
             left, right = self.node(node.lexpr), self.node(node.rexpr)
             negate = kind == K.AEXPR_NOT_DISTINCT
@@ -432,6 +427,80 @@ class _Compiler:
         ):
             return self._between(node, sql)
         raise SqlError(f"{sql} is not supported in a maintained view")
+
+    def _operator(self, node: ast.A_Expr, op: str, sql: str) -> Compiled:
+        if node.lexpr is None:
+            return self._unary(op, self.node(node.rexpr), sql)
+        left, right = self.node(node.lexpr), self.node(node.rexpr)
+        collate = left.collate_c or right.collate_c
+        if op in _COMPARISONS:
+            return _fold(sql, [left, right], lambda a, b: _compare(op, a, b, collate), kind="bool")
+        if op in _ARITHMETIC:
+            result = _arith_kind(left.kind, right.kind)
+            return _fold(
+                sql, [left, right], lambda a, b: _promote(_arith(op, a, b), result), kind=result
+            )
+        if op == "||":
+            return _fold(sql, [left, right], _concat, kind="text")
+        if op in _JSON_OPERATORS:
+            return self._json(op, left, right, sql)
+        raise SqlError(f"operator {op} is not supported: {sql}")
+
+    def _json(self, op: str, doc: Compiled, step: Compiled, sql: str) -> Compiled:
+        if doc.kind not in ("json", "jsonb", None):
+            raise SqlError(f"{sql}: {op} takes json or jsonb on its left, not {doc.kind}")
+        if op == "?":
+            return _fold(sql, [doc, step], _has_key, kind="bool")
+        index = step.kind == "int"
+        if op in ("#>", "#>>"):
+            by_path = get_path if op == "#>" else get_path_text
+            return _fold(sql, [doc, step], lambda d, p: _json_call(by_path, d, _path(p)),
+                         kind=doc.kind if op == "#>" else "text")  # fmt: skip
+        by_step = get if op == "->" else get_text
+        return _fold(sql, [doc, step], lambda d, s: _json_call(by_step, d, _step(s, index)),
+                     kind=doc.kind if op == "->" else "text")  # fmt: skip
+
+    def _any(self, node: ast.A_Expr, op: str, sql: str, *, every: bool) -> Compiled:
+        if op not in _COMPARISONS:
+            raise SqlError(f"{sql}: only comparisons are supported with ANY and ALL")
+        left, right = self.node(node.lexpr), self.node(node.rexpr)
+        if right.kind is not None and not right.kind.endswith("[]"):
+            raise SqlError(f"{sql}: ANY and ALL take an array here, not a subquery")
+        collate = left.collate_c or right.collate_c
+
+        def evaluate(a: Any, array: Any) -> bool | None:
+            if not isinstance(array, PgArray):
+                raise EvalError("ANY and ALL take an array")
+            seen_null = False
+            for v in _flat(array):
+                found = _compare(op, a, v, collate)
+                if found is None:
+                    seen_null = True
+                elif found != every:
+                    return found
+            return None if seen_null else every
+
+        # NULL on the left gives NULL only if the array has elements.
+        def strict_left(a: Any, array: Any) -> bool | None:
+            if array is None:
+                return None
+            if a is None:
+                return None if _flat(array) else every
+            return evaluate(a, array)
+
+        return _fold(sql, [left, right], strict_left, strict=False, kind="bool")
+
+    def _A_Indirection(self, node: ast.A_Indirection, sql: str) -> Compiled:
+        array = self.node(node.arg)
+        if array.kind is not None and not array.kind.endswith("[]"):
+            raise SqlError(f"{sql}: subscripts are supported on arrays only")
+        indexes = []
+        for item in _items(node.indirection):
+            if not isinstance(item, ast.A_Indices) or item.is_slice:
+                raise SqlError(f"{sql}: only single subscripts (a[i]) are supported, not slices")
+            indexes.append(self.node(item.uidx))
+        element = None if array.kind is None else array.kind[:-2] or None
+        return _fold(sql, [array, *indexes], _subscript, kind=element)
 
     def _unary(self, op: str, arg: Compiled, sql: str) -> Compiled:
         if op == "-":
@@ -654,17 +723,18 @@ class _Compiler:
 
 
 _AGGREGATES = frozenset({"count", "sum", "min", "max", "avg"})
+_JSON_OPERATORS = frozenset({"->", "->>", "#>", "#>>", "?"})
 
 _CAST_KINDS = {
     **dict.fromkeys(INT_WIDTH, "int"),
     "numeric": "numeric", "decimal": "numeric", "text": "text", "varchar": "text",
     "bool": "bool", "boolean": "bool", "date": "date", "timestamptz": "timestamptz",
-    "timestamp": "timestamp", "float8": "float",
+    "timestamp": "timestamp", "float8": "float", "json": "json", "jsonb": "jsonb",
 }  # fmt: skip
 
 
 def _function_kind(name: str, args: list[str | None]) -> str | None:
-    if name in ("length", "char_length", "character_length"):
+    if name in ("length", "char_length", "character_length", "cardinality", "array_length"):
         return "int"
     if name == "abs":
         return args[0] if args[0] != "unknown" else None
@@ -773,6 +843,14 @@ def _compare(op: str, a: Any, b: Any, collate_c: bool) -> bool | None:
 
 def _comparable(op: str, a: Any, b: Any, collate_c: bool) -> None:
     """Raise unless Python compares `a` and `b` as Postgres would."""
+    if isinstance(a, Json) or isinstance(b, Json):
+        raise EvalError("could not identify an equality operator for type json")
+    if isinstance(a, Jsonb | PgArray) or isinstance(b, Jsonb | PgArray):
+        if type(a) is not type(b):
+            raise EvalError(f"cannot compare {type(a).__name__} with {type(b).__name__}")
+        if op not in ("=", "<>"):
+            raise EvalError(f"ordering {type(a).__name__} values is not supported")
+        return
     if isinstance(a, str) and isinstance(b, str):
         if op not in ("=", "<>") and not collate_c:
             raise EvalError(
@@ -854,6 +932,8 @@ def _text(v: Any) -> str:
         return format(v, "f")
     if isinstance(v, dt.date) and not isinstance(v, dt.datetime):
         return v.isoformat()
+    if isinstance(v, Json | Jsonb):
+        return v.text
     raise EvalError(
         f"converting {type(v).__name__} to text depends on session settings; not supported"
     )
@@ -965,7 +1045,136 @@ def _length(a: Any) -> int:
     return len(a)
 
 
+def _flat(array: PgArray) -> list[Any]:
+    """Every element, all dimensions, in order."""
+    out: list[Any] = []
+    for v in array:
+        if isinstance(v, PgArray):
+            out.extend(_flat(v))
+        else:
+            out.append(v)
+    return out
+
+
+def _dims(array: PgArray) -> list[int]:
+    """The length of each dimension (none for an empty array)."""
+    dims: list[int] = []
+    level: Any = array
+    while isinstance(level, PgArray) and level:
+        dims.append(len(level))
+        level = level[0]
+    return dims
+
+
+def _cardinality(array: Any) -> int:
+    if not isinstance(array, PgArray):
+        raise EvalError("cardinality() takes an array")
+    return len(_flat(array))
+
+
+def _array_length(array: Any, dim: Any) -> int | None:
+    if not isinstance(array, PgArray) or isinstance(dim, bool) or not isinstance(dim, int):
+        raise EvalError("array_length() takes an array and an integer")
+    dims = _dims(array)
+    return dims[dim - 1] if 1 <= dim <= len(dims) else None
+
+
+def _subscript(array: Any, *indexes: Any) -> Any:
+    """a[i][j]...: 1-based; out of range, or fewer subscripts than the
+    array has dimensions, is NULL."""
+    if not isinstance(array, PgArray):
+        raise EvalError("subscripts take an array")
+    if len(indexes) != len(_dims(array)):
+        return None
+    value: Any = array
+    for i in indexes:
+        if isinstance(i, bool) or not isinstance(i, int):
+            raise EvalError("array subscripts must be integers")
+        if not 1 <= i <= len(value):
+            return None
+        value = value[i - 1]
+    return value
+
+
+def _json_call(fn: Callable[..., Any], *args: Any) -> Any:
+    try:
+        return fn(*args)
+    except JsonError as exc:
+        raise EvalError(str(exc)) from None
+
+
+def _step(step: Any, index: bool) -> str | int:
+    """The right of -> and ->>: an int4 index or a text key, as typed."""
+    if index or (isinstance(step, int) and not isinstance(step, bool)):
+        if isinstance(step, bool) or not isinstance(step, int):
+            raise EvalError("operator -> takes an integer or text")
+        return _int_range(step, 32)
+    if not isinstance(step, str):
+        raise EvalError("operator -> takes an integer or text")
+    return str(step)
+
+
+_TEXT_ARRAY = psycopg.adapters.get_loader(1009, Format.TEXT)
+
+
+def _path(path: Any) -> list[str | None]:
+    """The right of #> and #>>: a text[], or a literal for one."""
+    if isinstance(path, PgArray):
+        return [v if v is None else str(v) for v in _flat(path)]
+    if isinstance(path, str):
+        assert _TEXT_ARRAY is not None
+        try:
+            loaded = _TEXT_ARRAY(1009, None).load(str(path).encode())
+        except psycopg.DataError as exc:
+            raise EvalError(f'malformed array literal: "{path}"') from exc
+        flat = _flat(PgArray(loaded))
+        return [v if v is None else str(v) for v in flat]
+    raise EvalError("operators #> and #>> take a text[] path")
+
+
+def _has_key(doc: Any, key: Any) -> bool:
+    """jsonb ? text: the key is an object's, or a string in an array (a
+    scalar string counts: jsonb stores it as an array of one)."""
+    if not isinstance(doc, Jsonb):
+        raise EvalError("operator ? takes jsonb")
+    if not isinstance(key, str):
+        raise EvalError("operator ? takes text on its right")
+    node = json_parse(doc.text)
+    if node.kind == "object":
+        return any(k == key for k, _ in node.value)
+    items = node.value if node.kind == "array" else [node]
+    return any(n.kind == "string" and n.value == key for n in items)
+
+
+def _to_json(v: Any) -> Json:
+    if isinstance(v, Json):
+        return v
+    if isinstance(v, Jsonb):
+        return Json(v.text)
+    if isinstance(v, str):
+        try:
+            json_parse(str(v))
+        except JsonError as exc:
+            raise EvalError(str(exc)) from None
+        return Json(str(v))
+    raise EvalError(f"cannot cast {type(v).__name__} to json")
+
+
+def _to_jsonb(v: Any) -> Jsonb:
+    if isinstance(v, Jsonb):
+        return v
+    text = v.text if isinstance(v, Json) else v
+    if not isinstance(text, str):
+        raise EvalError(f"cannot cast {type(v).__name__} to jsonb")
+    try:
+        return Jsonb(jsonb_in(str(text)))
+    except JsonError as exc:
+        raise EvalError(str(exc)) from None
+
+
 _FUNCTIONS: dict[tuple[str, int], Callable[..., Any]] = {
+    ("cardinality", 1): _cardinality,
+    ("array_length", 2): _array_length,
     ("abs", 1): _abs,
     ("round", 1): _round,
     ("round", 2): _round,
@@ -1069,6 +1278,10 @@ def _cast_function(name: str, type_name: ast.TypeName, sql: str) -> Callable[[An
         return lambda v: _to_timestamp(v, zoned)
     if name in ("float8",):
         return _to_float
+    if name == "json":
+        return _to_json
+    if name == "jsonb":
+        return _to_jsonb
     raise SqlError(f"{sql}: a cast to {name} is not supported")
 
 

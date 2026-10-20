@@ -185,7 +185,11 @@ def test_describe_supported_sources(dsn: str, table: str, expected: TableSchema)
             await sql.execute(SCRATCH_DDL)
             return await describe_table(sql, table)
 
-    assert run(go()) == expected
+    got = run(go())
+    assert (got.table, got.columns, got.key) == (expected.table, expected.columns, expected.key)
+    # with each column's type and modifier, as pgoutput's RELATION gives them
+    assert len(got.types) == len(got.typmods) == len(got.columns)
+    assert not got.partitioned
 
 
 @pytest.mark.parametrize(
@@ -194,7 +198,7 @@ def test_describe_supported_sources(dsn: str, table: str, expected: TableSchema)
         ("m2src.nopk", "no primary key"),
         ("m2src.full_nopk", "REPLICA IDENTITY FULL but no primary key"),
         ("m2src.nothing", "REPLICA IDENTITY NOTHING"),
-        ("m2src.a_view", "not an ordinary table"),
+        ("m2src.a_view", "not a table"),
         ("m2src.missing", "does not exist"),
     ],
 )

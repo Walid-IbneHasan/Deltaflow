@@ -53,14 +53,16 @@ from deltaflow.sinks.postgres import SHARD_COLUMN
 type Conn = psycopg.AsyncConnection[tuple[Any, ...]]
 
 #: catalog type name -> the kind the expression compiler reproduces. Types
-#: missing here (char(n), real, json, ...) have no static kind: char(n)
+#: missing here (char(n), real, ...) have no static kind: char(n)
 #: comparisons ignore trailing blanks and real is single precision in
-#: Postgres, which Python does not reproduce.
+#: Postgres, which Python does not reproduce. An array type (typname
+#: "_int4") is its element's kind with "[]".
 _KINDS = {
     "int2": "int", "int4": "int", "int8": "int", "numeric": "numeric", "float8": "float",
     "text": "text", "varchar": "text", "name": "text", "bool": "bool", "date": "date",
-    "timestamptz": "timestamptz", "timestamp": "timestamp",
+    "timestamptz": "timestamptz", "timestamp": "timestamp", "json": "json", "jsonb": "jsonb",
 }  # fmt: skip
+_KINDS |= {f"_{t}": f"{k}[]" for t, k in _KINDS.items()}
 
 
 @dataclass(frozen=True)

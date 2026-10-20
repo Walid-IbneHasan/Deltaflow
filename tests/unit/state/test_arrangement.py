@@ -218,10 +218,51 @@ def test_duplicate_snapshot_row_raises(state_store: StateStore) -> None:
         arr.load(Row(row(1, 0, "a")))
 
 
-def test_schema_change_raises(state_store: StateStore) -> None:
+def test_an_added_column_is_left_out_the_views_never_saw_it(state_store: StateStore) -> None:
+    """ALTER TABLE ... ADD COLUMN while views run: rows keep the columns
+    the views were planned with, old and new rows alike."""
     arr = fresh(state_store)
+    arr.load(Row(row(1, 0, "x")))
     widened = relation("d", columns=("id", "a", "bio", "extra"))
-    with pytest.raises(
-        SchemaChangedError, match=r"columns changed from \(id, a, bio\) to \(id, a, bio, extra\)"
-    ):
-        arr.apply(RowInsert(widened, LSN, {**row(1, 0, "x"), "extra": 1}))
+    assert arr.apply(RowInsert(widened, LSN, {**row(2, 1, "y"), "extra": 7})) == [
+        (Row(row(2, 1, "y")), 1)
+    ]
+    update = RowUpdate(widened, LSN, None, None, {**row(1, 5, UNCHANGED_TOAST), "extra": 8})
+    assert arr.apply(update) == [(Row(row(1, 0, "x")), -1), (Row(row(1, 5, "x")), 1)]
+    full = relation("f", columns=("id", "a", "bio", "extra"))
+    delete = RowDelete(full, LSN, "full", {**row(2, 1, "y"), "extra": 7})
+    assert arr.apply(delete) == [(Row(row(2, 1, "y")), -1)]
+
+
+def test_a_dropped_or_renamed_column_raises(state_store: StateStore) -> None:
+    arr = fresh(state_store)
+    renamed = relation("d", columns=("id", "a", "biography"))
+    with pytest.raises(SchemaChangedError, match=r"column\(s\) bio dropped or renamed"):
+        arr.apply(RowInsert(renamed, LSN, {"id": 1, "a": 0, "biography": "x"}))
+
+
+def retyped(a_type: int) -> Relation:
+    return Relation(
+        1,
+        "public",
+        "t",
+        "d",
+        (Column(True, "id", 25, -1), Column(False, "a", a_type, -1), Column(False, "bio", 25, -1)),
+    )
+
+
+def test_a_changed_column_type_raises(state_store: StateStore) -> None:
+    """ALTER COLUMN ... TYPE: the stored rows hold values of the old type."""
+    schema = TableSchema(
+        "public.t", SCHEMA.columns, ("id",), types=(25, 25, 25), typmods=(-1, -1, -1)
+    )
+    arr = TableArrangement(schema, state_store.keyspace(f"arr:{uuid.uuid4().hex}"))
+    with pytest.raises(SchemaChangedError, match=r"column a changed type \(OID 25 to 20,"):
+        arr.apply(RowInsert(retyped(20), LSN, row(1, 0, "x")))
+
+
+def test_without_recorded_types_the_first_relation_sets_them(state_store: StateStore) -> None:
+    arr = fresh(state_store)  # a schema from a checkpoint that predates types
+    arr.apply(RowInsert(retyped(25), LSN, row(1, 0, "x")))
+    with pytest.raises(SchemaChangedError, match="column a changed type"):
+        arr.apply(RowInsert(retyped(20), LSN, row(2, 0, "x")))

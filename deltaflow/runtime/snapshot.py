@@ -7,7 +7,15 @@ arrive:
 
 * a source table not in the publication;
 * a publication that does not publish every operation;
-* a publication with a row filter or column list.
+* a publication with a row filter or column list;
+* a partitioned table in a publication that does not publish via the
+  root (its changes would arrive under the partitions' names), or a
+  partition as a source (its changes arrive under the root's).
+
+Postgres does not replicate rows that leave a partitioned table with its
+partition (DETACH, DROP), nor TRUNCATE of one partition, nor the rows a
+table brings when ATTACHed. `partitions` is how the runner notices the
+first: a partition of a source that is no longer one.
 
 Two ways to load the initial rows:
 
@@ -35,6 +43,7 @@ from psycopg import sql
 
 from deltaflow.core import Row
 from deltaflow.planner import PlanError
+from deltaflow.replication.changes import ValueDecoder
 from deltaflow.replication.lsn import Lsn
 from deltaflow.replication.slot import SlotInfo, create_slot, drop_slot
 from deltaflow.replication.wire import ReplicationConnection
@@ -50,10 +59,27 @@ class UnsupportedSourceError(PlanError):
     """A source table cannot be maintained incrementally as configured."""
 
 
+class PartitionsChangedError(RuntimeError):
+    """A partition of a source was detached or dropped: its rows left the
+    table without a DELETE the stream carries. The checkpoint no longer
+    describes the table; starting again bootstraps."""
+
+
 _DESCRIBE = """
 SELECT c.relkind::text,
        c.relreplident::text,
+       (SELECT rn.nspname || '.' || r.relname FROM pg_class r
+        JOIN pg_namespace rn ON rn.oid = r.relnamespace
+        WHERE c.relispartition AND r.oid = pg_partition_root(c.oid)),
        ARRAY(SELECT a.attname::text FROM pg_attribute a
+             WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+               AND a.attgenerated = ''
+             ORDER BY a.attnum),
+       ARRAY(SELECT a.atttypid::int8 FROM pg_attribute a
+             WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+               AND a.attgenerated = ''
+             ORDER BY a.attnum),
+       ARRAY(SELECT a.atttypmod FROM pg_attribute a
              WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
                AND a.attgenerated = ''
              ORDER BY a.attnum),
@@ -82,11 +108,16 @@ async def describe_table(conn: Conn, table: str) -> TableSchema:
         found = await cur.fetchone()
     if found is None:
         raise UnsupportedSourceError(f"source table {table} does not exist")
-    relkind, identity, columns, pk, replident = found
-    if relkind != "r":
+    relkind, identity, root, columns, types, typmods, pk, replident = found
+    if root is not None:
         raise UnsupportedSourceError(
-            f"{table} is not an ordinary table (relkind {relkind!r}); views, "
-            "partitioned and foreign tables are not supported as sources"
+            f"{table} is a partition of {root}; use {root} as the source: its changes are "
+            "published under the root's name"
+        )
+    if relkind not in ("r", "p"):
+        raise UnsupportedSourceError(
+            f"{table} is not a table (relkind {relkind!r}); views and foreign tables are not "
+            "supported as sources"
         )
     match identity:
         case "d" | "f" if pk:
@@ -107,7 +138,14 @@ async def describe_table(conn: Conn, table: str) -> TableSchema:
             raise UnsupportedSourceError(
                 f"{table} has REPLICA IDENTITY NOTHING; its UPDATEs and DELETEs carry no key"
             )
-    return TableSchema(table, tuple(columns), tuple(key))
+    return TableSchema(
+        table,
+        tuple(columns),
+        tuple(key),
+        tuple(int(t) for t in types),
+        relkind == "p",
+        tuple(int(m) for m in typmods),
+    )
 
 
 async def check_publication(conn: Conn, publication: str, schema: TableSchema) -> None:
@@ -116,7 +154,7 @@ async def check_publication(conn: Conn, publication: str, schema: TableSchema) -
         await cur.execute(
             """
             SELECT p.pubinsert AND p.pubupdate AND p.pubdelete AND p.pubtruncate,
-                   pt.rowfilter, pt.attnames::text[]
+                   pt.rowfilter, pt.attnames::text[], p.pubviaroot
             FROM pg_publication p
             JOIN pg_publication_tables pt ON pt.pubname = p.pubname
             WHERE p.pubname = %s AND pt.schemaname = %s AND pt.tablename = %s
@@ -126,7 +164,13 @@ async def check_publication(conn: Conn, publication: str, schema: TableSchema) -
         found = await cur.fetchone()
     if found is None:
         raise UnsupportedSourceError(f"publication {publication!r} does not include {schema.table}")
-    all_ops, rowfilter, attnames = found
+    all_ops, rowfilter, attnames, via_root = found
+    if schema.partitioned and not via_root:
+        raise UnsupportedSourceError(
+            f"publication {publication!r} must publish {schema.table} via its root "
+            "(WITH (publish_via_partition_root = true)): its changes would otherwise arrive "
+            "under the partitions' names"
+        )
     if not all_ops:
         raise UnsupportedSourceError(
             f"publication {publication!r} does not publish every operation "
@@ -141,6 +185,43 @@ async def check_publication(conn: Conn, publication: str, schema: TableSchema) -
         raise UnsupportedSourceError(
             f"publication {publication!r} publishes only some columns of {schema.table}"
         )
+
+
+async def partitions(conn: Conn, table: str) -> list[str]:
+    """The leaf partitions of a partitioned table, schema-qualified."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT n.nspname || '.' || c.relname FROM pg_partition_tree(%s::regclass) t"
+            " JOIN pg_class c ON c.oid = t.relid JOIN pg_namespace n ON n.oid = c.relnamespace"
+            " WHERE t.isleaf ORDER BY 1",
+            (table,),
+        )
+        return [str(r[0]) for r in await cur.fetchall()]
+
+
+async def partitioned_sources(conn: Conn, tables: Sequence[str]) -> list[str]:
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT n.nspname || '.' || c.relname FROM pg_class c"
+            " JOIN pg_namespace n ON n.oid = c.relnamespace"
+            " WHERE c.relkind = 'p' AND n.nspname || '.' || c.relname = ANY(%s)",
+            (list(tables),),
+        )
+        return [str(r[0]) for r in await cur.fetchall()]
+
+
+def removed_partitions(before: dict[str, list[str]], now: dict[str, list[str]]) -> str | None:
+    """A partition in `before` that `now` lacks, described; None if none.
+    (Added ones are fine: their rows arrive as inserts. One ATTACHed with
+    rows already in it is the case Postgres cannot report; docs/sql.md.)"""
+    for table, leaves in sorted(before.items()):
+        gone = sorted(set(leaves) - set(now.get(table, ())))
+        if gone:
+            return (
+                f"{', '.join(gone)} no longer a partition of {table} (detached or dropped): "
+                "its rows left the table without a DELETE the stream carries"
+            )
+    return None
 
 
 async def load_snapshot(
@@ -171,12 +252,9 @@ async def load_snapshot(
             await check_publication(conn, publication, schema)
             engine.declare(schema)  # a left join may pad with it before it loads
             schemas.append(schema)
+        decode = ValueDecoder()
         for schema in schemas:
-            table = schema.table
-            query = sql.SQL("SELECT {} FROM {}").format(
-                sql.SQL(", ").join(map(sql.Identifier, schema.columns)),
-                sql.Identifier(*table.split(".", 1)),
-            )
+            query = sql.SQL("SELECT {} FROM {}").format(select_list(schema, decode), _table(schema))
             # Binary, server-side cursor: the table is streamed into the
             # engine in chunks, never held in memory as a whole.
             loader = engine.begin_install(schema)
@@ -184,7 +262,7 @@ async def load_snapshot(
                 cur.itersize = 200
                 await cur.execute(query)
                 async for record in cur:
-                    loader.add(Row(zip(schema.columns, record, strict=True)))
+                    loader.add(row_of(schema, record, decode))
             loader.finish()
     engine.start(consistent_point)
 
@@ -224,6 +302,7 @@ class ChunkReader:
         self._repl: ReplicationConnection | None = None
         self._conn: Conn | None = None
         self._key_types: dict[str, tuple[str, ...]] = {}
+        self._decode = ValueDecoder()
 
     async def __aenter__(self) -> ChunkReader:
         self._conn = await psycopg.AsyncConnection.connect(self._dsn, application_name=self._app)
@@ -253,7 +332,7 @@ class ChunkReader:
             where = sql.SQL("WHERE ({}) > ({})").format(keys, await self._typed(schema))
             params.extend(after)
         query = sql.SQL("SELECT {} FROM {} {} ORDER BY {} LIMIT %s").format(
-            _columns(schema), _table(schema), where, keys
+            select_list(schema, self._decode), _table(schema), where, keys
         )
         cp, rows = await self._read(schema, query, [*params, limit])
         last = tuple(rows[-1][c] for c in schema.key) if len(rows) == limit else None
@@ -264,7 +343,7 @@ class ChunkReader:
         typed = await self._typed(schema)
         values = sql.SQL(", ").join(sql.SQL("({})").format(typed) for _ in keys)
         query = sql.SQL("SELECT {} FROM {} WHERE ({}) IN (VALUES {})").format(
-            _columns(schema),
+            select_list(schema, self._decode),
             _table(schema),
             sql.SQL(", ").join(map(sql.Identifier, schema.key)),
             values,
@@ -291,9 +370,7 @@ class ChunkReader:
                     records = await cur.fetchall()
         finally:
             await drop_slot(self._repl, name)
-        return info.consistent_point, [
-            Row(zip(schema.columns, record, strict=True)) for record in records
-        ]
+        return info.consistent_point, [row_of(schema, r, self._decode) for r in records]
 
     async def _create(self, name: str) -> SlotInfo:
         """Create the page's slot. Creation waits for every transaction
@@ -354,8 +431,25 @@ async def _key_types(conn: Conn | None, schema: TableSchema) -> tuple[str, ...]:
     return tuple(found[c] for c in schema.key)
 
 
-def _columns(schema: TableSchema) -> sql.Composable:
-    return sql.SQL(", ").join(map(sql.Identifier, schema.columns))
+def select_list(schema: TableSchema, decode: ValueDecoder) -> sql.Composable:
+    """The table's columns, those the stream's decoder must read as text
+    cast to text (json, jsonb, arrays, enums): a snapshot then gets exactly
+    the values the stream gets for them."""
+    types = schema.types or (0,) * len(schema.columns)
+    return sql.SQL(", ").join(
+        sql.SQL("{}::text").format(sql.Identifier(c))
+        if t and decode.reads_as_text(t)
+        else sql.Identifier(c)
+        for c, t in zip(schema.columns, types, strict=True)
+    )
+
+
+def row_of(schema: TableSchema, record: Sequence[Any], decode: ValueDecoder) -> Row:
+    types = schema.types or (0,) * len(schema.columns)
+    return Row(
+        (c, decode.text(t, v) if t and decode.reads_as_text(t) else v)
+        for c, t, v in zip(schema.columns, types, record, strict=True)
+    )
 
 
 def _table(schema: TableSchema) -> sql.Composable:

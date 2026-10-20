@@ -57,11 +57,13 @@ from deltaflow.operators import Source
 from deltaflow.planner import Deltaflow, FilterStep, GroupStep, JoinStep, MapStep, PlanError, View
 from deltaflow.planner.compile import Plan, compile_views
 from deltaflow.replication.changes import (
+    Change,
     RowDelete,
     RowInsert,
     RowUpdate,
     TableTruncate,
     Transaction,
+    TransactionPart,
 )
 from deltaflow.replication.lsn import Lsn
 from deltaflow.replication.pgoutput import UNCHANGED_TOAST
@@ -141,6 +143,8 @@ class Engine:
         self._load_lsn = SNAPSHOT_TIME
         self._load: dict[str, TableLoad] = {}
         self._max_cp = SNAPSHOT_TIME
+        #: (xid, commit LSN) of a transaction applied in part (apply_part)
+        self._partial: tuple[int, Lsn] | None = None
         if resume is not None:
             self._resume(resume)
         elif not chunked:
@@ -152,6 +156,11 @@ class Engine:
         """What a checkpoint must record to resume this engine (JSON-able)."""
         if not self._started or self.frontier.lower is None:
             raise RuntimeError("metadata is only meaningful for a started, open engine")
+        if self._partial is not None:
+            raise RuntimeError(
+                f"transaction {self._partial[0]} is applied in part; the state is not at a "
+                "transaction boundary"
+            )
         loading = {"loading": self._load_meta()} if self._loading else {}
         return {
             **loading,
@@ -171,6 +180,9 @@ class Engine:
                 table: {
                     "columns": list(a.schema.columns),
                     "key": list(a.schema.key),
+                    "types": list(a.schema.types),
+                    "typmods": list(a.schema.typmods),
+                    "partitioned": a.schema.partitioned,
                     "count": len(a),
                 }
                 for table, a in self._arrangements.items()
@@ -228,7 +240,7 @@ class Engine:
                 # mistake them for current.
                 keyspace.clear()
                 continue
-            schema = TableSchema(table, tuple(info["columns"]), tuple(info["key"]))
+            schema = _schema(table, info)
             self._schemas[table] = schema
             self._arrangements[table] = TableArrangement(
                 schema, keyspace, count=int(info["count"]), owns=self._owns.get(table)
@@ -342,6 +354,7 @@ class Engine:
         chunk has been applied."""
         return (
             self._loading
+            and self._partial is None
             and all(p.done for p in self._load.values())
             and not any(a.rereads() for a in self._arrangements.values())
             and self._load_lsn >= self._max_cp
@@ -407,7 +420,7 @@ class Engine:
     def _resume_load(self, meta: Mapping[str, Any]) -> None:
         loading = meta["loading"]
         for table, info in meta["arrangements"].items():
-            schema = TableSchema(table, tuple(info["columns"]), tuple(info["key"]))
+            schema = _schema(table, info)
             self._schemas[table] = schema
             self._arrangements[table] = self._loading_arrangement(schema, count=int(info["count"]))
         for table, info in loading["tables"].items():
@@ -508,58 +521,94 @@ class Engine:
         self._started = True
         self.advance(Frontier.at(consistent_point))
 
-    def apply(self, txn: Transaction) -> None:
-        if not self._started:
-            raise RuntimeError("engine not started: install snapshots, then start()")
-        if not self.frontier.admits(txn.commit_lsn):
-            raise FrontierViolationError(
-                f"transaction {txn.xid} commits at {txn.commit_lsn}, behind the frontier "
-                f"{self.frontier}: it was already applied"
+    @property
+    def partial(self) -> bool:
+        """A transaction is applied in part: not at a transaction boundary,
+        so neither checkpoint nor go live."""
+        return self._partial is not None
+
+    def apply_part(self, part: TransactionPart) -> None:
+        """Changes of a large transaction whose end has not arrived yet. They
+        are applied at its commit time; nothing at that time is complete
+        until `apply` of the transaction's final part advances the frontier."""
+        self._admit(part.xid, part.commit_lsn)
+        if self._partial is not None and self._partial != (part.xid, part.commit_lsn):
+            raise RuntimeError(
+                f"part of transaction {part.xid} while {self._partial[0]} is unfinished"
             )
+        self._partial = (part.xid, part.commit_lsn)
+        if self._loading:
+            self._load_changes(part.changes, part.commit_lsn)
+        else:
+            self._step(self._batches(part.changes, part.commit_lsn))
+        self.counters["transaction_parts"] += 1
+
+    def apply(self, txn: Transaction) -> None:
+        self._admit(txn.xid, txn.commit_lsn)
+        if txn.continued != (self._partial == (txn.xid, txn.commit_lsn)):
+            raise RuntimeError(
+                f"transaction {txn.xid}: its parts and its end do not match "
+                f"(continued={txn.continued}, applied in part: {self._partial})"
+            )
+        self._partial = None
         if self._loading:
             self._apply_loading(txn)
             return
+        self._step(self._batches(txn.changes, txn.commit_lsn))
+        crash_point("apply:after_state")  # state changed, frontier not yet advanced
+        self.counters["transactions"] += 1
+        self.advance(Frontier.at(txn.end_lsn))
+
+    def _admit(self, xid: int, commit_lsn: Lsn) -> None:
+        if not self._started:
+            raise RuntimeError("engine not started: install snapshots, then start()")
+        if not self.frontier.admits(commit_lsn):
+            raise FrontierViolationError(
+                f"transaction {xid} commits at {commit_lsn}, behind the frontier "
+                f"{self.frontier}: it was already applied"
+            )
+
+    def _batches(self, changes: Iterable[Change], commit_lsn: Lsn) -> dict[str, list[Delta[Row]]]:
+        """Each source table's deltas from `changes`, at `commit_lsn`."""
         batches: dict[str, list[Delta[Row]]] = {}
-        for change in txn.changes:
+        for change in changes:
             match change:
                 case RowInsert() | RowUpdate() | RowDelete():
                     arrangement = self._arrangements.get(change.relation.qualified_name)
                     if arrangement is None:
                         continue
                     out = batches.setdefault(arrangement.schema.table, [])
-                    out.extend(Delta(r, txn.commit_lsn, d) for r, d in arrangement.apply(change))
+                    out.extend(Delta(r, commit_lsn, d) for r, d in arrangement.apply(change))
                 case TableTruncate():
                     for rel in change.relations:
                         arrangement = self._arrangements.get(rel.qualified_name)
                         if arrangement is not None:
                             out = batches.setdefault(arrangement.schema.table, [])
-                            out.extend(
-                                Delta(r, txn.commit_lsn, d) for r, d in arrangement.truncate()
-                            )
+                            out.extend(Delta(r, commit_lsn, d) for r, d in arrangement.truncate())
                 case _:
                     pass  # logical messages carry no row data
-        self._step(batches)
-        crash_point("apply:after_state")  # state changed, frontier not yet advanced
-        self.counters["transactions"] += 1
-        self.advance(Frontier.at(txn.end_lsn))
+        return batches
 
     def _apply_loading(self, txn: Transaction) -> None:
         """Into the arrangements only: the views are built at go_live."""
-        for change in txn.changes:
+        self._load_changes(txn.changes, txn.commit_lsn)
+        crash_point("apply:after_state")
+        self.counters["transactions"] += 1
+        self.advance(Frontier.at(txn.end_lsn))
+
+    def _load_changes(self, changes: Iterable[Change], commit_lsn: Lsn) -> None:
+        for change in changes:
             match change:
                 case RowInsert() | RowUpdate() | RowDelete():
                     arrangement = self._arrangements.get(change.relation.qualified_name)
                     if arrangement is not None:
-                        arrangement.apply_loading(change, txn.commit_lsn)
+                        arrangement.apply_loading(change, commit_lsn)
                 case TableTruncate():
                     for rel in change.relations:
                         if (arrangement := self._arrangements.get(rel.qualified_name)) is not None:
-                            arrangement.truncate_loading(txn.commit_lsn)
+                            arrangement.truncate_loading(commit_lsn)
                 case _:
                     pass
-        crash_point("apply:after_state")
-        self.counters["transactions"] += 1
-        self.advance(Frontier.at(txn.end_lsn))
 
     def advance(self, to: Frontier) -> None:
         if self._loading:
@@ -623,6 +672,18 @@ class TableLoad:
     done: bool = False
     chunks: int = 0
     rows: int = 0
+
+
+def _schema(table: str, info: Mapping[str, Any]) -> TableSchema:
+    """A source table's schema from checkpoint metadata (older ones have no types)."""
+    return TableSchema(
+        table,
+        tuple(info["columns"]),
+        tuple(info["key"]),
+        tuple(int(t) for t in info.get("types", ())),
+        bool(info.get("partitioned", False)),
+        tuple(int(m) for m in info.get("typmods", ())),
+    )
 
 
 def _pack(key: tuple[Any, ...]) -> str:

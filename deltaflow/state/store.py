@@ -248,6 +248,17 @@ class Keyspace:
         assert upper is not None  # the prefix starts with a length byte < 0xff
         self._db.delete_range(self._prefix, upper)
 
+    def clear_prefix(self, prefix: bytes) -> None:
+        """Delete every entry whose key starts with `prefix` (non-empty)."""
+        full = self._prefix + prefix
+        upper = _successor(full)
+        assert upper is not None
+        self._db.delete_range(full, upper)
+
+    def clear_range(self, start: bytes, end: bytes) -> None:
+        """Delete every entry with start <= key < end."""
+        self._db.delete_range(self._prefix + start, self._prefix + end)
+
     @property
     def full_prefix(self) -> bytes:
         return self._prefix

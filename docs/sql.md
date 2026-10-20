@@ -80,10 +80,16 @@ Expressions:
   `[NOT] IN (...)`, `[NOT] BETWEEN [SYMMETRIC]`,
   `IS [NOT] DISTINCT FROM`, `[NOT] LIKE`;
 - **Conditionals and functions:** CASE, COALESCE, NULLIF, GREATEST,
-  LEAST, `abs`, `round`, `length`;
+  LEAST, `abs`, `round`, `length`, `cardinality`, `array_length`;
+- **json and jsonb:** `-> ->> #> #>>`, jsonb `?`, jsonb `=` and `<>`;
+- **Arrays:** subscripts `a[i]`, `a[i][j]`, and comparisons with
+  `ANY (...)` and `ALL (...)`;
 - **Types:** casts to integer types, `numeric[(p, s)]`, text, boolean,
-  date, timestamp[tz] and float8;
+  date, timestamp[tz], float8, json and jsonb;
 - **Collation:** `COLLATE "C"`.
+
+How json, jsonb and arrays are held exactly, and what each of these
+operators had to get right, is in [schemas.md](schemas.md).
 
 ## Exactly Postgres's results, or refused
 

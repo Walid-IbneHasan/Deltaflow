@@ -16,16 +16,27 @@ never ahead of the watermark. Transactions at or below the watermark come
 through again, and the sink drops them, because the table already reflects
 them. Neither duplicates nor gaps. The full argument is in
 docs/exactly-once.md.
+
+**Memory.** Bound with a `spill` keyspace, the sink keeps at most
+`spill_after` deltas and `spill_after` keys' net writes in memory. Beyond
+that, deltas move into the keyspace ordered by (time, key) and are folded a
+key at a time, and the net writes move there too and are written in chunks
+(`take_chunks`). A ten-million-row transaction, or a bootstrap's whole view,
+then never sits in memory. All of it still commits with the watermark in one
+transaction.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import pickle
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
+from itertools import groupby, takewhile
 from typing import Any, ClassVar
 
 import psycopg
 from psycopg import sql
+from psycopg.adapt import Dumper
 
 from deltaflow.core import (
     Delta,
@@ -35,15 +46,26 @@ from deltaflow.core import (
     Row,
     consolidate,
 )
+from deltaflow.core.values import Json, Jsonb, to_array, to_param
 from deltaflow.faults import crash_point
+from deltaflow.replication.changes import register_value_loaders
 from deltaflow.replication.lsn import Lsn
 from deltaflow.sinks.base import Sink
-from deltaflow.state.codec import encode_key
+from deltaflow.state.codec import decode_row, encode_key, encode_row
+from deltaflow.state.store import Keyspace
 
 type Conn = psycopg.AsyncConnection[tuple[Any, ...]]
 
 WATERMARKS = "_deltaflow.watermarks"
 SHARD_COLUMN = "shard"
+#: past this many buffered deltas or keys, a bound sink spills (`bind`)
+SPILL_AFTER = 100_000
+#: rows per chunk of a flush's writes (`take_chunks`)
+WRITE_CHUNK = 10_000
+
+# The spill keyspace: pending deltas under _PENDING + time + key + seq,
+# net writes under _WRITES + key.
+_PENDING, _WRITES = b"p", b"w"
 
 
 class SinkError(RuntimeError):
@@ -96,6 +118,12 @@ class PostgresSink(Sink):
         self._pending: list[Delta[Row]] = []
         self._writes: dict[bytes, _KeyState] = {}
         self._bound = False
+        self._spill: Keyspace | None = None
+        self._spill_after = SPILL_AFTER
+        #: some pending deltas, or the net writes, live in the spill keyspace
+        self._pending_spilled = False
+        self._writes_spilled = False
+        self._seq = 0
 
     def bind(
         self,
@@ -106,9 +134,13 @@ class PostgresSink(Sink):
         watermark: Lsn | None,
         shard: int | None = None,
         write_table: str | None = None,
+        spill: Keyspace | None = None,
+        spill_after: int = SPILL_AFTER,
     ) -> None:
         """Called by the runner with the table's shape and stored watermark.
-        `columns` and `key` are the view's, without the shard column.
+        `columns` and `key` are the view's, without the shard column. With
+        `spill` (a state store keyspace this sink owns), buffers beyond
+        `spill_after` move there.
 
         Binding starts a session: whatever an earlier session buffered and
         never flushed is dropped, and the frontier starts over. A runner
@@ -121,6 +153,12 @@ class PostgresSink(Sink):
         self._pending = []
         self._writes = {}
         self._bound = True
+        if spill_after < 1:
+            raise ValueError("spill_after must be at least 1")
+        self._spill, self._spill_after = spill, spill_after
+        if spill is not None:
+            spill.clear()
+        self._pending_spilled = self._writes_spilled = False
 
     @property
     def db_columns(self) -> tuple[str, ...]:
@@ -131,15 +169,21 @@ class PostgresSink(Sink):
         return (SHARD_COLUMN, *self.key) if self.shard is not None else self.key
 
     def db_values(self, row: Row) -> list[Any]:
-        values = [row[c] for c in self.columns]
+        values = [to_param(row[c]) for c in self.columns]
         return [self.shard, *values] if self.shard is not None else values
 
     def db_key_values(self, key: tuple[Any, ...]) -> tuple[Any, ...]:
+        key = tuple(to_param(v) for v in key)
         return (self.shard, *key) if self.shard is not None else key
 
     @property
     def frontier(self) -> Frontier:
         return self._frontier.current
+
+    @property
+    def buffered(self) -> int:
+        """Deltas and keys held in memory (not spilled)."""
+        return len(self._pending) + len(self._writes)
 
     def accept(self, batch: Sequence[Delta[Row]]) -> None:
         if not self._bound:
@@ -150,19 +194,29 @@ class PostgresSink(Sink):
                     f"sink {self.table} received a delta at {d.time}, behind {self.frontier}"
                 )
         self._pending.extend(batch)
+        if self._spill is not None and len(self._pending) >= self._spill_after:
+            self._spill_pending(self._pending)
+            self._pending = []
 
     def advance(self, frontier: Frontier) -> None:
         self._frontier.advance(frontier)
         ready = [d for d in self._pending if frontier.is_complete(d.time)]
-        if not ready:
+        if not ready and not self._spilled_before(frontier):
             return
         self._pending = [d for d in self._pending if not frontier.is_complete(d.time)]
-        if (
+        replay = (
             self.watermark is not None
             and frontier.lower is not None
             and frontier.lower <= self.watermark
-        ):
-            return  # replayed transactions: the table already has them
+        )  # replayed transactions: the table already has them
+        if self._pending_spilled:
+            # Every complete delta goes through the keyspace, so a time's
+            # deltas are folded together, a key at a time, in order.
+            self._spill_pending(ready)
+            self._fold_spilled(frontier, drop=replay)
+            return
+        if replay:
+            return
         by_time: dict[Lsn, list[Delta[Row]]] = {}
         for d in consolidate(ready):
             by_time.setdefault(d.time, []).append(d)
@@ -170,40 +224,110 @@ class PostgresSink(Sink):
             self._fold(by_time[t])
 
     def _fold(self, batch: list[Delta[Row]]) -> None:
-        """One complete transaction. Per key it may retract the row the table
-        has, add the row the table will have, or both. Anything else means
-        the view is not unique on the table's key."""
-        added: dict[bytes, Row] = {}
-        removed: set[bytes] = set()
-        keys: dict[bytes, tuple[Any, ...]] = {}
+        """One complete transaction, a key at a time."""
+        by_key: dict[bytes, list[Delta[Row]]] = {}
         for d in batch:
             self._check_columns(d.row)
+            by_key.setdefault(encode_key(tuple(d.row[c] for c in self.key)), []).append(d)
+        for kb, deltas in by_key.items():
+            self._fold_key(kb, deltas)
+
+    def _fold_key(self, kb: bytes, deltas: Iterable[Delta[Row]]) -> None:
+        """One key's deltas of one complete transaction. It may retract the
+        row the table has, add the row the table will have, or both.
+        Anything else means the view is not unique on the table's key."""
+        added: Row | None = None
+        removed = False
+        key: tuple[Any, ...] = ()
+        for d in deltas:
             key = tuple(d.row[c] for c in self.key)
-            kb = encode_key(key)
-            keys[kb] = key
             if abs(d.diff) > 1:
                 raise SinkError(
                     f"{self.table}: row {d.row!r} has multiplicity {d.diff}; the view is not "
                     f"unique on the table's key {self.key}"
                 )
             if d.diff < 0:
-                if kb in removed:
+                if removed:
                     raise self._not_unique(key, "retracts two rows")
-                removed.add(kb)
-            elif kb in added:
+                removed = True
+            elif added is not None:
                 raise self._not_unique(key, "has two rows")
             else:
-                added[kb] = d.row
-        for kb, key in keys.items():
-            state = self._writes.get(kb)
-            had = (state.row is not None) if state is not None else (kb in removed)
-            if kb in removed and not had:
-                raise self._not_unique(key, "retracts a row the table does not have")
-            if kb in added and had and kb not in removed:
-                raise self._not_unique(key, "would be a second row")
-            if state is None:
-                state = self._writes[kb] = _KeyState(key, existed=kb in removed, row=None)
-            state.row = added.get(kb)
+                added = d.row
+        state = self._state_of(kb)
+        had = (state.row is not None) if state is not None else removed
+        if removed and not had:
+            raise self._not_unique(key, "retracts a row the table does not have")
+        if added is not None and had and not removed:
+            raise self._not_unique(key, "would be a second row")
+        if state is None:
+            state = _KeyState(key, existed=removed, row=None)
+        state.row = added
+        self._set_state(kb, state)
+
+    # --- spilling ----------------------------------------------------------------
+
+    def _spill_pending(self, deltas: Iterable[Delta[Row]]) -> None:
+        assert self._spill is not None
+        for d in deltas:
+            self._check_columns(d.row)
+            self._seq += 1
+            self._spill.put(
+                _PENDING
+                + int(d.time).to_bytes(8, "big")
+                + encode_key(tuple(d.row[c] for c in self.key))
+                + self._seq.to_bytes(8, "big"),
+                pickle.dumps((encode_row(d.row), d.diff), protocol=5),
+            )
+            self._pending_spilled = True
+
+    def _spilled_before(self, frontier: Frontier) -> bool:
+        if not self._pending_spilled:
+            return False
+        assert self._spill is not None
+        first = self._spill.first(_PENDING)
+        return first is not None and frontier.is_complete(_time_of(first[0]))
+
+    def _fold_spilled(self, frontier: Frontier, *, drop: bool) -> None:
+        """Fold (or, replayed, drop) the spilled deltas of complete times:
+        in (time, key) order, one key's deltas of one time at a time."""
+        assert self._spill is not None
+        done: bytes | None = None
+        complete = takewhile(
+            lambda kv: frontier.is_complete(_time_of(kv[0])), self._spill.scan(_PENDING)
+        )
+        for (_time, kb), group in groupby(complete, key=lambda kv: (kv[0][1:9], kv[0][9:-8])):
+            batch = []
+            for k, raw in group:
+                done = k
+                row, diff = pickle.loads(raw)
+                batch.append(Delta(decode_row(row), _time_of(k), diff))
+            # A row retracted and re-added in one transaction cancels out:
+            # no change to the key at all.
+            if not drop and (deltas := consolidate(batch)):
+                self._fold_key(kb, deltas)
+        if done is not None:
+            self._spill.clear_range(_PENDING, done + bytes(1))
+        self._pending_spilled = self._spill.first(_PENDING) is not None
+
+    def _state_of(self, kb: bytes) -> _KeyState | None:
+        if not self._writes_spilled:
+            return self._writes.get(kb)
+        assert self._spill is not None
+        raw = self._spill.get(_WRITES + kb)
+        return None if raw is None else _load_state(raw)
+
+    def _set_state(self, kb: bytes, state: _KeyState) -> None:
+        if self._writes_spilled:
+            assert self._spill is not None
+            self._spill.put(_WRITES + kb, _dump_state(state))
+            return
+        self._writes[kb] = state
+        if self._spill is not None and len(self._writes) >= self._spill_after:
+            for k, s in self._writes.items():
+                self._spill.put(_WRITES + k, _dump_state(s))
+            self._writes = {}
+            self._writes_spilled = True
 
     def _not_unique(self, key: tuple[Any, ...], what: str) -> SinkError:
         return SinkError(
@@ -223,16 +347,41 @@ class PostgresSink(Sink):
     def take(self) -> SinkWrites:
         """The net writes since the last take, and forget them."""
         writes = SinkWrites()
-        for state in self._writes.values():
-            if state.row is None:
-                if state.existed:
-                    writes.deletes.append(state.key)
-            elif state.existed:
-                writes.updates.append(state.row)
-            else:
-                writes.inserts.append(state.row)
-        self._writes = {}
+        for chunk in self.take_chunks():
+            writes.inserts.extend(chunk.inserts)
+            writes.updates.extend(chunk.updates)
+            writes.deletes.extend(chunk.deletes)
         return writes
+
+    def take_chunks(self, rows: int = WRITE_CHUNK) -> Iterator[SinkWrites]:
+        """The net writes since the last take, `rows` keys at a time, and
+        forget them."""
+        if self._writes_spilled:
+            assert self._spill is not None
+            states: Iterable[_KeyState] = (_load_state(raw) for _, raw in self._spill.scan(_WRITES))
+        else:
+            states = list(self._writes.values())
+            self._writes = {}
+        chunk, n = SinkWrites(), 0
+        for state in states:
+            if state.row is None:
+                if not state.existed:
+                    continue
+                chunk.deletes.append(state.key)
+            elif state.existed:
+                chunk.updates.append(state.row)
+            else:
+                chunk.inserts.append(state.row)
+            n += 1
+            if n >= rows:
+                yield chunk
+                chunk, n = SinkWrites(), 0
+        if n:
+            yield chunk
+        if self._writes_spilled:
+            assert self._spill is not None
+            self._spill.clear_prefix(_WRITES)
+            self._writes_spilled = False
 
 
 # --- database side ---------------------------------------------------------
@@ -306,6 +455,7 @@ async def flush(
             raise SinkError(
                 f"{sink.table}: refusing to move the watermark back from {sink.watermark} to {lsn}"
             )
+    _register_dumpers(conn)
     written = 0
     async with conn.transaction(), conn.cursor() as cur:
         if fence is not None:
@@ -316,7 +466,6 @@ async def flush(
             if await cur.fetchone() is None:
                 raise FencedError(f"lease on shard {fence[0]} (epoch {fence[1]}) was taken over")
         for sink in sinks:
-            writes = sink.take()
             table = sql.Identifier(*sink.write_table.split(".", 1))
             if replace and sink.shard is not None:
                 await cur.execute(
@@ -328,10 +477,13 @@ async def flush(
             elif replace:
                 await cur.execute(sql.SQL("DELETE FROM {}").format(table))
             if sink.db_key:
-                await _write_keyed(cur, sink, table, writes)
+                for chunk in sink.take_chunks():
+                    await _write_keyed(cur, sink, table, chunk)
+                    written += len(chunk.upserts) + len(chunk.deletes)
             else:
+                writes = sink.take()
                 await _write_single_row(cur, sink, table, writes)
-            written += len(writes.upserts) + len(writes.deletes)
+                written += len(writes.upserts) + len(writes.deletes)
             await cur.execute(
                 "INSERT INTO _deltaflow.watermarks (view, lsn, updated_at)"
                 " VALUES (%s, %s::pg_lsn, now()) ON CONFLICT (view)"
@@ -378,7 +530,7 @@ async def _write_keyed(
             ),
             [v for key in chunk for v in sink.db_key_values(key)],
         )
-        deleted = {encode_key(r) for r in await cur.fetchall()}
+        deleted = {encode_key(map(to_array, r)) for r in await cur.fetchall()}
         for key in chunk:
             if encode_key(sink.db_key_values(key)) not in deleted:
                 raise _drift(sink, "delete", key, "no such row")
@@ -412,13 +564,49 @@ async def _write_keyed(
             [v for r in rows for v in sink.db_values(r)],
         )
         for returned in await cur.fetchall():
-            kb = encode_key(returned[:nkey])
+            kb = encode_key(map(to_array, returned[:nkey]))
             inserted = returned[nkey]
             if kb not in expected or expected[kb] != inserted:
                 what = "insert" if expected.get(kb, inserted) else "update"
                 raise _drift(
                     sink, what, tuple(returned[:nkey]), "it was " + ("new" if inserted else "there")
                 )
+
+
+class _JsonDumper(Dumper):
+    oid = 114
+
+    def dump(self, obj: Json) -> bytes:
+        return obj.text.encode()
+
+
+class _JsonbDumper(Dumper):
+    oid = 3802
+
+    def dump(self, obj: Jsonb) -> bytes:
+        return obj.text.encode()
+
+
+def _register_dumpers(conn: Conn) -> None:
+    """json and jsonb values written as their text, with their types, and
+    read back (RETURNING keys) as the engine has them."""
+    conn.adapters.register_dumper(Json, _JsonDumper)
+    conn.adapters.register_dumper(Jsonb, _JsonbDumper)
+    register_value_loaders(conn.adapters)
+
+
+def _time_of(spilled_key: bytes) -> Lsn:
+    return Lsn(int.from_bytes(spilled_key[1:9], "big"))
+
+
+def _dump_state(state: _KeyState) -> bytes:
+    row = None if state.row is None else encode_row(state.row)
+    return pickle.dumps((state.key, state.existed, row), protocol=5)
+
+
+def _load_state(raw: bytes) -> _KeyState:
+    key, existed, row = pickle.loads(raw)
+    return _KeyState(key, existed, None if row is None else decode_row(row))
 
 
 def _drift(sink: PostgresSink, what: str, key: object, found: str) -> SinkError:
@@ -450,5 +638,5 @@ async def _write_single_row(
             sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
                 table, cols, sql.SQL(", ").join(sql.Placeholder() * len(sink.columns))
             ),
-            [row[c] for c in sink.columns],
+            [to_param(row[c]) for c in sink.columns],
         )

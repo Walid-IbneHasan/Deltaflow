@@ -46,6 +46,14 @@ When every page is in and the stream is past the last page's consistent
 point, the views are built from the arrangements and every sink's
 contents are replaced at that position, which is where they go live.
 
+**Large transactions.** The stream delivers a transaction of more than
+`max_transaction_changes` changes in parts (replication/changes.py), and
+each sink spills its buffers to the state store past `sink_spill_after`
+(sinks/postgres.py): memory stays bounded however large a transaction is.
+A transaction applied in part is not a boundary, so no checkpoint is taken
+until its end. A crash or stop inside it replays it whole from the last
+checkpoint.
+
 **Changed views.** Views added or changed since the checkpoint do not
 need a bootstrap: the engine builds them from the checkpoint's source
 rows, as of its position (engine.py, per-view state). The runner then
@@ -81,7 +89,7 @@ from deltaflow.faults import crash_point
 from deltaflow.observability.memory import rss
 from deltaflow.observability.metrics import Registry
 from deltaflow.planner import Deltaflow, PlanError
-from deltaflow.replication.changes import Transaction
+from deltaflow.replication.changes import Transaction, TransactionPart
 from deltaflow.replication.lsn import Lsn
 from deltaflow.replication.slot import create_publication, create_slot, drop_slot, slot_exists
 from deltaflow.replication.stream import Progress, ReplicationEndedError, ReplicationStream
@@ -96,9 +104,13 @@ from deltaflow.runtime.runner import DEFAULT_MEMORY_BUDGET
 from deltaflow.runtime.snapshot import (
     REREAD_BATCH,
     ChunkReader,
+    PartitionsChangedError,
     check_publication,
     describe_table,
     load_snapshot,
+    partitioned_sources,
+    partitions,
+    removed_partitions,
 )
 from deltaflow.sinks.postgres import (
     SHARD_COLUMN,
@@ -135,6 +147,8 @@ def is_transient(exc: BaseException) -> bool:
         return exc.sqlstate is None or exc.sqlstate.startswith(_TRANSIENT_SQLSTATES)
     if isinstance(exc, ssl.SSLCertVerificationError | TlsUnavailableError | WireProtocolError):
         return False
+    if isinstance(exc, PartitionsChangedError):
+        return True  # starting again bootstraps, which reads the table as it is now
     return isinstance(
         exc, OSError | asyncio.IncompleteReadError | ReplicationEndedError
     )  # OSError covers ConnectionError, TimeoutError and ssl.SSLError
@@ -162,6 +176,8 @@ class DurableRunner:
         application_name: str = "deltaflow",
         snapshot: Literal["chunked", "single"] = "chunked",
         snapshot_chunk_rows: int = 20_000,
+        max_transaction_changes: int = 10_000,
+        sink_spill_after: int = 100_000,
     ) -> None:
         """With `shard`, this runner maintains that shard of a sharded
         registry: its sinks write partial rows to `<table>__shards`, its
@@ -171,7 +187,12 @@ class DurableRunner:
         `snapshot` is how a bootstrap reads the tables: `"chunked"`, pages of
         `snapshot_chunk_rows` rows, each with its own snapshot (decision
         0009); or `"single"`, everything in one transaction, which holds
-        back VACUUM on the whole server while it runs."""
+        back VACUUM on the whole server while it runs.
+
+        A transaction of more than `max_transaction_changes` changes is
+        applied in parts, and a sink buffering more than `sink_spill_after`
+        deltas or keys moves them to the state store: memory stays bounded
+        however large a transaction (or a view's initial contents) is."""
         if snapshot not in ("chunked", "single"):
             raise ValueError(f"snapshot must be 'chunked' or 'single', not {snapshot!r}")
         if snapshot_chunk_rows < 1:
@@ -205,6 +226,8 @@ class DurableRunner:
         self._status_interval = status_interval
         self._snapshot = snapshot
         self._chunk_rows = snapshot_chunk_rows
+        self._max_txn_changes = max_transaction_changes
+        self._spill_after = sink_spill_after
         self.counters: Counter[str] = Counter()
         self.metrics = RunnerMetrics()
         #: (end_lsn, commit_time) of applied transactions not yet flushed
@@ -221,6 +244,8 @@ class DurableRunner:
         self.started_by: str | None = None
         #: the latest progress the stream reported (idle sources)
         self._progress_lsn: Lsn | None = None
+        #: partitioned source -> its partitions, as the state knows them
+        self._partitions: dict[str, list[str]] = {}
 
     # --- start: resume or bootstrap ------------------------------------------
 
@@ -246,6 +271,7 @@ class DurableRunner:
                 registry_sources = self.registry.sources
                 await self._ensure_publication(admin, registry_sources)
             have_slot = await slot_exists(admin, self.slot)
+            self._partitions = await self._current_partitions(admin)
         repl = await ReplicationConnection.connect(self._dsn, application_name=self._app)
         loading = False
         try:
@@ -274,6 +300,7 @@ class DurableRunner:
                 start_lsn=start_lsn,
                 status_interval=self._status_interval,
                 progress=True,
+                max_transaction_changes=self._max_txn_changes,
             )
             await self._stream.start()
             self._stream.ack(start_lsn)
@@ -321,6 +348,11 @@ class DurableRunner:
         if not exists:
             await create_publication(admin, self.publication, tables)
             return
+        await admin.execute(
+            sql.SQL("ALTER PUBLICATION {} SET (publish_via_partition_root = true)").format(
+                sql.Identifier(self.publication)
+            )
+        )
         for table, verb in (*((t, "ADD") for t in sorted(set(tables) - current)),
                             *((t, "DROP") for t in sorted(current - set(tables)))):  # fmt: skip
             await admin.execute(
@@ -336,6 +368,9 @@ class DurableRunner:
             return f"replication slot {self.slot} is missing"
         if (reason := Engine.cannot_resume(self.registry, checkpoint.meta)) is not None:
             return reason
+        if (gone := removed_partitions(checkpoint.meta.get("partitions", {}),
+                                       self._partitions)) is not None:  # fmt: skip
+            return gone
         if "loading" in checkpoint.meta:
             return None  # the sinks are replaced when the load goes live
         return await self._watermark_problem(checkpoint)
@@ -368,17 +403,9 @@ class DurableRunner:
         self.store = self.state.open_live(memory_budget=self._memory_budget, restore=checkpoint)
         rebuild = self._to_rebuild(checkpoint.meta)
         for sink in self.sinks:
-            columns, key = shapes[sink.table]
-            view = self._views[id(sink)]
             fresh = self._view_names[id(sink)] in rebuild
-            sink.bind(
-                view=view,
-                columns=columns,
-                key=key,
-                watermark=None if fresh else await load_watermark(self._sql, view),
-                shard=self.shard,
-                write_table=self._write_table(sink),
-            )
+            watermark = None if fresh else await load_watermark(self._sql, self._views[id(sink)])
+            self._bind(sink, shapes, watermark)
         self.engine = Engine(self.registry, self.store, resume=checkpoint.meta, shard=self.shard)
         at = Lsn(checkpoint.lsn)
         if self.engine.rebuilt:
@@ -401,18 +428,25 @@ class DurableRunner:
         )
         return Lsn(checkpoint.lsn)
 
+    def _bind(self, sink: PostgresSink, shapes: dict[str, Any], watermark: Lsn | None) -> None:
+        assert self.store is not None
+        columns, key = shapes[sink.table]
+        view = self._views[id(sink)]
+        sink.bind(
+            view=view,
+            columns=columns,
+            key=key,
+            watermark=watermark,
+            shard=self.shard,
+            write_table=self._write_table(sink),
+            spill=self.store.keyspace(f"spill:{view}"),
+            spill_after=self._spill_after,
+        )
+
     def _bind_fresh(self, shapes: dict[str, Any]) -> None:
         """Bind every sink without a watermark: its contents are replaced."""
         for sink in self.sinks:
-            columns, key = shapes[sink.table]
-            sink.bind(
-                view=self._views[id(sink)],
-                columns=columns,
-                key=key,
-                watermark=None,
-                shard=self.shard,
-                write_table=self._write_table(sink),
-            )
+            self._bind(sink, shapes, None)
 
     async def _begin_load(
         self, repl: ReplicationConnection, have_slot: bool, shapes: dict[str, Any]
@@ -467,7 +501,7 @@ class DurableRunner:
         async with ChunkReader(self._dsn, slot=self.slot, application_name=self._app) as reader:
             while not engine.ready():
                 await self._drain()
-                if stop is not None and stop.is_set():
+                if stop is not None and stop.is_set() and not engine.partial:
                     # Pages change the state without moving the frontier.
                     await self._checkpoint()
                     self.started_by = "loading"
@@ -492,8 +526,10 @@ class DurableRunner:
                     await self._stream.send_status(reply_requested=True)
                     if (event := await self._next(0.5)) is not None:
                         self._apply_loading(event)
-                    self._advance_idle()
-                if time.monotonic() - last_checkpoint >= self._checkpoint_interval:
+                    if not engine.partial:
+                        self._advance_idle()
+                due = time.monotonic() - last_checkpoint >= self._checkpoint_interval
+                if due and not engine.partial:
                     self._advance_idle()
                     await self._checkpoint()
                     last_checkpoint = time.monotonic()
@@ -519,12 +555,15 @@ class DurableRunner:
                 return
             self._apply_loading(event)
 
-    def _apply_loading(self, txn: Transaction) -> None:
+    def _apply_loading(self, event: Transaction | TransactionPart) -> None:
         assert self.engine is not None
-        self.engine.apply(txn)
+        self.metrics.changes.inc(len(event.changes))
+        if isinstance(event, TransactionPart):
+            self.engine.apply_part(event)
+            return
+        self.engine.apply(event)
         self.counters["transactions"] += 1
         self.metrics.transactions.inc()
-        self.metrics.changes.inc(len(txn.changes))
 
     async def _bootstrap(
         self, repl: ReplicationConnection, have_slot: bool, shapes: dict[str, Any]
@@ -696,6 +735,7 @@ class DurableRunner:
             "views_rebuilt",
             "loads",
             "load_resumes",
+            "transaction_parts",
         ):
             m.events.labels(event=name).value = self.counters[name]
         return m.registry
@@ -714,7 +754,14 @@ class DurableRunner:
             timeout = self._flush_interval if pending else 0.5
             event = await self._next(timeout)
             now = time.monotonic()
-            if isinstance(event, Transaction):
+            if isinstance(event, TransactionPart):
+                # A large transaction, still arriving: nothing of it is
+                # complete, so a flush leaves it out. Flushing earlier
+                # transactions meanwhile is fine; a checkpoint is not.
+                self.engine.apply_part(event)
+                self.counters["transaction_parts"] += 1
+                self.metrics.changes.inc(len(event.changes))
+            elif isinstance(event, Transaction):
                 self.engine.apply(event)
                 self.counters["transactions"] += 1
                 self.metrics.transactions.inc()
@@ -731,20 +778,24 @@ class DurableRunner:
             if due:
                 await self._flush()
                 pending = 0
-            if not pending and now - last_checkpoint >= self._checkpoint_interval:
+            if (
+                not pending
+                and not self.engine.partial
+                and now - last_checkpoint >= self._checkpoint_interval
+            ):
                 if self._advance_idle():
                     await self._flush()
                 if self._state_lsn() != self.checkpointed_lsn:
                     await self._checkpoint()
                     last_checkpoint = now
 
-    async def _next(self, timeout: float) -> Transaction | None:
+    async def _next(self, timeout: float) -> Transaction | TransactionPart | None:
         assert self._stream is not None
         try:
             async with asyncio.timeout(timeout):
                 while True:
                     event = await anext(self._stream)
-                    if isinstance(event, Transaction):
+                    if isinstance(event, Transaction | TransactionPart):
                         return event
                     if isinstance(event, Progress):
                         self._progress_lsn = event.lsn
@@ -807,6 +858,8 @@ class DurableRunner:
         sinks then drop the replay of (E, W] and nothing is applied twice."""
         assert self.engine is not None
         assert self.store is not None
+        if self.engine.partial:
+            raise AssertionError("checkpoint inside a transaction applied in part")
         lsn = self._state_lsn()
         # While loading, the sinks are not involved: they are replaced when
         # the load goes live.
@@ -822,8 +875,9 @@ class DurableRunner:
         # checkpoint), so heartbeats wait for it too. Timeouts (wal_sender,
         # cluster lease TTL) must therefore exceed the slowest checkpoint the
         # host produces; docs/operations.md.
+        await self._check_partitions()
         started = time.perf_counter()
-        meta = self.engine.metadata()
+        meta = {**self.engine.metadata(), "partitions": self._partitions}
         await asyncio.to_thread(self.state.checkpoint, self.store, lsn, meta)
         seconds = time.perf_counter() - started
         self.metrics.checkpoint_seconds.observe(seconds)
@@ -834,13 +888,31 @@ class DurableRunner:
             self._stream.ack(lsn)
         self.counters["checkpoints"] += 1
 
+    async def _current_partitions(self, conn: Conn) -> dict[str, list[str]]:
+        tables = await partitioned_sources(conn, self.registry.sources)
+        return {t: await partitions(conn, t) for t in tables}
+
+    async def _check_partitions(self) -> None:
+        """Before every checkpoint: a partition of a source detached or dropped
+        since start took its rows away unseen. Stop; the next start bootstraps."""
+        if not self._partitions:
+            return
+        assert self._sql is not None
+        now = await self._current_partitions(self._sql)
+        if (gone := removed_partitions(self._partitions, now)) is not None:
+            raise PartitionsChangedError(gone)
+        self._partitions = now  # added partitions: their rows arrive as inserts
+
     async def close(self, *, final_checkpoint: bool = True) -> None:
         """Graceful stop: flush and checkpoint what was applied, so the next
         start replays nothing. (A crash skips all of this, by definition.)"""
         try:
+            # Inside a transaction applied in part, the state is no boundary:
+            # the next start replays the transaction whole.
             if (
                 final_checkpoint
                 and self.engine is not None
+                and not self.engine.partial
                 and self._sql is not None
                 and self.store
             ):

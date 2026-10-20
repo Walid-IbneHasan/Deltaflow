@@ -66,12 +66,18 @@ async def drop_slot(conn: ReplicationConnection, name: str) -> None:
 async def create_publication(
     conn: psycopg.AsyncConnection[tuple[object, ...]], name: str, tables: Sequence[str]
 ) -> None:
-    """(Re)create publication `name` covering exactly `tables` (schema.table)."""
+    """(Re)create publication `name` covering exactly `tables` (schema.table).
+    A partitioned table is published via its root: its changes arrive under
+    its own name, not its partitions'."""
     ident = sql.Identifier(check_name(name, "publication"))
     targets = sql.SQL(", ").join(sql.Identifier(*t.split(".", 1)) for t in tables)
     async with conn.transaction():
         await conn.execute(sql.SQL("DROP PUBLICATION IF EXISTS {}").format(ident))
-        await conn.execute(sql.SQL("CREATE PUBLICATION {} FOR TABLE {}").format(ident, targets))
+        await conn.execute(
+            sql.SQL(
+                "CREATE PUBLICATION {} FOR TABLE {} WITH (publish_via_partition_root = true)"
+            ).format(ident, targets)
+        )
 
 
 async def slot_confirmed_flush(conn: psycopg.AsyncConnection[tuple[object, ...]], name: str) -> Lsn:

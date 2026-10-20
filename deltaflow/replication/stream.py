@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Final
 
-from deltaflow.replication.changes import Transaction, TransactionAssembler
+from deltaflow.replication.changes import Transaction, TransactionAssembler, TransactionPart
 from deltaflow.replication.lsn import Lsn
 from deltaflow.replication.pgoutput import Message, decode_message
 from deltaflow.replication.protocol import PrimaryKeepalive, parse_copy_data, standby_status_update
@@ -61,7 +61,7 @@ class Progress:
 
 _END: Final = object()
 LSN_ZERO: Final = Lsn(0)
-type Event = Transaction | Message | Progress
+type Event = Transaction | TransactionPart | Message | Progress
 
 
 class ReplicationStream:
@@ -76,7 +76,11 @@ class ReplicationStream:
         status_interval: float = 10.0,
         max_pending: int = 32,
         progress: bool = False,
+        max_transaction_changes: int | None = None,
     ) -> None:
+        """With `max_transaction_changes`, a large transaction arrives as
+        `TransactionPart`s of that many changes and a final `Transaction`
+        (changes.py): memory stays bounded however large it is."""
         self._conn = conn
         self.slot = check_name(slot, "slot")
         self._publications = [check_name(p, "publication") for p in publications]
@@ -84,7 +88,7 @@ class ReplicationStream:
         self._messages = messages
         self._status_interval = status_interval
         self._queue: asyncio.Queue[Event | BaseException | object] = asyncio.Queue(max_pending)
-        self._assembler = TransactionAssembler()
+        self._assembler = TransactionAssembler(max_changes=max_transaction_changes)
         self._received = start_lsn
         self._flushed = start_lsn
         self._progress = progress
@@ -134,7 +138,7 @@ class ReplicationStream:
             raise StopAsyncIteration
         if isinstance(item, BaseException):
             raise item
-        assert isinstance(item, Transaction | Message | Progress)
+        assert isinstance(item, Transaction | TransactionPart | Message | Progress)
         return item
 
     def ack(self, lsn: Lsn) -> None:
@@ -172,12 +176,9 @@ class ReplicationStream:
                     continue
                 self._received = max(self._received, msg.wal_start)
                 event = self._assembler.feed(msg.wal_start, decode_message(msg.payload))
-                if event is None or self._closing:
+                if event is None or self._closing or self._acknowledged(event):
                     continue
                 if isinstance(event, Transaction):
-                    if event.end_lsn <= self._start_lsn:
-                        log.info("skipping already-acknowledged transaction %s", event.xid)
-                        continue
                     self._delivered = max(self._delivered, event.end_lsn)
                 await self._queue.put(event)
             # The server sent CopyDone: either our close() asked for it, or it
@@ -191,6 +192,17 @@ class ReplicationStream:
         except Exception as exc:
             if not self._closing:
                 await self._queue.put(exc)
+
+    def _acknowledged(self, event: Transaction | TransactionPart | Message) -> bool:
+        """A transaction the slot was acknowledged past (re-sent after a
+        reconnect). A part's transaction ends after its commit record: a
+        commit before the start means an end at or before it."""
+        if isinstance(event, TransactionPart):
+            return event.commit_lsn < self._start_lsn
+        if isinstance(event, Transaction) and event.end_lsn <= self._start_lsn:
+            log.info("skipping already-acknowledged transaction %s", event.xid)
+            return True
+        return False
 
     async def _heartbeat_loop(self) -> None:
         with contextlib.suppress(ConnectionError, OSError):

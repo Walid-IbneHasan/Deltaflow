@@ -38,6 +38,7 @@ from, so it raises.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import pickle
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -59,7 +60,8 @@ class SourceStateError(RuntimeError):
 
 
 class SchemaChangedError(SourceStateError):
-    """A source table's columns changed while views were running on it."""
+    """A source table's columns changed in a way the views cannot follow:
+    a column they may read was dropped, renamed or retyped."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +73,14 @@ class TableSchema:
     #: the columns that identify a row (the replica identity, or the
     #: primary key for REPLICA IDENTITY FULL)
     key: tuple[str, ...]
+    #: each column's type OID, as pgoutput sends it; empty when not known
+    #: (a checkpoint older than this field), then taken from the stream
+    types: tuple[int, ...] = ()
+    #: a partitioned table (read through, and published via, its root)
+    partitioned: bool = False
+    #: each column's type modifier (numeric's precision and scale, ...),
+    #: like `types`
+    typmods: tuple[int, ...] = ()
 
 
 type Key = tuple[Any, ...]
@@ -99,6 +109,12 @@ class TableArrangement:
         self._owns = owns
         self._marks = marks
         self._rereads = rereads
+        #: column -> (type OID, modifier) the stored rows have
+        self._types = {
+            c: (t, m) for c, t, m in zip(schema.columns, schema.types, schema.typmods, strict=False)
+        }
+        #: the checked relation has columns the schema does not (added since)
+        self._extra = False
         self._checked: Relation | None = None
         self.counters: Counter[str] = Counter()
 
@@ -123,6 +139,7 @@ class TableArrangement:
         """Apply one change; return it as whole-row (row, diff) pairs."""
         self._not_loading()
         self._check(change.relation)
+        change = self._projected(change)
         match change:
             case RowInsert():
                 if self._owns is not None and not self._owns(change.new):
@@ -272,6 +289,7 @@ class TableArrangement:
         """Apply a change committed at `lsn` while loading: per key, the newest
         writer wins (decision 0009, fork 2). Produces no deltas."""
         self._check(change.relation)
+        change = self._projected(change)
         match change:
             case RowInsert():
                 self._insert_loading(change.new, lsn)
@@ -443,15 +461,54 @@ class TableArrangement:
             raise RuntimeError(f"{self.schema.table} is still loading")
 
     def _check(self, relation: Relation) -> None:
+        """The stream's description of the table (a RELATION message, sent
+        again whenever the table changes) against the rows held here.
+
+        - An added column is left out: no view was planned with it, and
+          rows keep the columns they had (`_projected`).
+        - A dropped or renamed column may be one a view reads: refused.
+        - A column of a new type: the stored rows hold values of the old
+          one, so retractions would not match. Refused."""
         if relation is self._checked:
             return
-        columns = tuple(c.name for c in relation.columns)
-        if columns != self.schema.columns:
+        names = tuple(c.name for c in relation.columns)
+        if missing := [c for c in self.schema.columns if c not in names]:
             raise SchemaChangedError(
-                f"{self.schema.table}: columns changed from ({', '.join(self.schema.columns)}) "
-                f"to ({', '.join(columns)}); re-register the views on it"
+                f"{self.schema.table}: column(s) {', '.join(missing)} dropped or renamed while "
+                f"views read the table (now: {', '.join(names)}); re-register the views on it"
             )
+        types = {c.name: (c.type_oid, c.type_modifier) for c in relation.columns}
+        if not self._types:
+            self._types = {c: types[c] for c in self.schema.columns}
+        for column in self.schema.columns:
+            if types[column] != self._types[column]:
+                (was, was_mod), (now, now_mod) = self._types[column], types[column]
+                raise SchemaChangedError(
+                    f"{self.schema.table}: column {column} changed type (OID {was} to {now}, "
+                    f"modifier {was_mod} to {now_mod}) while views read the table: a rewrite "
+                    "Postgres does not replicate; re-register the views on it"
+                )
+        self._extra = names != self.schema.columns
         self._checked = relation
+
+    def _projected(
+        self, change: RowInsert | RowUpdate | RowDelete
+    ) -> RowInsert | RowUpdate | RowDelete:
+        """The change without the columns added since the schema was read."""
+        if not self._extra:
+            return change
+        columns = self.schema.columns
+
+        def keep(values: Values) -> Values:
+            # A key-only old row has just the key columns.
+            return {c: values[c] for c in columns if c in values}
+
+        if isinstance(change, RowInsert):
+            return dataclasses.replace(change, new=keep(change.new))
+        if isinstance(change, RowUpdate):
+            old = None if change.old is None else keep(change.old)
+            return dataclasses.replace(change, new=keep(change.new), old=old)
+        return dataclasses.replace(change, old=keep(change.old))
 
 
 _UNREAD, _STALE, _MARKED = object(), object(), object()

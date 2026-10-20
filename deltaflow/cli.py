@@ -135,6 +135,18 @@ def parser() -> argparse.ArgumentParser:
         sub.add_argument(
             "--snapshot-chunk-rows", type=int, default=20_000, help="rows per page (chunked)"
         )
+        sub.add_argument(
+            "--max-transaction-changes",
+            type=int,
+            default=10_000,
+            help="a larger transaction is applied in parts of this many changes",
+        )
+        sub.add_argument(
+            "--sink-spill-after",
+            type=int,
+            default=100_000,
+            help="buffered rows per sink beyond which they move to the state store",
+        )
 
     run = commands.add_parser("run", help="run views in one durable worker")
     run.add_argument("views", help="module:attribute naming the registry, or a .sql file")
@@ -291,6 +303,8 @@ async def _run(args: argparse.Namespace, make: Callable[[], Deltaflow] | None) -
         status_interval=args.status_interval,
         snapshot=args.snapshot,
         snapshot_chunk_rows=args.snapshot_chunk_rows,
+        max_transaction_changes=args.max_transaction_changes,
+        sink_spill_after=args.sink_spill_after,
     )
     await serve_runner(runner, args, restart=args.restart)
 
@@ -322,6 +336,8 @@ async def _cluster(args: argparse.Namespace, make: Callable[[], Deltaflow] | Non
             "status_interval": args.status_interval,
             "snapshot": args.snapshot,
             "snapshot_chunk_rows": args.snapshot_chunk_rows,
+            "max_transaction_changes": args.max_transaction_changes,
+            "sink_spill_after": args.sink_spill_after,
         },
     )
     stop = _stop_on_signals()

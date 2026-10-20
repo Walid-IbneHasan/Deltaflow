@@ -8,16 +8,21 @@ from typing import Any
 import psycopg
 
 from deltaflow.core import Multiset, Row
+from deltaflow.core.values import to_array
+from deltaflow.replication.changes import register_value_loaders
 
 
 async def query_multiset(
     conn: psycopg.AsyncConnection[tuple[Any, ...]], query: str
 ) -> Multiset[Row]:
+    register_value_loaders(conn.adapters)  # json, jsonb and arrays as the engine has them
     async with conn.cursor(binary=True) as cur:
         await cur.execute(query)
         assert cur.description is not None
         names = [c.name for c in cur.description]
-        return Multiset.of(Row(zip(names, rec, strict=True)) for rec in await cur.fetchall())
+        return Multiset.of(
+            Row(zip(names, map(to_array, rec), strict=True)) for rec in await cur.fetchall()
+        )
 
 
 def first_difference(view: Multiset[Row], expected: Multiset[Row]) -> str:

@@ -30,6 +30,7 @@ from decimal import Decimal
 from typing import Any
 
 from deltaflow.core import Row
+from deltaflow.core.values import Json, Jsonb, PgArray
 
 _EPOCH_UTC = datetime(1970, 1, 1, tzinfo=UTC)
 _EPOCH_NAIVE = datetime(1970, 1, 1)
@@ -99,9 +100,34 @@ def _encode(value: Any) -> bytes:  # noqa: PLR0911, PLR0912 - ordered type dispa
         return _blob(b"B", bytes(value))
     if isinstance(value, uuid.UUID):
         return b"U" + value.bytes
+    if isinstance(value, PgArray):
+        return b"R" + _varint(len(value)) + b"".join(_encode(v) for v in value)
+    if isinstance(value, Jsonb):  # by value: 1.0 and 1 are the same jsonb
+        return b"J" + _json_key(value.key)
+    if isinstance(value, Json):  # json has no equality but its text's
+        return _blob(b"j", value.text.encode("utf-8", "surrogatepass"))
     raise TypeError(
         f"a value of type {type(value).__name__} ({value!r:.60}) cannot be used as a key"
     )
+
+
+def _json_key(key: tuple[Any, ...]) -> bytes:
+    """A jsonb value's canonical bytes, from `Jsonb.key`."""
+    match key:
+        case ("o", pairs):
+            return (
+                b"o" + _varint(len(pairs)) + b"".join(_encode(k) + _json_key(v) for k, v in pairs)
+            )
+        case ("a", items):
+            return b"a" + _varint(len(items)) + b"".join(_json_key(v) for v in items)
+        case ("s", text):
+            return _encode(text)
+        case ("n", number):
+            return _encode(number)
+        case ("b", flag):
+            return b"T" if flag else b"F"
+        case _:
+            return b"0"
 
 
 def encode_key(values: Iterable[Any]) -> bytes:

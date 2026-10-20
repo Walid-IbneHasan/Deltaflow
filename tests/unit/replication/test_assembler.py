@@ -14,6 +14,7 @@ from deltaflow.replication.changes import (
     TableTruncate,
     Transaction,
     TransactionAssembler,
+    TransactionPart,
 )
 from deltaflow.replication.lsn import Lsn
 from deltaflow.replication.pgoutput import UNCHANGED_TOAST, Message, ProtocolError, decode_message
@@ -38,8 +39,8 @@ CUSTOMERS = pb.relation(
 )
 
 
-def feed(asm: TransactionAssembler, *raws: bytes) -> list[Transaction | Message]:
-    out: list[Transaction | Message] = []
+def feed(asm: TransactionAssembler, *raws: bytes) -> list[Transaction | TransactionPart | Message]:
+    out: list[Transaction | TransactionPart | Message] = []
     for i, raw in enumerate(raws):
         event = asm.feed(Lsn(0x1000 + i), decode_message(raw))
         if event is not None:
@@ -238,3 +239,31 @@ def test_protocol_violations_raise(raws: list[bytes], match: str) -> None:
     asm = TransactionAssembler()
     with pytest.raises(ProtocolError, match=match):
         feed(asm, *raws)
+
+
+def test_a_large_transaction_comes_in_parts_before_its_commit() -> None:
+    """pgoutput without streaming sends a transaction only once it has
+    committed, so its changes can be applied before its end arrives; in
+    parts, a large one never has to be in memory whole."""
+    asm = TransactionAssembler(max_changes=3)
+    inserts = [pb.insert(100, [str(i), "1", None]) for i in range(8)]
+    parts = feed(asm, ORDERS, pb.begin(0x2000, 0, 9), *inserts)
+    assert all(isinstance(p, TransactionPart) for p in parts)
+    assert [len(p.changes) for p in parts if isinstance(p, TransactionPart)] == [3, 3]
+    assert {(p.xid, p.commit_lsn) for p in parts if isinstance(p, TransactionPart)} == {
+        (9, Lsn(0x2000))
+    }
+    [txn] = feed(asm, pb.commit(0x2000, 0x2010, 0))
+    assert isinstance(txn, Transaction)
+    assert txn.continued
+    assert [c.new["id"] for c in txn.changes if isinstance(c, RowInsert)] == [6, 7]
+
+
+def test_without_a_limit_a_transaction_comes_whole() -> None:
+    asm = TransactionAssembler()
+    inserts = [pb.insert(100, [str(i), "1", None]) for i in range(8)]
+    assert feed(asm, ORDERS, pb.begin(0x2000, 0, 9), *inserts) == []
+    [txn] = feed(asm, pb.commit(0x2000, 0x2010, 0))
+    assert isinstance(txn, Transaction)
+    assert not txn.continued
+    assert len(txn.changes) == 8
