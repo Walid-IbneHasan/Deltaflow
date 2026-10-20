@@ -71,6 +71,16 @@ The other Postgres versions, run locally during the round:
   after the kill without this, and 21 s with it. The test's own
   connections had no `connect_timeout` and waited minutes on the dead
   port; with one, the test takes 36 s instead of 310 s.
+- **A synced slot is not safe until it is persistent.** In CI the
+  failover test killed the primary right after the standby's copy of the
+  slot showed `synced`. That copy was still `temporary`, so Postgres
+  dropped it at promotion, and the runner bootstrapped (correctly) rather
+  than resuming. The test now waits for `temporary = false`, and
+  docs/failover.md says what to check.
+- **The batch cap was larger than any batch could be.** The stream's
+  queue holds 32 events, so a batch never exceeds about 32 transactions;
+  the cap of 256 never applied. It is 32 now, and the measurement that
+  stands for the runner is the one with batches of 32.
 - **Two tests passed only because of earlier tests.** On a new Postgres
   15, two CLI tests cleared tables nothing had created yet. Every
   integration module now passes on its own on a new server.
