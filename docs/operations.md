@@ -80,6 +80,39 @@ event fields as top-level keys:
 logic is unit-tested with `node --test` (`console/lib/graph.test.ts`).
 CI type-checks and builds it.
 
+## Bootstrapping a large database
+
+A bootstrap loads the tables in chunks by default (decision 0009): one
+primary-key page at a time, each with its own exported snapshot, while the
+stream runs. No transaction stays open longer than one page, so VACUUM keeps
+working during the load.
+
+**What a load needs from the server.** Beside its slot and walsender, a
+loading runner uses one more of each: a temporary slot per page, created
+and dropped in turn on a second replication connection. Size
+`max_wal_senders` and `max_replication_slots` for two per runner (two per
+shard in a cluster) while loads run.
+
+**What stalls a load.** Creating a page's slot waits for the transactions
+open at that moment to end. A session idle in a transaction for an hour
+stalls the load for an hour. The runner logs a warning every 10 s while it
+waits, naming the oldest open transactions (pid, state, age, query). The
+remedy is the server's: `idle_in_transaction_session_timeout`, or ending the
+session.
+
+**Watching it.** `GET /api/stats` reports `"loading"`: per table, rows and
+pages read and whether it is done. The `deltaflow_runner_events_total` events
+`loads` and `load_resumes` count loads started and continued. The load is
+checkpointed every `--checkpoint-interval`, and the slot is acknowledged up
+to each checkpoint, so `deltaflow_slot_lag_bytes` stays bounded during a long
+load. A stopped or crashed load continues from its last checkpoint.
+
+**Page size** (`--snapshot-chunk-rows`, default 20,000). Larger pages mean
+fewer slot creations, but each page holds back VACUUM for as long as it takes
+to read. `--snapshot single` reads everything in one transaction. That is
+fastest for small databases, where holding back VACUUM for a few seconds
+does not matter.
+
 ## Backpressure under a slow sink
 
 Nothing in the pipeline buffers without bound:

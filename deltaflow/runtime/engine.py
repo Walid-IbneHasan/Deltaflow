@@ -23,18 +23,35 @@ Results become visible only in step 3, a whole transaction at a time. The
 snapshot is installed at time 0, and `start(consistent_point)` completes
 it: everything committed before the slot's consistent point is in the
 snapshot, and everything after it arrives as a transaction.
+
+**Loading in chunks (decision 0009).** Built with `chunked=True`, the
+engine is loaded with `begin_load`: the stream's transactions and chunks
+read at their own consistent points go into the arrangements only (the
+views have no state yet), until `ready()`. Then `go_live` builds every
+view from the arrangements, as a snapshot is installed, at the engine's
+frontier.
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+import pickle
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
-from deltaflow.core import Delta, Frontier, FrontierViolationError, Row, consolidate
+from deltaflow.core import (
+    Delta,
+    Frontier,
+    FrontierRegressionError,
+    FrontierViolationError,
+    Row,
+    consolidate,
+)
 from deltaflow.faults import crash_point
 from deltaflow.operators import Source
 from deltaflow.planner import Deltaflow, FilterStep, GroupStep, JoinStep, MapStep, PlanError, View
@@ -67,6 +84,7 @@ class Engine:
         snapshot_chunk_bytes: int = 2 << 20,
         resume: Mapping[str, Any] | None = None,
         shard: int | None = None,
+        chunked: bool = False,
     ) -> None:
         """All operator state (arrangements, join indices) goes into `store`.
         `namespace` prefixes every keyspace, so several engines can share one
@@ -80,7 +98,10 @@ class Engine:
 
         With `shard`, the registry must be sharded and the engine keeps only
         that shard's rows: its views' results are this shard's partials
-        (planner/merge.py combines them)."""
+        (planner/merge.py combines them).
+
+        With `chunked`, the engine is loaded with `begin_load` instead of
+        snapshots (decision 0009)."""
         if shard is not None and (registry.shards is None or not 0 <= shard < registry.shards):
             raise PlanError(f"shard {shard} given for a registry with shards={registry.shards}")
         self.shard = shard
@@ -114,17 +135,26 @@ class Engine:
         self._started = False
         self.counters: Counter[str] = Counter()
         self._fingerprint = fingerprint(registry)
+        #: while loading in chunks: the frontier (the plan's sources stay
+        #: at 0 until go_live), each table's paging, the newest chunk's CP
+        self._loading = False
+        self._load_lsn = SNAPSHOT_TIME
+        self._load: dict[str, TableLoad] = {}
+        self._max_cp = SNAPSHOT_TIME
         if resume is not None:
             self._resume(resume)
-        else:
-            # Operators with output before any input (a global aggregate's row).
+        elif not chunked:
+            # Operators with output before any input (a global aggregate's
+            # row). Loaded in chunks, the views are built at go_live instead.
             self._step({}, initial=True)
 
     def metadata(self) -> dict[str, Any]:
         """What a checkpoint must record to resume this engine (JSON-able)."""
         if not self._started or self.frontier.lower is None:
             raise RuntimeError("metadata is only meaningful for a started, open engine")
+        loading = {"loading": self._load_meta()} if self._loading else {}
         return {
+            **loading,
             "version": 1,
             "lsn": int(self.frontier.lower),
             "fingerprint": self._fingerprint,
@@ -153,6 +183,8 @@ class Engine:
         `registry` (None if it can, rebuilding changed views if need be)."""
         if meta.get("fingerprint") == fingerprint(registry):
             return None
+        if "loading" in meta:
+            return "the views changed while their tables were being loaded"
         if "views" not in meta:
             return "the views changed since the checkpoint, which predates per-view state"
         if meta.get("sharding") != _sharding(registry):
@@ -181,6 +213,9 @@ class Engine:
             raise PlanError(f"checkpoint is of shard {meta.get('shard')}, not {self.shard}")
         if (reason := Engine.cannot_resume(self._registry, meta)) is not None:
             raise PlanError(f"the state checkpoint cannot be resumed: {reason}")
+        if "loading" in meta:
+            self._resume_load(meta)
+            return
         rebuild = [] if "views" not in meta else Engine.views_to_rebuild(self._registry, meta)
         old: Mapping[str, Any] = meta.get("views") or {}
         dropped = tuple(name for name in old if name not in self._view_keyspaces)
@@ -235,12 +270,163 @@ class Engine:
             view.sink.advance(node.frontier)
         self.counters["views_rebuilt"] += len(views)
 
+    # --- loading in chunks (decision 0009) ---------------------------------
+
+    def begin_load(self, schemas: Sequence[TableSchema], at: Lsn) -> None:
+        """Start loading every source in chunks, the stream running from
+        `at` (the slot's consistent point)."""
+        if self._started:
+            raise RuntimeError("begin_load on a started engine")
+        if missing := set(self._plan.sources) - {s.table for s in schemas}:
+            raise PlanError(f"no schema given for {sorted(missing)}")
+        for schema in schemas:
+            self.declare(schema)
+        for schema in schemas:
+            for kind in ("arr", "mark", "reread"):
+                self._store.keyspace(f"{self._namespace}{kind}:{schema.table}").clear()
+            self._arrangements[schema.table] = self._loading_arrangement(schema, count=0)
+            self._load[schema.table] = TableLoad()
+        self._loading = self._started = True
+        self._load_lsn = at
+
+    @property
+    def loading(self) -> bool:
+        """Being loaded in chunks (begin_load, not yet go_live)."""
+        return self._loading
+
+    @property
+    def live(self) -> bool:
+        """Started and loaded: its views are maintained."""
+        return self._started and not self._loading
+
+    def next_page(self) -> tuple[TableSchema, tuple[Any, ...] | None] | None:
+        """The next page to read: a table, and the last key read before it
+        (None: from the start). None once every table has been read."""
+        for table, progress in self._load.items():
+            if not progress.done:
+                return self._schemas[table], progress.after
+        return None
+
+    def load_chunk(
+        self, table: str, rows: Sequence[Row], cp: Lsn, *, after: tuple[Any, ...] | None
+    ) -> None:
+        """Merge one page, read at consistent point `cp`. `after` is the
+        page's last key when the page was full (more may follow); None when
+        it was the table's last page."""
+        self._loading_check()
+        progress = self._load[table]
+        self._arrangements[table].load_chunk(rows, cp)
+        progress.chunks += 1
+        progress.rows += len(rows)
+        progress.after, progress.done = after, after is None
+        self._max_cp = max(self._max_cp, cp)
+        self.counters["snapshot_chunks"] += 1
+        self.counters["snapshot_rows"] += len(rows)
+
+    def rereads(self) -> dict[str, list[tuple[Any, ...]]]:
+        """Per table, the keys to read again (decision 0009)."""
+        self._loading_check()
+        return {t: keys for t, a in self._arrangements.items() if (keys := a.rereads())}
+
+    def reread(
+        self, table: str, keys: Sequence[tuple[Any, ...]], rows: Sequence[Row], cp: Lsn
+    ) -> None:
+        self._loading_check()
+        self._arrangements[table].reread(keys, rows, cp)
+        self._max_cp = max(self._max_cp, cp)
+        self.counters["rereads"] += len(keys)
+
+    def ready(self) -> bool:
+        """Loaded: every page read, no re-read pending, and the stream past
+        the newest chunk's consistent point, so every change older than any
+        chunk has been applied."""
+        return (
+            self._loading
+            and all(p.done for p in self._load.values())
+            and not any(a.rereads() for a in self._arrangements.values())
+            and self._load_lsn >= self._max_cp
+        )
+
+    def go_live(self) -> None:
+        """Build every view from the arrangements, at the frontier."""
+        if not self.ready():
+            raise RuntimeError("go_live before the load is complete")
+        for arrangement in self._arrangements.values():
+            arrangement.finish_loading()
+        self._loading = False
+        self._step({}, initial=True)
+        limit = self._chunk_limits[0]
+        for table, arrangement in self._arrangements.items():
+            chunk: list[Delta[Row]] = []
+            for row in arrangement.rows():
+                chunk.append(Delta(row, SNAPSHOT_TIME, 1))
+                if len(chunk) >= limit:
+                    self._step({table: chunk})
+                    chunk = []
+            if chunk:
+                self._step({table: chunk})
+        self.advance(Frontier.at(self._load_lsn))
+        self._load = {}
+
+    def load_progress(self) -> dict[str, dict[str, Any]]:
+        """Per table: rows and chunks read, and whether it is done."""
+        return {
+            t: {"rows": p.rows, "chunks": p.chunks, "done": p.done} for t, p in self._load.items()
+        }
+
+    def _loading_arrangement(self, schema: TableSchema, count: int) -> TableArrangement:
+        ks = self._store.keyspace
+        table = schema.table
+        return TableArrangement(
+            schema,
+            ks(f"{self._namespace}arr:{table}"),
+            count=count,
+            owns=self._owns.get(table),
+            marks=ks(f"{self._namespace}mark:{table}"),
+            rereads=ks(f"{self._namespace}reread:{table}"),
+        )
+
+    def _loading_check(self) -> None:
+        if not self._loading:
+            raise RuntimeError("the engine is not loading")
+
+    def _load_meta(self) -> dict[str, Any]:
+        return {
+            "max_cp": int(self._max_cp),
+            "tables": {
+                t: {
+                    "after": None if p.after is None else _pack(p.after),
+                    "done": p.done,
+                    "chunks": p.chunks,
+                    "rows": p.rows,
+                }
+                for t, p in self._load.items()
+            },
+        }
+
+    def _resume_load(self, meta: Mapping[str, Any]) -> None:
+        loading = meta["loading"]
+        for table, info in meta["arrangements"].items():
+            schema = TableSchema(table, tuple(info["columns"]), tuple(info["key"]))
+            self._schemas[table] = schema
+            self._arrangements[table] = self._loading_arrangement(schema, count=int(info["count"]))
+        for table, info in loading["tables"].items():
+            after = None if info["after"] is None else _unpack(info["after"])
+            self._load[table] = TableLoad(after, info["done"], info["chunks"], info["rows"])
+        self._max_cp = Lsn(int(loading["max_cp"]))
+        self._load_lsn = Lsn(int(meta["lsn"]))
+        self._loading = self._started = True
+
+    # --- running ----------------------------------------------------------------
+
     @property
     def sources(self) -> tuple[str, ...]:
         return tuple(self._plan.sources)
 
     @property
     def frontier(self) -> Frontier:
+        if self._loading:
+            return Frontier.at(self._load_lsn)
         return Frontier.meet(*(s.frontier for s in self._plan.sources.values()))
 
     def graph(self) -> dict[str, Any]:
@@ -330,6 +516,9 @@ class Engine:
                 f"transaction {txn.xid} commits at {txn.commit_lsn}, behind the frontier "
                 f"{self.frontier}: it was already applied"
             )
+        if self._loading:
+            self._apply_loading(txn)
+            return
         batches: dict[str, list[Delta[Row]]] = {}
         for change in txn.changes:
             match change:
@@ -354,7 +543,32 @@ class Engine:
         self.counters["transactions"] += 1
         self.advance(Frontier.at(txn.end_lsn))
 
+    def _apply_loading(self, txn: Transaction) -> None:
+        """Into the arrangements only: the views are built at go_live."""
+        for change in txn.changes:
+            match change:
+                case RowInsert() | RowUpdate() | RowDelete():
+                    arrangement = self._arrangements.get(change.relation.qualified_name)
+                    if arrangement is not None:
+                        arrangement.apply_loading(change, txn.commit_lsn)
+                case TableTruncate():
+                    for rel in change.relations:
+                        if (arrangement := self._arrangements.get(rel.qualified_name)) is not None:
+                            arrangement.truncate_loading(txn.commit_lsn)
+                case _:
+                    pass
+        crash_point("apply:after_state")
+        self.counters["transactions"] += 1
+        self.advance(Frontier.at(txn.end_lsn))
+
     def advance(self, to: Frontier) -> None:
+        if self._loading:
+            if to.lower is None or to.lower < self._load_lsn:
+                raise FrontierRegressionError(
+                    f"frontier would move back from {self._load_lsn} to {to}"
+                )
+            self._load_lsn = to.lower
+            return
         for source in self._plan.sources.values():
             source.advance(to)
         for view, node in self._plan.outputs:
@@ -362,6 +576,7 @@ class Engine:
 
     def _install_chunk(self, arrangement: TableArrangement, chunk: list[Row]) -> None:
         self.counters["snapshot_chunks"] += 1
+        self.counters["snapshot_rows"] += len(chunk)
         mine = [row for row in chunk if arrangement.load(row)]
         self._step({arrangement.schema.table: [Delta(row, SNAPSHOT_TIME, 1) for row in mine]})
 
@@ -397,6 +612,28 @@ class Engine:
         for view, node in plan.outputs:
             if out := outputs.get(id(node)):
                 view.sink.accept(consolidate(out))
+
+
+@dataclass(slots=True)
+class TableLoad:
+    """A table being loaded in chunks: the last key read (the paging
+    position), whether its last page has been read, and counts."""
+
+    after: tuple[Any, ...] | None = None
+    done: bool = False
+    chunks: int = 0
+    rows: int = 0
+
+
+def _pack(key: tuple[Any, ...]) -> str:
+    """A key in checkpoint metadata (JSON), exactly: Decimal scale, tzinfo."""
+    return base64.b64encode(pickle.dumps(key, protocol=5)).decode()
+
+
+def _unpack(text: str) -> tuple[Any, ...]:
+    key = pickle.loads(base64.b64decode(text))
+    assert isinstance(key, tuple)
+    return key
 
 
 class SnapshotLoader:

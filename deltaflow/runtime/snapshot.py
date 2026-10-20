@@ -8,11 +8,26 @@ arrive:
 * a source table not in the publication;
 * a publication that does not publish every operation;
 * a publication with a row filter or column list.
+
+Two ways to load the initial rows:
+
+* `load_snapshot`: every table inside one transaction on the slot's
+  exported snapshot. That transaction holds the server's xmin, and with it
+  VACUUM everywhere, for the whole load;
+* `ChunkReader`: one primary-key page at a time, each read with its own
+  exported snapshot from a temporary slot, so its consistent point is
+  exact (decision 0009). xmin is held for one page.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
+import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass
+from types import TracebackType
 from typing import Any
 
 import psycopg
@@ -21,8 +36,12 @@ from psycopg import sql
 from deltaflow.core import Row
 from deltaflow.planner import PlanError
 from deltaflow.replication.lsn import Lsn
+from deltaflow.replication.slot import SlotInfo, create_slot, drop_slot
+from deltaflow.replication.wire import ReplicationConnection
 from deltaflow.runtime.engine import Engine
 from deltaflow.state import TableSchema
+
+log = logging.getLogger(__name__)
 
 type Conn = psycopg.AsyncConnection[tuple[Any, ...]]
 
@@ -168,3 +187,176 @@ async def load_snapshot(
                     loader.add(Row(zip(schema.columns, record, strict=True)))
             loader.finish()
     engine.start(consistent_point)
+
+
+# --- chunks (decision 0009) -----------------------------------------------------
+
+#: keys per re-read query (each is one snapshot)
+REREAD_BATCH = 1_000
+
+
+@dataclass(frozen=True, slots=True)
+class Page:
+    #: the rows are the table as of this consistent point
+    cp: Lsn
+    rows: list[Row]
+    #: the last key, when the page was full (more may follow); None when it
+    #: was the table's last page
+    after: tuple[Any, ...] | None
+
+
+class ChunkReader:
+    """Reads source tables a primary-key page at a time, each page with its
+    own snapshot: a temporary slot exporting one, so that the page is the
+    table exactly as of the slot's consistent point. A page's transaction
+    is the only one held open, for as long as the page takes to read.
+
+    Pages follow the key index's own order (its collation, for text), and
+    the keys are only ever compared by Postgres.
+    """
+
+    def __init__(self, dsn: str, *, slot: str, application_name: str) -> None:
+        self._dsn = dsn
+        # Unique per page: after a crash the server may not have dropped the
+        # previous session's temporary slot yet.
+        self._prefix = f"{slot[:44]}_l"
+        self._app = application_name
+        self._repl: ReplicationConnection | None = None
+        self._conn: Conn | None = None
+        self._key_types: dict[str, tuple[str, ...]] = {}
+
+    async def __aenter__(self) -> ChunkReader:
+        self._conn = await psycopg.AsyncConnection.connect(self._dsn, application_name=self._app)
+        await self._conn.set_isolation_level(psycopg.IsolationLevel.REPEATABLE_READ)
+        self._repl = await ReplicationConnection.connect(self._dsn, application_name=self._app)
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        if self._repl is not None:
+            with contextlib.suppress(Exception):
+                await self._repl.close()
+        if self._conn is not None:
+            with contextlib.suppress(Exception):
+                await self._conn.close()
+
+    async def page(self, schema: TableSchema, after: tuple[Any, ...] | None, limit: int) -> Page:
+        """Up to `limit` rows with keys after `after` (from the start: None), in key order."""
+        keys = sql.SQL(", ").join(map(sql.Identifier, schema.key))
+        params: list[Any] = []
+        where: sql.Composable = sql.SQL("")
+        if after is not None:
+            where = sql.SQL("WHERE ({}) > ({})").format(keys, await self._typed(schema))
+            params.extend(after)
+        query = sql.SQL("SELECT {} FROM {} {} ORDER BY {} LIMIT %s").format(
+            _columns(schema), _table(schema), where, keys
+        )
+        cp, rows = await self._read(schema, query, [*params, limit])
+        last = tuple(rows[-1][c] for c in schema.key) if len(rows) == limit else None
+        return Page(cp, rows, last)
+
+    async def rows_of(self, schema: TableSchema, keys: Sequence[tuple[Any, ...]]) -> Page:
+        """The current rows of `keys` (a key without a row is gone)."""
+        typed = await self._typed(schema)
+        values = sql.SQL(", ").join(sql.SQL("({})").format(typed) for _ in keys)
+        query = sql.SQL("SELECT {} FROM {} WHERE ({}) IN (VALUES {})").format(
+            _columns(schema),
+            _table(schema),
+            sql.SQL(", ").join(map(sql.Identifier, schema.key)),
+            values,
+        )
+        cp, rows = await self._read(schema, query, [v for key in keys for v in key])
+        return Page(cp, rows, None)
+
+    async def _read(
+        self, schema: TableSchema, query: sql.Composed, params: Sequence[Any]
+    ) -> tuple[Lsn, list[Row]]:
+        assert self._conn is not None
+        assert self._repl is not None
+        name = f"{self._prefix}{uuid.uuid4().hex[:12]}"
+        info = await self._create(name)
+        assert info.snapshot_name is not None
+        try:
+            async with self._conn.transaction():
+                await self._conn.execute(
+                    sql.SQL("SET TRANSACTION SNAPSHOT {}").format(sql.Literal(info.snapshot_name))
+                )
+                # Binary, as load_snapshot reads: the same Python values.
+                async with self._conn.cursor(binary=True) as cur:
+                    await cur.execute(query, params)
+                    records = await cur.fetchall()
+        finally:
+            await drop_slot(self._repl, name)
+        return info.consistent_point, [
+            Row(zip(schema.columns, record, strict=True)) for record in records
+        ]
+
+    async def _create(self, name: str) -> SlotInfo:
+        """Create the page's slot. Creation waits for every transaction
+        running at that moment to end; a long one stalls the load, so say
+        which sessions it is waiting for."""
+        assert self._repl is not None
+        creating = asyncio.ensure_future(
+            create_slot(self._repl, name, temporary=True, export_snapshot=True)
+        )
+        waited = 0
+        try:
+            while True:
+                done, _ = await asyncio.wait({creating}, timeout=10)
+                if done:
+                    return creating.result()
+                waited += 10
+                log.warning(
+                    "the next chunk has waited %d s for transactions that were open when its "
+                    "slot was created to end",
+                    waited,
+                    extra={"sessions": await self._open_transactions()},
+                )
+        except BaseException:
+            creating.cancel()
+            raise
+
+    async def _open_transactions(self) -> list[dict[str, Any]]:
+        assert self._conn is not None
+        async with self._conn.transaction(), self._conn.cursor() as cur:
+            await cur.execute(
+                "SELECT pid, state, (now() - xact_start)::text, left(query, 200)"
+                " FROM pg_stat_activity WHERE backend_xid IS NOT NULL"
+                " ORDER BY xact_start LIMIT 5"
+            )
+            found = await cur.fetchall()
+        return [{"pid": p, "state": s, "open for": t, "query": q} for p, s, t, q in found]
+
+    async def _typed(self, schema: TableSchema) -> sql.Composable:
+        """Placeholders for one key, cast to the key columns' types."""
+        types = self._key_types.get(schema.table)
+        if types is None:
+            types = self._key_types[schema.table] = await _key_types(self._conn, schema)
+        return sql.SQL(", ").join(sql.SQL("%s::" + t) for t in types)
+
+
+async def _key_types(conn: Conn | None, schema: TableSchema) -> tuple[str, ...]:
+    assert conn is not None
+    namespace, name = schema.table.split(".", 1)
+    async with conn.transaction(), conn.cursor() as cur:
+        await cur.execute(
+            "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod)"
+            " FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid"
+            " JOIN pg_namespace n ON n.oid = c.relnamespace"
+            " WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped",
+            (namespace, name),
+        )
+        found: dict[str, str] = {str(n): str(t) for n, t in await cur.fetchall()}
+    return tuple(found[c] for c in schema.key)
+
+
+def _columns(schema: TableSchema) -> sql.Composable:
+    return sql.SQL(", ").join(map(sql.Identifier, schema.columns))
+
+
+def _table(schema: TableSchema) -> sql.Composable:
+    return sql.Identifier(*schema.table.split(".", 1))

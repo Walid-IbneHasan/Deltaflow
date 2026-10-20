@@ -13,6 +13,7 @@ against the source tables the whole time. Two tests:
   so random timing would almost never hit them. A crash point
   (`deltaflow.faults`) kills the worker exactly there:
   - after the slot is created, before the sink holds the snapshot;
+  - in the middle of a chunked load, after a page is merged;
   - with the state changed but the frontier not yet advanced;
   - before and after the sink transaction commits;
   - with a checkpoint's files written but not marked complete;
@@ -75,6 +76,8 @@ class Harness:
                     "--dsn", self.dsn, "--state-dir", str(self.state_dir), "--slot", self.slot,
                     "--publication", "deltaflow_chaos", "--memory-budget", "16",
                     "--flush-interval", "0.05", "--checkpoint-interval", "0.3", "--http-port", "-1",
+                    # pages of 200 rows: a load of about ten chunks, for kills to land in
+                    "--snapshot-chunk-rows", "200",
                 ],
                 stdout=log,
                 stderr=subprocess.STDOUT,
@@ -178,6 +181,7 @@ def test_kill_9_at_random_moments(dsn: str, chaos_seed: int, tmp_path: Path) -> 
 
 CRASH_POINTS = [
     ("bootstrap:after_slot", 1),
+    ("load:after_chunk", None),
     ("bootstrap:after_sink", 1),
     ("apply:after_state", None),
     ("flush:before_commit", None),
@@ -201,7 +205,7 @@ def test_crash_at_each_critical_point(
         stop = asyncio.Event()
         load = asyncio.create_task(sustained_load(dsn, chaos_seed, stop, stats))
         try:
-            if not point.startswith("bootstrap"):
+            if not point.startswith(("bootstrap", "load")):
                 # Let a first worker bootstrap and checkpoint, then kill it, so
                 # the crashing worker is a resumed one.
                 first = h.spawn()

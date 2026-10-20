@@ -19,6 +19,7 @@ from deltaflow.replication.lsn import Lsn
 from deltaflow.runtime.cluster import CLUSTER_DDL, LOCK_CLASS, ClusterWorker
 from deltaflow.sinks import PostgresSink
 from deltaflow.sinks.postgres import FencedError, ensure_watermark_table, flush, load_watermark
+from tests.integration.test_durable_runner import until
 
 type Sql = psycopg.AsyncConnection[tuple[Any, ...]]
 
@@ -142,7 +143,10 @@ def test_a_failing_shard_is_retried_with_backoff(dsn: str, tmp_path: Path) -> No
             stop = asyncio.Event()
             task = asyncio.create_task(worker.run(stop))
             try:
-                await asyncio.sleep(5.0)
+                # Watch from the first failure: getting there takes longer on
+                # a loaded machine, and is not what is tested.
+                await until(lambda: worker.stats.runner_failures[0] >= 1)
+                await asyncio.sleep(4.0)
             finally:
                 stop.set()
                 await task
@@ -155,5 +159,6 @@ def test_a_failing_shard_is_retried_with_backoff(dsn: str, tmp_path: Path) -> No
 
     acquired, failures = run(go())
     assert failures >= 2  # it kept trying
-    # 0.5 + 1 + 2 s of backoff fit in 5 s; one try per 0.1 s heartbeat would be ~50
+    # retries 0.5, 1 and 2 s apart fit in the 4 s after the first failure; one try
+    # per 0.1 s heartbeat would be ~40
     assert acquired <= 5, acquired

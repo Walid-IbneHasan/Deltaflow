@@ -125,6 +125,16 @@ def parser() -> argparse.ArgumentParser:
         sub.add_argument("--status-interval", type=float, default=2.0, help="seconds")
         sub.add_argument("--http-host", default="127.0.0.1")
         sub.add_argument("--http-port", type=int, default=9187, help="-1 disables; 0 picks one")
+        sub.add_argument(
+            "--snapshot",
+            choices=("chunked", "single"),
+            default="chunked",
+            help="how a bootstrap reads the tables: in key-ordered pages, each with its own "
+            "snapshot (default), or in one transaction, holding back VACUUM meanwhile",
+        )
+        sub.add_argument(
+            "--snapshot-chunk-rows", type=int, default=20_000, help="rows per page (chunked)"
+        )
 
     run = commands.add_parser("run", help="run views in one durable worker")
     run.add_argument("views", help="module:attribute naming the registry, or a .sql file")
@@ -279,6 +289,8 @@ async def _run(args: argparse.Namespace, make: Callable[[], Deltaflow] | None) -
         flush_interval=args.flush_interval,
         checkpoint_interval=args.checkpoint_interval,
         status_interval=args.status_interval,
+        snapshot=args.snapshot,
+        snapshot_chunk_rows=args.snapshot_chunk_rows,
     )
     await serve_runner(runner, args, restart=args.restart)
 
@@ -308,6 +320,8 @@ async def _cluster(args: argparse.Namespace, make: Callable[[], Deltaflow] | Non
             "checkpoint_interval": args.checkpoint_interval,
             "memory_budget": args.memory_budget << 20,
             "status_interval": args.status_interval,
+            "snapshot": args.snapshot,
+            "snapshot_chunk_rows": args.snapshot_chunk_rows,
         },
     )
     stop = _stop_on_signals()

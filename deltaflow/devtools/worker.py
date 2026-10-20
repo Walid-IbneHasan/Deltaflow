@@ -136,6 +136,8 @@ async def _main(args: argparse.Namespace) -> None:
         flush_interval=args.flush_interval,
         checkpoint_interval=args.checkpoint_interval,
         status_interval=2,
+        snapshot=args.snapshot,
+        snapshot_chunk_rows=args.snapshot_chunk_rows,
     )
     # The same loop as `deltaflow run`: restarts after transient failures.
     await serve_runner(runner, args)
@@ -167,6 +169,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--memory-budget", type=int, default=64, help="MiB")
     parser.add_argument("--flush-interval", type=float, default=0.1, help="seconds")
     parser.add_argument("--checkpoint-interval", type=float, default=10.0, help="seconds")
+    parser.add_argument("--snapshot", choices=("chunked", "single"), default="chunked")
+    parser.add_argument("--snapshot-chunk-rows", type=int, default=20_000)
     parser.add_argument("--http-host", default="127.0.0.1")
     parser.add_argument("--http-port", type=int, default=9187, help="-1 disables; 0 picks one")
     parser.add_argument("--log-format", choices=("json", "text"), default="json")

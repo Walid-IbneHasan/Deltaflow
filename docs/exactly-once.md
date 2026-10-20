@@ -66,23 +66,60 @@ run emitted.
 ## Bootstrap is the other way to recover
 
 With no usable checkpoint, the runner logs a warning, counts a bootstrap,
-and rebuilds from scratch:
-
-- drop the slot;
-- create it with an exported snapshot;
-- load the snapshot;
-- **replace** every sink table's contents and set W to the snapshot's
-  consistent point, in one transaction;
-- checkpoint there.
+and rebuilds from scratch.
 
 Reasons for no usable checkpoint:
 - first start;
 - the slot is missing;
-- the views changed (plan fingerprint);
+- a view reads a table the checkpoint has no copy of;
 - a watermark is missing or behind the checkpoint.
 
-A crash anywhere inside bootstrap leaves no complete checkpoint, so the next
-start bootstraps again. The replace makes that idempotent.
+(A changed view no longer needs one: see "Changing views without a
+bootstrap" below.)
+
+### In chunks: the default (decision 0009)
+
+- Drop the slot and create it **without** a snapshot, at C0. The stream
+  starts at C0 at once.
+- Read every table a primary-key page at a time. Each page is read with its
+  own exported snapshot, from a temporary slot, so the page is the table
+  exactly as of that slot's consistent point CP. Its transaction is the only
+  one open, and only while the page is read: VACUUM keeps working.
+- Between pages, apply the stream's transactions to the arrangements only.
+  Per key, the newest writer wins: a change older than the page that read
+  its key is ignored; a change to a key no page has read yet is skipped
+  (UPDATE, DELETE) or kept (INSERT); a change the loader cannot complete is
+  read again with a fresh snapshot.
+- **Checkpoint the load** like live state, and acknowledge the slot up to
+  it. A crash during the load restores that checkpoint and continues with
+  the next page. Nothing is written to a sink during the load, so no
+  watermark is involved yet.
+- **Go live** once every page is in, nothing is waiting to be read again,
+  and the stream is past the last CP. Every change older than any page has
+  then been applied, so the arrangements equal the tables as of the engine's
+  frontier F. Build the views from them, **replace** every sink's contents
+  and set W = F in one transaction, and checkpoint at F.
+
+A crash before going live leaves a load checkpoint, so the next start
+continues the load. A crash after the replace but before the checkpoint
+replays from the last load checkpoint and goes live again; the replace makes
+that idempotent. Tests: `tests/unit/state/test_loading.py` (the rule above,
+against a model of the table, under random interleavings);
+`tests/integration/test_chunked_bootstrap.py` (VACUUM during a load, a
+stopped load resuming); the chaos suite's `load:after_chunk` crash point.
+
+### In one transaction: `snapshot="single"`
+
+- drop the slot;
+- create it with an exported snapshot;
+- load the snapshot, every table in one REPEATABLE READ transaction (which
+  holds back VACUUM on the whole server while it runs);
+- **replace** every sink table's contents and set W to the snapshot's
+  consistent point, in one transaction;
+- checkpoint there.
+
+A crash anywhere inside this bootstrap leaves no complete checkpoint, so the
+next start bootstraps again. The replace makes that idempotent.
 
 **Limit:** the fingerprint covers the views' structure and their functions'
 *names*, not their bodies. Changing what a lambda computes needs

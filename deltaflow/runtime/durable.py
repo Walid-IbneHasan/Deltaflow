@@ -35,6 +35,17 @@ so in the log and in `counters["bootstraps"]`. Reasons: first start, a
 missing slot, a view over a table the checkpoint has no copy of, missing
 watermarks.
 
+**Bootstrapping in chunks** (decision 0009, the default). The slot is
+created without a snapshot and the stream starts at once. Every table is
+read a primary-key page at a time, each page with its own exported
+snapshot, while the stream's transactions go into the arrangements in
+between. No transaction stays open for longer than a page, so VACUUM
+keeps working. The load is checkpointed like live state and the slot
+acknowledged up to it: a stopped or crashed load continues where it was.
+When every page is in and the stream is past the last page's consistent
+point, the views are built from the arrangements and every sink's
+contents are replaced at that position, which is where they go live.
+
 **Changed views.** Views added or changed since the checkpoint do not
 need a bootstrap: the engine builds them from the checkpoint's source
 rows, as of its position (engine.py, per-view state). The runner then
@@ -60,7 +71,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import Any, Literal
 
 import psycopg
 from psycopg import sql
@@ -82,7 +93,13 @@ from deltaflow.replication.wire import (
 )
 from deltaflow.runtime.engine import Engine
 from deltaflow.runtime.runner import DEFAULT_MEMORY_BUDGET
-from deltaflow.runtime.snapshot import load_snapshot
+from deltaflow.runtime.snapshot import (
+    REREAD_BATCH,
+    ChunkReader,
+    check_publication,
+    describe_table,
+    load_snapshot,
+)
 from deltaflow.sinks.postgres import (
     SHARD_COLUMN,
     PostgresSink,
@@ -143,11 +160,22 @@ class DurableRunner:
         fence: tuple[int, int] | None = None,
         live_name: str = "live",
         application_name: str = "deltaflow",
+        snapshot: Literal["chunked", "single"] = "chunked",
+        snapshot_chunk_rows: int = 20_000,
     ) -> None:
         """With `shard`, this runner maintains that shard of a sharded
         registry: its sinks write partial rows to `<table>__shards`, its
         watermarks are per (view, shard), and every flush is fenced by the
-        lease `fence=(shard, epoch)` (M7, runtime/cluster.py)."""
+        lease `fence=(shard, epoch)` (M7, runtime/cluster.py).
+
+        `snapshot` is how a bootstrap reads the tables: `"chunked"`, pages of
+        `snapshot_chunk_rows` rows, each with its own snapshot (decision
+        0009); or `"single"`, everything in one transaction, which holds
+        back VACUUM on the whole server while it runs."""
+        if snapshot not in ("chunked", "single"):
+            raise ValueError(f"snapshot must be 'chunked' or 'single', not {snapshot!r}")
+        if snapshot_chunk_rows < 1:
+            raise ValueError("snapshot_chunk_rows must be at least 1")
         for view in registry.views:
             if not isinstance(view.sink, PostgresSink):
                 raise PlanError(
@@ -175,6 +203,8 @@ class DurableRunner:
         self._max_flush = max_flush_transactions
         self._checkpoint_interval = checkpoint_interval
         self._status_interval = status_interval
+        self._snapshot = snapshot
+        self._chunk_rows = snapshot_chunk_rows
         self.counters: Counter[str] = Counter()
         self.metrics = RunnerMetrics()
         #: (end_lsn, commit_time) of applied transactions not yet flushed
@@ -186,14 +216,18 @@ class DurableRunner:
         self._sql: Conn | None = None
         self.flushed_lsn: Lsn | None = None
         self.checkpointed_lsn: Lsn | None = None
-        #: how the last start() went: "resumed" or "bootstrapped"
+        #: how the last start() went: "resumed" or "bootstrapped"; "loading"
+        #: when stopped during a chunked load (the next start continues it)
         self.started_by: str | None = None
         #: the latest progress the stream reported (idle sources)
         self._progress_lsn: Lsn | None = None
 
     # --- start: resume or bootstrap ------------------------------------------
 
-    async def start(self) -> None:
+    async def start(self, stop: asyncio.Event | None = None) -> None:
+        """Resume, or bootstrap. A chunked bootstrap loads the tables before
+        this returns; if `stop` is set meanwhile, the load is checkpointed and
+        start returns with `started_by == "loading"`."""
         # A session: a restart replays from the checkpoint, so progress and
         # commit times of the previous session no longer apply.
         self._progress_lsn = None
@@ -213,18 +247,26 @@ class DurableRunner:
                 await self._ensure_publication(admin, registry_sources)
             have_slot = await slot_exists(admin, self.slot)
         repl = await ReplicationConnection.connect(self._dsn, application_name=self._app)
+        loading = False
         try:
             checkpoint = self.state.latest()
             reason = await self._why_not_resume(checkpoint, have_slot)
-            if reason is None and checkpoint is not None:
+            if reason is None and checkpoint is not None and "loading" in checkpoint.meta:
+                start_lsn = self._resume_load(checkpoint, shapes)
+                loading = True
+            elif reason is None and checkpoint is not None:
                 start_lsn = await self._resume(checkpoint, shapes)
                 self.started_by = "resumed"
             else:
                 log.warning(
                     "bootstrapping from a fresh snapshot: %s", reason, extra={"reason": reason}
                 )
-                start_lsn = await self._bootstrap(repl, have_slot, shapes)
-                self.started_by = "bootstrapped"
+                if self._snapshot == "single":
+                    start_lsn = await self._bootstrap(repl, have_slot, shapes)
+                    self.started_by = "bootstrapped"
+                else:
+                    start_lsn = await self._begin_load(repl, have_slot, shapes)
+                    loading = True
             self._stream = ReplicationStream(
                 repl,
                 slot=self.slot,
@@ -238,6 +280,8 @@ class DurableRunner:
         except BaseException:
             await repl.close()
             raise
+        if loading:
+            await self._load(stop)
 
     def _write_table(self, sink: PostgresSink) -> str:
         return sink.table if self.shard is None else f"{sink.table}__shards"
@@ -292,6 +336,12 @@ class DurableRunner:
             return f"replication slot {self.slot} is missing"
         if (reason := Engine.cannot_resume(self.registry, checkpoint.meta)) is not None:
             return reason
+        if "loading" in checkpoint.meta:
+            return None  # the sinks are replaced when the load goes live
+        return await self._watermark_problem(checkpoint)
+
+    async def _watermark_problem(self, checkpoint: Any) -> str | None:
+        """Whether every kept view's sink is written through the checkpoint."""
         assert self._sql is not None
         rebuild = self._to_rebuild(checkpoint.meta)
         for sink in self.sinks:
@@ -351,14 +401,8 @@ class DurableRunner:
         )
         return Lsn(checkpoint.lsn)
 
-    async def _bootstrap(
-        self, repl: ReplicationConnection, have_slot: bool, shapes: dict[str, Any]
-    ) -> Lsn:
-        assert self._sql is not None
-        if have_slot:
-            await drop_slot(repl, self.slot)
-        self.state.reset()
-        self.store = self.state.open_live(memory_budget=self._memory_budget)
+    def _bind_fresh(self, shapes: dict[str, Any]) -> None:
+        """Bind every sink without a watermark: its contents are replaced."""
         for sink in self.sinks:
             columns, key = shapes[sink.table]
             sink.bind(
@@ -369,7 +413,131 @@ class DurableRunner:
                 shard=self.shard,
                 write_table=self._write_table(sink),
             )
-        self.engine = Engine(self.registry, self.store, shard=self.shard)
+
+    async def _begin_load(
+        self, repl: ReplicationConnection, have_slot: bool, shapes: dict[str, Any]
+    ) -> Lsn:
+        """A chunked bootstrap: the slot, without a snapshot, and an engine
+        waiting for pages. The load itself is `_load`."""
+        if have_slot:
+            await drop_slot(repl, self.slot)
+        self.state.reset()
+        self.store = self.state.open_live(memory_budget=self._memory_budget)
+        self._bind_fresh(shapes)
+        self.engine = Engine(self.registry, self.store, shard=self.shard, chunked=True)
+        info = await create_slot(repl, self.slot)
+        crash_point("bootstrap:after_slot")
+        async with await psycopg.AsyncConnection.connect(
+            self._dsn, autocommit=True, application_name=self._app
+        ) as conn:
+            schemas = []
+            for table in self.engine.sources:
+                schema = await describe_table(conn, table)
+                await check_publication(conn, self.publication, schema)
+                schemas.append(schema)
+        self.engine.begin_load(schemas, info.consistent_point)
+        self.flushed_lsn = None
+        await self._checkpoint()  # from here on, a restart continues the load
+        self.counters["loads"] += 1
+        log.info(
+            "loading %s in chunks; slot %s created at %s",
+            list(self.engine.sources), self.slot, info.consistent_point,
+        )  # fmt: skip
+        return info.consistent_point
+
+    def _resume_load(self, checkpoint: Any, shapes: dict[str, Any]) -> Lsn:
+        self.store = self.state.open_live(memory_budget=self._memory_budget, restore=checkpoint)
+        self._bind_fresh(shapes)
+        self.engine = Engine(self.registry, self.store, resume=checkpoint.meta, shard=self.shard)
+        self.flushed_lsn = None
+        self.checkpointed_lsn = checkpoint.lsn
+        self.counters["load_resumes"] += 1
+        log.info("continuing the load from its checkpoint at %s", checkpoint.lsn)
+        return Lsn(checkpoint.lsn)
+
+    async def _load(self, stop: asyncio.Event | None) -> None:
+        """Read pages and re-reads, applying the stream in between, until the
+        engine is ready; then go live: build the views, replace every sink's
+        contents at the frontier, and checkpoint."""
+        engine = self.engine
+        assert engine is not None
+        assert self._stream is not None
+        assert self._sql is not None
+        last_checkpoint = time.monotonic()
+        async with ChunkReader(self._dsn, slot=self.slot, application_name=self._app) as reader:
+            while not engine.ready():
+                await self._drain()
+                if stop is not None and stop.is_set():
+                    # Pages change the state without moving the frontier.
+                    await self._checkpoint()
+                    self.started_by = "loading"
+                    log.info("load stopped at %s; the next start continues it", self._state_lsn())
+                    return
+                if (page := engine.next_page()) is not None:
+                    schema, after = page
+                    chunk = await reader.page(schema, after, self._chunk_rows)
+                    engine.load_chunk(schema.table, chunk.rows, chunk.cp, after=chunk.after)
+                    crash_point("load:after_chunk")
+                elif rereads := engine.rereads():
+                    for table, keys in rereads.items():
+                        schema = engine.arrangements[table].schema
+                        for i in range(0, len(keys), REREAD_BATCH):
+                            batch = keys[i : i + REREAD_BATCH]
+                            again = await reader.rows_of(schema, batch)
+                            engine.reread(table, batch, again.rows, again.cp)
+                else:
+                    # Every page is in. Wait for the stream to pass the last
+                    # page's consistent point, asking the server for its
+                    # position in case the tables are idle.
+                    await self._stream.send_status(reply_requested=True)
+                    if (event := await self._next(0.5)) is not None:
+                        self._apply_loading(event)
+                    self._advance_idle()
+                if time.monotonic() - last_checkpoint >= self._checkpoint_interval:
+                    self._advance_idle()
+                    await self._checkpoint()
+                    last_checkpoint = time.monotonic()
+        lsn = self._state_lsn()
+        engine.go_live()
+        await flush(self._sql, self.sinks, lsn, replace=True, fence=self._fence)
+        crash_point("bootstrap:after_sink")
+        self.flushed_lsn = lsn
+        await self._checkpoint()
+        self.counters["bootstraps"] += 1
+        self.started_by = "bootstrapped"
+        log.info(
+            "loaded %d rows in %d chunks; live at %s",
+            engine.counters["snapshot_rows"], engine.counters["snapshot_chunks"], lsn,
+        )  # fmt: skip
+
+    async def _drain(self, budget: float = 0.5) -> None:
+        """Apply what the stream has queued, for up to `budget` seconds."""
+        deadline = time.monotonic() + budget
+        while time.monotonic() < deadline:
+            event = await self._next(0)
+            if event is None:
+                return
+            self._apply_loading(event)
+
+    def _apply_loading(self, txn: Transaction) -> None:
+        assert self.engine is not None
+        self.engine.apply(txn)
+        self.counters["transactions"] += 1
+        self.metrics.transactions.inc()
+        self.metrics.changes.inc(len(txn.changes))
+
+    async def _bootstrap(
+        self, repl: ReplicationConnection, have_slot: bool, shapes: dict[str, Any]
+    ) -> Lsn:
+        assert self._sql is not None
+        if have_slot:
+            await drop_slot(repl, self.slot)
+        self.state.reset()
+        self.store = self.state.open_live(memory_budget=self._memory_budget)
+        self._bind_fresh(shapes)
+        self.engine = Engine(
+            self.registry, self.store, shard=self.shard, snapshot_chunk_rows=self._chunk_rows
+        )
         info = await create_slot(repl, self.slot, export_snapshot=True)
         assert info.snapshot_name is not None
         crash_point("bootstrap:after_slot")
@@ -491,6 +659,7 @@ class DurableRunner:
                 "max": lag.max if lag.count else None,
             },
             "counters": dict(self.counters),
+            "loading": engine.load_progress() if engine and engine.loading else None,
             "state": dataclasses.asdict(store.stats()) if store else {},
             "rss_bytes": rss().current,
             "graph": engine.graph() if engine else {"nodes": []},
@@ -525,6 +694,8 @@ class DurableRunner:
             "idle_advances",
             "restarts",
             "views_rebuilt",
+            "loads",
+            "load_resumes",
         ):
             m.events.labels(event=name).value = self.counters[name]
         return m.registry
@@ -532,6 +703,10 @@ class DurableRunner:
     async def _run(self, stop: asyncio.Event) -> None:
         assert self._stream is not None
         assert self.engine is not None
+        if self.engine.loading:
+            if stop.is_set():
+                return
+            raise RuntimeError("the load was stopped before it went live; start() continues it")
         pending = 0
         first_pending = 0.0
         last_checkpoint = time.monotonic()
@@ -633,7 +808,9 @@ class DurableRunner:
         assert self.engine is not None
         assert self.store is not None
         lsn = self._state_lsn()
-        if self.flushed_lsn is None or lsn > self.flushed_lsn:
+        # While loading, the sinks are not involved: they are replaced when
+        # the load goes live.
+        if not self.engine.loading and (self.flushed_lsn is None or lsn > self.flushed_lsn):
             raise AssertionError(
                 f"checkpoint at {lsn} would be ahead of the sinks ({self.flushed_lsn})"
             )
@@ -667,8 +844,10 @@ class DurableRunner:
                 and self._sql is not None
                 and self.store
             ):
-                await self._flush()
-                if self._state_lsn() != self.checkpointed_lsn:
+                if not self.engine.loading:
+                    await self._flush()
+                # A load's pages change the state without moving the frontier.
+                if self.engine.loading or self._state_lsn() != self.checkpointed_lsn:
                     await self._checkpoint()
         finally:
             if self._stream is not None:
