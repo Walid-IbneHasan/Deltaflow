@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,10 @@ def dsn(port: int) -> str:
 
 #: both servers, the primary wanted: what an application would configure
 EITHER = f"host=localhost,localhost port={PRIMARY},{STANDBY} {AUTH} target_session_attrs=read-write"
+#: the test's own connections, with a connect timeout as docs/failover.md
+#: advises: Docker Desktop accepts connections to a dead container's port
+#: and then says nothing, and libpq would wait on it for minutes
+CLIENT = f"{EITHER} connect_timeout=5"
 
 
 async def load(target: str, seed: int, txns: int) -> None:
@@ -69,17 +74,18 @@ def test_a_failover_under_load_resumes_exactly_on_the_promoted_standby(tmp_path:
         task = asyncio.create_task(runner.serve(stop, first_delay=0.2, max_delay=2.0))
         try:
             await until(lambda: runner.started_by == "bootstrapped", timeout=120)
-            await load(EITHER, seed=1, txns=200)
+            await load(CLIENT, seed=1, txns=200)
             async with await psycopg.AsyncConnection.connect(dsn(PRIMARY), autocommit=True) as p:
                 await wait_caught_up(p, await emit_marker(p))
             async with await psycopg.AsyncConnection.connect(dsn(STANDBY), autocommit=True) as s:
                 async with asyncio.timeout(120):
                     while not await synced(s):  # noqa: ASYNC110 - polling another server
                         await asyncio.sleep(0.5)
-            await load(EITHER, seed=2, txns=100)
+            await load(CLIENT, seed=2, txns=100)
 
             # The primary dies; the standby is promoted.
             restarts = runner.counters["restarts"]
+            killed = time.monotonic()
             await asyncio.to_thread(
                 subprocess.run,
                 ["docker", "compose", "-f", str(COMPOSE), "kill", "primary"],
@@ -90,8 +96,9 @@ def test_a_failover_under_load_resumes_exactly_on_the_promoted_standby(tmp_path:
                 await s.execute("SELECT pg_promote(wait => true)")
             await until(lambda: runner.counters["restarts"] > restarts, timeout=60)
             await until(lambda: runner.counters["resumes"] >= 1, timeout=120)
+            resumed_after = time.monotonic() - killed
 
-            await load(EITHER, seed=3, txns=150)
+            await load(CLIENT, seed=3, txns=150)
             async with await psycopg.AsyncConnection.connect(dsn(STANDBY), autocommit=True) as s:
                 await wait_caught_up(s, await emit_marker(s), timeout=120)
                 assert await sink_differences(s) == []
@@ -101,7 +108,7 @@ def test_a_failover_under_load_resumes_exactly_on_the_promoted_standby(tmp_path:
             stop.set()
             await asyncio.wait_for(task, timeout=60)
             await runner.close()
-        return dict(runner.counters)
+        return {**runner.counters, "resumed_after_s": round(resumed_after)}
 
     counters = run(go())
     print(f"failover: {counters}")

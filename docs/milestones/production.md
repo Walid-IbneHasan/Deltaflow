@@ -26,10 +26,11 @@ Postgres 16, in four parts:
 
 | Part | Result |
 |---|---|
-| unit | 483 passed, 1 skipped (POSIX file modes) |
+| unit | 494 passed, 1 skipped (POSIX file modes) |
 | integration | 98 passed, 1 skipped (a stalled consumer: Linux only, M6) |
 | chaos (`kill -9`, scale-out) | 10 passed |
 | differential | 6 passed |
+| failover (`make failover`, Postgres 17) | 1 passed |
 
 The other Postgres versions, run locally during the round:
 
@@ -57,6 +58,15 @@ The other Postgres versions, run locally during the round:
   included the sinks already past it, and moving their watermarks back
   was refused. A flush now writes only the sinks behind it. A new test
   reproduces it every time and failed before the change.
+- **After a failover, every new connection waited on the dead primary.**
+  libpq tries the hosts in order, and a start opens three connections,
+  each first waiting `connect_timeout` on the old primary. Every later
+  restart would do the same, for as long as that host stays down. The
+  runner and the cluster worker now move the server that answered to the
+  front of their host lists. In the failover test the runner resumed 45 s
+  after the kill without this, and 21 s with it. The test's own
+  connections had no `connect_timeout` and waited minutes on the dead
+  port; with one, the test takes 36 s instead of 310 s.
 - **Two tests passed only because of earlier tests.** On a new Postgres
   15, two CLI tests cleared tables nothing had created yet. Every
   integration module now passes on its own on a new server.

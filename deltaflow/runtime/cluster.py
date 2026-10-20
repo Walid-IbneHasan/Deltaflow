@@ -54,7 +54,7 @@ from typing import Any
 import psycopg
 from psycopg import sql
 
-from deltaflow.config import with_connect_timeout
+from deltaflow.config import prefer_host, with_connect_timeout
 from deltaflow.observability.metrics import Registry, merge
 from deltaflow.planner import Deltaflow, PlanError
 from deltaflow.planner.merge import merge_view_sql
@@ -245,6 +245,8 @@ class ClusterWorker:
         self._conn = await psycopg.AsyncConnection.connect(
             self._dsn, autocommit=True, application_name=self._app
         )
+        # The lock, the heartbeats and the shards then go to this server first.
+        self._dsn = prefer_host(self._dsn, self._conn.info.host, self._conn.info.port)
         await self._conn.execute(CLUSTER_DDL)
         await self._connect_lock()
         beating = threading.Event()

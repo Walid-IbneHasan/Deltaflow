@@ -36,6 +36,15 @@ skips standbys (`in_hot_standby`). Every connection gets
 otherwise waits for ever on a host that accepts TCP and then says nothing,
 and would never reach the next one.
 
+The server that answers moves to the front of the runner's host list.
+Without that, every connection after a failover, each restart included,
+would first wait `connect_timeout` on the old primary: a start opens
+three. In the failover test the runner resumed 45 s after the primary
+died without this, and 21 s with it. Docker Desktop holds a dead
+container's port open, so each attempt there waits the full timeout.
+Your application's own connections need a `connect_timeout` too, for the
+same reason.
+
 ## What happens at a failover
 
 The runner's connections break and `serve()` restarts it, retrying with

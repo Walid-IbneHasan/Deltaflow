@@ -97,7 +97,7 @@ from typing import Any, Literal
 import psycopg
 from psycopg import sql
 
-from deltaflow.config import with_connect_timeout
+from deltaflow.config import prefer_host, with_connect_timeout
 from deltaflow.core import Frontier
 from deltaflow.faults import crash_point
 from deltaflow.observability.memory import rss
@@ -301,6 +301,11 @@ class DurableRunner:
         self._sql = await psycopg.AsyncConnection.connect(
             self._sink_dsn, autocommit=True, application_name=self._app
         )
+        # The server that answers goes first in the host lists: after a
+        # failover, later connections reach the new primary at once instead
+        # of each waiting connect_timeout on the old one.
+        self._sink_dsn = prefer_host(self._sink_dsn, self._sql.info.host, self._sql.info.port)
+        self._dsn = prefer_host(self._dsn, self._sql.info.host, self._sql.info.port)
         await ensure_watermark_table(self._sql)
         shapes = {}
         for sink in self.sinks:
@@ -308,6 +313,7 @@ class DurableRunner:
         async with await psycopg.AsyncConnection.connect(
             self._dsn, autocommit=True, application_name=self._app
         ) as admin:
+            self._dsn = prefer_host(self._dsn, admin.info.host, admin.info.port)
             if self._manage_publication:
                 registry_sources = self.registry.sources
                 await self._ensure_publication(admin, registry_sources)
