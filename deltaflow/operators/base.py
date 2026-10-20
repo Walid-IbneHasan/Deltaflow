@@ -20,6 +20,9 @@ class Operator(ABC):
     CPU work on data already in memory, and the runtime is what awaits I/O.
     """
 
+    #: names of the state store keyspaces this operator owns (its state)
+    state_keyspaces: tuple[str, ...] = ()
+
     def __init__(self, *inputs: Operator) -> None:
         self.inputs: tuple[Operator, ...] = inputs
 

@@ -179,6 +179,64 @@ one checkpoint per checkpoint interval while idle.
   - repeated and lower positions are not reported;
   - progress is opt-in.
 
+## Changing views without a bootstrap
+
+Adding a view, or changing one, used to change the registry's single
+fingerprint. The next start then bootstrapped *everything*: it dropped the
+slot, took a new snapshot and replaced every sink. Now a checkpoint records
+each view's fingerprint and the keyspaces its operators own, and a resume
+under changed views does this instead:
+
+1. **Unchanged views keep their state**, their sinks and their watermarks.
+2. **Removed views' state is dropped.** So is the copy of any table no
+   view reads any more: the publication stops covering it, so it would go
+   stale while claiming to be current.
+3. **New and changed views are rebuilt from the checkpoint's own source
+   rows.** These are the arrangements of decision 0003, a full copy of
+   every source table as of C. The views' operators are fed those rows
+   (as a snapshot would be), so their state is exactly as of C, with no
+   new snapshot and without touching the source database.
+4. **Only their sinks are replaced**, with watermark C, in one
+   transaction.
+5. **A checkpoint at C records the new views.** It replaces the old
+   checkpoint at C by writing beside it and swapping. A crash between the
+   two renames is completed on the next listing, so one complete checkpoint
+   at C exists at every moment (`test_a_crash_while_swapping_keeps_a_checkpoint`).
+6. **Streaming resumes from the same slot.** The replay of (C, W] is
+   skipped by the kept views' sinks, whose watermarks are at W, and applied
+   by the rebuilt ones, whose watermarks are at C.
+
+**Why it is still exactly-once.** The rebuilt views start from state and
+sinks that are both at C, with the slot acknowledged at or below C. That
+is the bootstrap's starting condition, met without a snapshot. A crash
+anywhere before step 5 completes restarts from the old checkpoint and
+rebuilds again; the rebuild is deterministic.
+
+**When a bootstrap is still needed.** A view that reads a table the
+checkpoint has no copy of cannot be built from it (`Engine.cannot_resume`
+names the table). A change of sharding needs one too.
+
+**Tests.**
+
+- `test_a_new_and_a_changed_view_are_built_from_the_arrangements` (engine,
+  no database): the rebuilt views equal a from-scratch engine, and the kept
+  view emits exactly what it would have.
+- `test_changed_and_added_views_are_built_alone` (runner):
+  - no bootstrap, and the slot is kept;
+  - the unchanged views' sink rows keep their xmin across the restart;
+  - all views equal SQL after further load.
+
+  Rebuilding every view instead makes it fail.
+- `test_editing_a_sql_file_rebuilds_only_what_changed_even_through_a_crash`
+  (the command, as a subprocess):
+  1. version 1 of a SQL file bootstraps;
+  2. version 2 builds exactly its two changed views and crashes in the
+     middle of the checkpoint swap (`DELTAFLOW_CRASH_AT=checkpoint:swap:1`);
+  3. the next start resumes, with every view equal to SQL.
+
+**A changed view with different columns** needs its sink table changed
+too: drop it (a SQL file's sink is then created afresh), or alter it.
+
 ## Restarting in-process
 
 A crash and a restart are exactly-once by the argument above, so a runner

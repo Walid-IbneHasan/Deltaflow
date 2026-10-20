@@ -163,6 +163,7 @@ class GroupBy(Operator):
         self.aggregates = aggregates
         self._groups = store.keyspace(f"agg:{name}:groups")
         self._values = store.keyspace(f"agg:{name}:values")
+        self.state_keyspaces = (f"agg:{name}:groups", f"agg:{name}:values")
         self._latest = Lsn(0)
 
     def initial(self) -> list[Delta[Row]]:
@@ -368,6 +369,7 @@ class Distinct(Operator):
         super().__init__(input)
         self.name = name
         self._counts: Keyspace = store.keyspace(f"distinct:{name}")
+        self.state_keyspaces = (f"distinct:{name}",)
         self._latest = Lsn(0)
 
     def process(self, port: int, batch: Sequence[Delta[Row]]) -> list[Delta[Row]]:

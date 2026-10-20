@@ -75,3 +75,45 @@ def test_checkpoints_must_move_forward(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="behind"):
         sd.checkpoint(store, Lsn(5), {})
     store.close()
+
+
+def test_a_checkpoint_at_the_same_lsn_replaces_the_old_one_safely(tmp_path: Path) -> None:
+    """A second checkpoint at the same LSN (a resume that rebuilt views
+    has new state at the checkpoint's own position) is written beside the
+    old one and swapped in: at every moment one complete checkpoint at that
+    LSN exists. Deleting the old one first would leave, after a crash, only
+    an older checkpoint, behind what the slot was acknowledged up to."""
+    sd = StateDirectory(tmp_path)
+    store = sd.open_live(memory_budget=8 * MB)
+    store.keyspace("k").put(b"x", b"old")
+    sd.checkpoint(store, Lsn(50), {"views": "old"})
+    store.keyspace("k").put(b"x", b"new")
+    sd.checkpoint(store, Lsn(50), {"views": "new"})
+    store.close()
+    latest = sd.latest()
+    assert latest is not None
+    assert (latest.lsn, latest.meta) == (Lsn(50), {"views": "new"})
+    assert sorted(p.name for p in (sd.root / "checkpoints").iterdir()) == [f"{50:016X}"]
+
+
+@pytest.mark.parametrize("crash", ["before_swap", "between_renames"])
+def test_a_crash_while_swapping_keeps_a_checkpoint(tmp_path: Path, crash: str) -> None:
+    sd = StateDirectory(tmp_path)
+    store = sd.open_live(memory_budget=8 * MB)
+    store.keyspace("k").put(b"x", b"old")
+    sd.checkpoint(store, Lsn(50), {"views": "old"})
+    store.keyspace("k").put(b"x", b"new")
+    final = sd.root / "checkpoints" / f"{50:016X}"
+    nxt = final.with_name(final.name + ".next")
+    # what the swap leaves behind: the new one complete beside the old one,
+    # or the old one already moved aside
+    store.checkpoint_to(nxt)
+    (nxt / "deltaflow-meta.json").write_text('{"views": "new"}', encoding="utf-8")
+    (nxt / "COMPLETE").write_text("50", encoding="utf-8")
+    if crash == "between_renames":
+        final.rename(final.with_name(final.name + ".old"))
+    store.close()
+    latest = sd.latest()
+    assert latest is not None
+    assert (latest.lsn, latest.meta) == (Lsn(50), {"views": "new"})
+    assert sorted(p.name for p in (sd.root / "checkpoints").iterdir()) == [f"{50:016X}"]

@@ -36,6 +36,8 @@ from deltaflow.state.store import StateStore
 
 _META = "deltaflow-meta.json"
 _COMPLETE = "COMPLETE"
+#: a checkpoint replacing one at the same LSN, before and after the swap
+_NEXT, _OLD = ".next", ".old"
 _IMMUTABLE = (".sst", ".blob")
 
 
@@ -60,6 +62,7 @@ class StateDirectory:
 
     def checkpoints(self) -> list[CheckpointInfo]:
         """Complete checkpoints, oldest first. Incomplete ones are deleted."""
+        self._finish_swaps()
         found = []
         for path in sorted(self._checkpoints.iterdir()):
             if not (path / _COMPLETE).exists():
@@ -94,16 +97,47 @@ class StateDirectory:
         if latest is not None and lsn < latest.lsn:
             raise ValueError(f"checkpoint at {lsn} is behind the latest one at {latest.lsn}")
         path = self._checkpoints / f"{int(lsn):016X}"
-        if path.exists():  # same LSN again (nothing happened since): replace it
-            shutil.rmtree(path)
-        store.checkpoint_to(path)
-        (path / _META).write_text(json.dumps(meta), encoding="utf-8")
+        # The same LSN again (new metadata, e.g. rebuilt views, at the same
+        # position): written beside the old one and swapped in, so that one
+        # complete checkpoint at this LSN exists at every moment. Deleting
+        # the old one first would leave, after a crash, only an older one:
+        # behind what the slot was acknowledged up to.
+        target = path.with_name(path.name + _NEXT) if path.exists() else path
+        shutil.rmtree(target, ignore_errors=True)
+        store.checkpoint_to(target)
+        (target / _META).write_text(json.dumps(meta), encoding="utf-8")
         crash_point("checkpoint:before_complete")
-        _write_durably(path / _COMPLETE, str(lsn))
+        _write_durably(target / _COMPLETE, str(lsn))
+        if target != path:
+            self._swap(path, target)
         info = CheckpointInfo(lsn, path, meta)
         for old in self.checkpoints()[: -self.keep]:
             shutil.rmtree(old.path, ignore_errors=True)
         return info
+
+    def _swap(self, final: Path, nxt: Path) -> None:
+        old = final.with_name(final.name + _OLD)
+        shutil.rmtree(old, ignore_errors=True)
+        final.rename(old)
+        crash_point("checkpoint:swap")
+        nxt.rename(final)
+        shutil.rmtree(old, ignore_errors=True)
+
+    def _finish_swaps(self) -> None:
+        """Complete a swap a crash interrupted: a complete `.next` is the
+        newer checkpoint at its LSN, whether or not the old one was moved
+        aside yet; an incomplete one never counted."""
+        for nxt in sorted(self._checkpoints.glob(f"*{_NEXT}")):
+            final = nxt.with_name(nxt.name.removesuffix(_NEXT))
+            if not (nxt / _COMPLETE).exists():
+                shutil.rmtree(nxt, ignore_errors=True)
+                continue
+            if final.exists():
+                self._swap(final, nxt)
+            else:
+                nxt.rename(final)
+        for old in self._checkpoints.glob(f"*{_OLD}"):
+            shutil.rmtree(old, ignore_errors=True)
 
     def reset(self) -> None:
         shutil.rmtree(self._checkpoints, ignore_errors=True)

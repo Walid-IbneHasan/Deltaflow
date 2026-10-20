@@ -32,7 +32,17 @@ at or after P, so the frontier still admits it.
 
 If there is no usable checkpoint, the runner bootstraps instead and says
 so in the log and in `counters["bootstraps"]`. Reasons: first start, a
-missing slot, changed views, missing watermarks. Bootstrapping means: drop
+missing slot, a view over a table the checkpoint has no copy of, missing
+watermarks.
+
+**Changed views.** Views added or changed since the checkpoint do not
+need a bootstrap: the engine builds them from the checkpoint's source
+rows, as of its position (engine.py, per-view state). The runner then
+replaces only their sinks' contents, with watermark C, and checkpoints
+again at C. That checkpoint replaces the old one at C atomically (state/
+durable.py), and the slot, the other views' state and their sinks are
+untouched. A crash anywhere in between restarts from the old checkpoint
+and rebuilds again, which is deterministic. Bootstrapping means: drop
 the slot, create it again with an exported snapshot, load the snapshot,
 *replace* each sink table's contents in one transaction, and checkpoint.
 """
@@ -53,6 +63,7 @@ from types import TracebackType
 from typing import Any
 
 import psycopg
+from psycopg import sql
 
 from deltaflow.core import Frontier
 from deltaflow.faults import crash_point
@@ -69,7 +80,7 @@ from deltaflow.replication.wire import (
     TlsUnavailableError,
     WireProtocolError,
 )
-from deltaflow.runtime.engine import Engine, fingerprint
+from deltaflow.runtime.engine import Engine
 from deltaflow.runtime.runner import DEFAULT_MEMORY_BUDGET
 from deltaflow.runtime.snapshot import load_snapshot
 from deltaflow.sinks.postgres import (
@@ -147,6 +158,7 @@ class DurableRunner:
         self.sinks = [v.sink for v in registry.views if isinstance(v.sink, PostgresSink)]
         suffix = "" if shard is None else f"@{shard}"
         self._views = {id(v.sink): f"{v.name}{suffix}" for v in registry.views}
+        self._view_names = {id(v.sink): v.name for v in registry.views}
         self.shard = shard
         self._fence = fence
         #: every connection is tagged with it, so a cluster can find (and
@@ -247,28 +259,44 @@ class DurableRunner:
         return columns[1:], key[1:]
 
     async def _ensure_publication(self, admin: Conn, tables: tuple[str, ...]) -> None:
+        """The publication covers exactly the views' tables. An existing one
+        is altered, never dropped and recreated: a slot with WAL still to
+        replay decodes it against the publication as it was at each
+        position, and a recreated publication did not exist back then."""
         async with admin.cursor() as cur:
+            await cur.execute(
+                "SELECT 1 FROM pg_publication WHERE pubname = %s", (self.publication,)
+            )
+            exists = await cur.fetchone() is not None
             await cur.execute(
                 "SELECT schemaname || '.' || tablename FROM pg_publication_tables"
                 " WHERE pubname = %s",
                 (self.publication,),
             )
             current = {str(r[0]) for r in await cur.fetchall()}
-        if current != set(tables):
-            # Re-creating a publication is safe for a slot that is not
-            # streaming; a changed set of tables also changes the views, which
-            # forces a bootstrap anyway.
+        if not exists:
             await create_publication(admin, self.publication, tables)
+            return
+        for table, verb in (*((t, "ADD") for t in sorted(set(tables) - current)),
+                            *((t, "DROP") for t in sorted(current - set(tables)))):  # fmt: skip
+            await admin.execute(
+                sql.SQL("ALTER PUBLICATION {} " + verb + " TABLE {}").format(
+                    sql.Identifier(self.publication), sql.Identifier(*table.split(".", 1))
+                )
+            )
 
     async def _why_not_resume(self, checkpoint: Any, have_slot: bool) -> str | None:
         if checkpoint is None:
             return "no state checkpoint"
         if not have_slot:
             return f"replication slot {self.slot} is missing"
-        if checkpoint.meta.get("fingerprint") != fingerprint(self.registry):
-            return "the views changed since the checkpoint"
+        if (reason := Engine.cannot_resume(self.registry, checkpoint.meta)) is not None:
+            return reason
         assert self._sql is not None
+        rebuild = self._to_rebuild(checkpoint.meta)
         for sink in self.sinks:
+            if self._view_names[id(sink)] in rebuild:
+                continue  # replaced on resume
             watermark = await load_watermark(self._sql, self._views[id(sink)])
             if watermark is None:
                 return f"no watermark for view {self._views[id(sink)]}"
@@ -280,23 +308,41 @@ class DurableRunner:
                 )
         return None
 
+    def _to_rebuild(self, meta: dict[str, Any]) -> set[str]:
+        if "views" not in meta:
+            return set()
+        return {v.name for v in Engine.views_to_rebuild(self.registry, meta)}
+
     async def _resume(self, checkpoint: Any, shapes: dict[str, Any]) -> Lsn:
         assert self._sql is not None
         self.store = self.state.open_live(memory_budget=self._memory_budget, restore=checkpoint)
+        rebuild = self._to_rebuild(checkpoint.meta)
         for sink in self.sinks:
             columns, key = shapes[sink.table]
             view = self._views[id(sink)]
+            fresh = self._view_names[id(sink)] in rebuild
             sink.bind(
                 view=view,
                 columns=columns,
                 key=key,
-                watermark=await load_watermark(self._sql, view),
+                watermark=None if fresh else await load_watermark(self._sql, view),
                 shard=self.shard,
                 write_table=self._write_table(sink),
             )
         self.engine = Engine(self.registry, self.store, resume=checkpoint.meta, shard=self.shard)
+        at = Lsn(checkpoint.lsn)
+        if self.engine.rebuilt:
+            rebuilt = [s for s in self.sinks if self._view_names[id(s)] in self.engine.rebuilt]
+            await flush(self._sql, rebuilt, at, replace=True, fence=self._fence)
+            self.counters["views_rebuilt"] += len(rebuilt)
+            log.info(
+                "built views %s from the checkpoint's source rows at %s; dropped %s",
+                list(self.engine.rebuilt), at, list(self.engine.dropped),
+            )  # fmt: skip
         self.flushed_lsn = min(s.watermark for s in self.sinks if s.watermark is not None)
         self.checkpointed_lsn = checkpoint.lsn
+        if self.engine.rebuilt or self.engine.dropped:
+            await self._checkpoint()  # the new views' state, at the same position
         self.counters["resumes"] += 1
         log.info(
             "resumed from checkpoint at %s; sink watermarks %s",
@@ -478,6 +524,7 @@ class DurableRunner:
             "flushes",
             "idle_advances",
             "restarts",
+            "views_rebuilt",
         ):
             m.events.labels(event=name).value = self.counters[name]
         return m.registry

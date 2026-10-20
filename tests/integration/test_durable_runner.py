@@ -15,7 +15,7 @@ import pytest
 from deltaflow.aio import run
 from deltaflow.devtools.loadgen import load_state, run_load
 from deltaflow.devtools.seed import seed_database
-from deltaflow.devtools.worker import SINK_DDL, views
+from deltaflow.devtools.worker import SINK_DDL, VIEW_SQL, views
 from deltaflow.devtools.workload import Workload
 from deltaflow.planner import Count, Deltaflow, Max, PlanError, Sum
 from deltaflow.replication.lsn import Lsn
@@ -24,6 +24,7 @@ from deltaflow.replication.wire import ReplicationConnection
 from deltaflow.runtime import DurableRunner
 from deltaflow.sinks import MemorySink, PostgresSink
 from deltaflow.sinks.postgres import ensure_watermark_table
+from tests.sql_oracle import first_difference, query_multiset
 from tests.worker_harness import Sql, emit_marker, sink_differences, wait_caught_up
 
 
@@ -37,8 +38,16 @@ async def fresh(dsn: str) -> None:
 
 
 async def drop(dsn: str, slot: str) -> None:
+    """Drop the slot, first terminating a session still streaming from it:
+    a test that failed with a runner open then fails, instead of waiting
+    here for the slot forever."""
     async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as sql:
         exists = await slot_exists(sql, slot)
+        await sql.execute(
+            "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots"
+            " WHERE slot_name = %s AND active_pid IS NOT NULL",
+            (slot,),
+        )
     if exists:
         repl = await ReplicationConnection.connect(dsn)
         try:
@@ -115,11 +124,18 @@ def test_bootstrap_then_resume_after_a_clean_stop(dsn: str, tmp_path: Path) -> N
     run(go())
 
 
-def test_changed_views_or_a_missing_slot_force_a_bootstrap(dsn: str, tmp_path: Path) -> None:
+def test_a_missing_slot_or_an_uncopied_table_forces_a_bootstrap(dsn: str, tmp_path: Path) -> None:
+    """A changed view is rebuilt from the checkpoint's source rows; only a
+    view over a table the checkpoint has no copy of needs a bootstrap."""
     slot = f"it_durable_{uuid.uuid4().hex[:8]}"
 
     async def go() -> None:
         await fresh(dsn)
+        async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as sql:
+            await sql.execute("DROP TABLE IF EXISTS public.it_extra")
+            await sql.execute("CREATE TABLE public.it_extra (id int PRIMARY KEY, v int)")
+            await sql.execute("INSERT INTO public.it_extra VALUES (1, 10), (2, 20)")
+            await sql.execute("CREATE TABLE analytics.it_extra (id int PRIMARY KEY, v int)")
         try:
             first = DurableRunner(
                 views(), dsn, state_dir=tmp_path, slot=slot, publication="it_durable"
@@ -134,18 +150,41 @@ def test_changed_views_or_a_missing_slot_force_a_bootstrap(dsn: str, tmp_path: P
             assert second.counters["bootstraps"] == 1
             await second.close()
 
-            changed = Deltaflow()
-            changed.view("order_totals").source("public.orders").agg(
-                orders=Count(), revenue=Sum("amount"), smallest=Max("amount"), largest=Max("amount")
-            ).sink(PostgresSink("analytics.order_totals"))
+            def changed(*, extra: bool) -> Deltaflow:
+                df = Deltaflow()
+                df.view("order_totals").source("public.orders").agg(
+                    orders=Count(), revenue=Sum("amount"), smallest=Max("amount"),
+                    largest=Max("amount"),
+                ).sink(PostgresSink("analytics.order_totals"))  # fmt: skip
+                if extra:
+                    df.view("extra").source("public.it_extra").sink(
+                        PostgresSink("analytics.it_extra")
+                    )
+                return df
+
             third = DurableRunner(
-                changed, dsn, state_dir=tmp_path, slot=slot, publication="it_durable"
+                changed(extra=False), dsn, state_dir=tmp_path, slot=slot, publication="it_durable"
             )
             await third.start()
-            assert third.counters["bootstraps"] == 1
+            assert third.counters == {"resumes": 1, "views_rebuilt": 1, "checkpoints": 1}
             await third.close()
+
+            fourth = DurableRunner(
+                changed(extra=True), dsn, state_dir=tmp_path, slot=slot, publication="it_durable"
+            )
+            await fourth.start()
+            assert fourth.counters["bootstraps"] == 1
+            await fourth.close()
+            async with (
+                await psycopg.AsyncConnection.connect(dsn, autocommit=True) as sql,
+                sql.cursor() as cur,
+            ):
+                await cur.execute("SELECT id, v FROM analytics.it_extra ORDER BY id")
+                assert await cur.fetchall() == [(1, 10), (2, 20)]
         finally:
             await drop(dsn, slot)
+            async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as sql:
+                await sql.execute("DROP TABLE IF EXISTS public.it_extra")
 
     run(go())
 
@@ -322,3 +361,121 @@ def test_serve_rides_out_dropped_connections_exactly_once(dsn: str, tmp_path: Pa
     assert counters["restarts"] >= 2, counters
     assert counters["resumes"] >= 2, counters
     assert differences == []
+
+
+def registry_v2() -> Deltaflow:
+    """The demo views with order_totals changed (cancelled orders left out)
+    and a new view, written in SQL. The other three are defined exactly as
+    in deltaflow.devtools.worker, so their fingerprints are unchanged."""
+    from deltaflow.devtools.worker import country_totals, not_cancelled, order_details  # noqa: PLC0415
+    from deltaflow.planner import Min  # noqa: PLC0415
+
+    df = Deltaflow()
+    (
+        df.view("orders_per_customer")
+        .source("public.orders")
+        .join("public.customers", on=("customer_id", "id"))
+        .filter(not_cancelled)
+        .group_by("customers.country")
+        .agg(orders=Count(), revenue=Sum("orders.amount"))
+        .map(country_totals)
+        .sink(PostgresSink("analytics.orders_per_customer"))
+    )
+    (
+        df.view("order_details")
+        .source("public.orders")
+        .join("public.customers", on=("customer_id", "id"))
+        .map(order_details)
+        .sink(PostgresSink("analytics.order_details"))
+    )
+    (
+        df.view("order_totals")
+        .source("public.orders")
+        .filter(not_cancelled)
+        .agg(orders=Count(), revenue=Sum("amount"), smallest=Min("amount"), largest=Max("amount"))
+        .sink(PostgresSink("analytics.order_totals"))
+    )
+    (
+        df.view("customer_statuses")
+        .source("public.orders")
+        .select("customer_id", "status")
+        .distinct()
+        .sink(PostgresSink("analytics.customer_statuses"))
+    )
+    df.sql(
+        "SELECT id AS order_id, amount FROM orders WHERE status = 'paid'",
+        name="paid_orders", sink=PostgresSink("analytics.paid_orders"),
+    )  # fmt: skip
+    return df
+
+
+V2_SQL = {
+    **{t: q for t, q in VIEW_SQL.items() if t != "analytics.order_totals"},
+    "analytics.order_totals": (
+        "SELECT count(*) AS orders, sum(amount) AS revenue, min(amount) AS smallest,"
+        " max(amount) AS largest FROM orders WHERE status <> 'cancelled'"
+    ),
+    "analytics.paid_orders": "SELECT id AS order_id, amount FROM orders WHERE status = 'paid'",
+}
+
+
+def test_changed_and_added_views_are_built_alone(dsn: str, tmp_path: Path) -> None:
+    """After a change of views, only the changed and the new ones are built:
+    from the checkpoint's own copy of the source rows, at its position. No
+    bootstrap, the slot is kept, and the other views' sink rows are not
+    rewritten (their xmin is unchanged across the restart)."""
+    slot = f"it_durable_{uuid.uuid4().hex[:8]}"
+
+    async def xmins(sql: Sql, table: str, key: str) -> set[str]:
+        async with sql.cursor() as cur:
+            await cur.execute(f"SELECT {key}::text || ':' || xmin::text FROM {table}")
+            return {str(r[0]) for r in await cur.fetchall()}
+
+    async def go() -> dict[str, Any]:
+        await fresh(dsn)
+        async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as sql:
+            await sql.execute(
+                "CREATE TABLE analytics.paid_orders"
+                " (order_id bigint PRIMARY KEY, amount numeric NOT NULL)"
+            )
+            try:
+                first = DurableRunner(
+                    views(), dsn, state_dir=tmp_path, slot=slot, publication="it_durable",
+                    flush_interval=0.05, checkpoint_interval=0.2,
+                )  # fmt: skip
+                await first.start()
+                await load_and_sync(dsn, first, sql, seed=6, txns=120)
+                await first.close()
+                details_before = await xmins(sql, "analytics.order_details", "order_id")
+                totals_before = await xmins(sql, "analytics.order_totals", "orders")
+
+                second = DurableRunner(
+                    registry_v2(), dsn, state_dir=tmp_path, slot=slot, publication="it_durable",
+                    flush_interval=0.05, checkpoint_interval=0.2,
+                )  # fmt: skip
+                await second.start()
+                counters = dict(second.counters)
+                untouched = (
+                    await xmins(sql, "analytics.order_details", "order_id") == details_before
+                )
+                rewritten = await xmins(sql, "analytics.order_totals", "orders") != totals_before
+                await load_and_sync(dsn, second, sql, seed=7, txns=120)
+                differences = {}
+                for table, query in V2_SQL.items():
+                    actual = await query_multiset(sql, f"SELECT * FROM {table}")
+                    expected = await query_multiset(sql, query)
+                    if actual != expected:
+                        differences[table] = first_difference(actual, expected)
+                await second.close()
+            finally:
+                await drop(dsn, slot)
+        return {"counters": counters, "untouched": untouched, "rewritten": rewritten,
+                "differences": differences}  # fmt: skip
+
+    outcome = run(go())
+    assert outcome["counters"].get("bootstraps", 0) == 0, outcome
+    assert outcome["counters"]["resumes"] == 1
+    assert outcome["counters"]["views_rebuilt"] == 2  # order_totals and paid_orders
+    assert outcome["untouched"], "an unchanged view's sink was rewritten"
+    assert outcome["rewritten"], "the changed view's sink kept its old rows"
+    assert outcome["differences"] == {}

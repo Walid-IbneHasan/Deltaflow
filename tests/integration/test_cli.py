@@ -35,12 +35,12 @@ def deltaflow(*args: str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
     )  # fmt: skip
 
 
-def spawn(log: Path, *args: str) -> subprocess.Popen[bytes]:
+def spawn(log: Path, *args: str, env: dict[str, str] | None = None) -> subprocess.Popen[bytes]:
     with log.open("ab") as out:
         return subprocess.Popen(
             [sys.executable, "-m", "deltaflow", *args],
             stdout=out, stderr=subprocess.STDOUT, cwd=ROOT,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            env={**os.environ, "PYTHONUNBUFFERED": "1", **(env or {})},
         )  # fmt: skip
 
 
@@ -383,3 +383,71 @@ def test_a_cluster_runs_a_sql_file(dsn: str, tmp_path: Path) -> None:
                 " WHERE slot_name LIKE %s AND NOT active",
                 (f"{prefix}%",),
             )
+
+
+def test_editing_a_sql_file_rebuilds_only_what_changed_even_through_a_crash(
+    dsn: str, tmp_path: Path
+) -> None:
+    """Change one view of a running SQL file and add another: the restart
+    builds just those two from the checkpoint's source rows, with no
+    bootstrap. A crash in the middle of saving the rebuilt state (between
+    the two renames that swap the checkpoint) loses nothing: the next start
+    resumes."""
+    prepare(dsn)
+    with psycopg.connect(dsn, autocommit=True) as sql:
+        sql.execute("DROP SCHEMA IF EXISTS cli_sqlv CASCADE")
+        sql.execute(
+            "DELETE FROM _deltaflow.watermarks WHERE view = ANY (%s)",
+            (["by_status", "big", "per_customer"],),
+        )
+    v1 = {
+        "cli_sqlv.by_status": "SELECT status, count(*) AS n FROM orders GROUP BY status",
+        "cli_sqlv.big": "SELECT o.id, o.amount FROM orders o WHERE o.amount > 1000",
+    }
+    v2 = {
+        "cli_sqlv.by_status": (
+            "SELECT status, count(*) AS n FROM orders WHERE amount > 10 GROUP BY status"
+        ),
+        "cli_sqlv.big": v1["cli_sqlv.big"],
+        "cli_sqlv.per_customer": (
+            "SELECT customer_id, count(*) AS n FROM orders GROUP BY customer_id"
+        ),
+    }
+    slot = f"it_cli_{uuid.uuid4().hex[:8]}"
+    common = (
+        "--dsn", dsn, "--slot", slot, "--publication", "it_cli_sqlv",
+        "--state-dir", str(tmp_path / "state"), "--http-port", "-1",
+        "--flush-interval", "0.05", "--checkpoint-interval", "0.3", "--log-format", "text",
+    )  # fmt: skip
+    path = tmp_path / "views.sql"
+
+    def run_until_caught_up(log: Path, views: dict[str, str]) -> str:
+        proc = spawn(log, "run", str(path), *common)
+        try:
+            how = wait_for(log, r"worker pid=\d+ (\w+);", proc)
+            marker = run(load_then_marker(dsn))
+            deadline = time.monotonic() + 60
+            for table in views:
+                name = table.split(".")[1]
+                while (w := watermark(dsn, name)) is None or w <= marker:
+                    assert time.monotonic() < deadline, f"{name} never caught up"
+                    time.sleep(0.1)
+            for table, query in views.items():
+                assert rows(dsn, f"SELECT * FROM {table}") == rows(dsn, query), table
+            return how
+        finally:
+            proc.terminate()
+            proc.wait(timeout=30)
+            wait_inactive(dsn, slot)
+
+    sql_file(path, v1)
+    assert run_until_caught_up(tmp_path / "1.log", v1) == "bootstrapped"
+    sql_file(path, v2)
+    crashed = spawn(tmp_path / "2.log", "run", str(path), *common,
+                    env={"DELTAFLOW_CRASH_AT": "checkpoint:swap:1"})  # fmt: skip
+    assert crashed.wait(timeout=90) == 86, (tmp_path / "2.log").read_text(encoding="utf-8")
+    text = (tmp_path / "2.log").read_text(encoding="utf-8")
+    assert "built views ['by_status', 'per_customer']" in text
+    wait_inactive(dsn, slot)
+    assert run_until_caught_up(tmp_path / "3.log", v2) == "resumed"
+    deltaflow("reset", "--dsn", dsn, "--slot", slot, "--state-dir", str(tmp_path / "state"))

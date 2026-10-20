@@ -89,6 +89,8 @@ class Join(Operator):
         self._left_outer = left_outer
         self._right_columns = right_columns or (lambda: ())
         self._counts = store.keyspace(f"join:{name}:right_count") if left_outer else None
+        counts = (f"join:{name}:right_count",) if left_outer else ()
+        self.state_keyspaces = (f"join:{name}:left", f"join:{name}:right", *counts)
 
     def process(self, port: int, batch: Sequence[Delta[Row]]) -> list[Delta[Row]]:
         own, other = self._index[port], self._index[1 - port]
