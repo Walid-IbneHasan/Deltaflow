@@ -1,0 +1,101 @@
+# promtool test rules deltaflow-alerts.test.yml (make alerts)
+rule_files:
+  - deltaflow-alerts.yml
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'up{job="deltaflow", instance="w1"}'
+        values: "0x5"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: DeltaflowDown
+        exp_alerts:
+          - exp_labels: { severity: critical, job: deltaflow, instance: w1 }
+            exp_annotations:
+              summary: "Deltaflow worker w1 is down"
+              description: >-
+                Its views are not maintained, and its slot keeps WAL on the source until it
+                is back. It resumes from its checkpoint when restarted.
+
+  - interval: 1m
+    input_series:
+      - series: 'deltaflow_slot_lag_bytes{instance="w1"}'
+        values: "2e9x30"
+      - series: 'deltaflow_slot_lag_bytes{instance="w2"}'
+        values: "1e6x30"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: DeltaflowSlotRetainsWal
+        exp_alerts:
+          - exp_labels: { severity: warning, instance: w1 }
+            exp_annotations:
+              summary: "The source keeps 1.863GiB of WAL for w1's slot"
+              description: >-
+                WAL the slot has not acknowledged stays on the source's disk. It is
+                acknowledged at each checkpoint: a worker that is down, stalled, or far
+                behind lets it grow until the disk fills.
+      - eval_time: 20m
+        alertname: DeltaflowSlotRetainsWalCritical
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      # p99 at 10 s: every observation in the (5, 10] bucket
+      - series: 'deltaflow_end_to_end_lag_seconds_bucket{instance="w1", le="5.0"}'
+        values: "0x30"
+      - series: 'deltaflow_end_to_end_lag_seconds_bucket{instance="w1", le="10.0"}'
+        values: "0+100x30"
+      - series: 'deltaflow_end_to_end_lag_seconds_bucket{instance="w1", le="+Inf"}'
+        values: "0+100x30"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: DeltaflowViewsStale
+        exp_alerts:
+          - exp_labels: { severity: warning, instance: w1 }
+            exp_annotations:
+              summary: "Views on w1 lag their source by 9.95s (p99)"
+              description: >-
+                Source commit to sink commit. Check deltaflow_apply_lag_bytes (the engine
+                behind the stream) and deltaflow_sink_flush_seconds (a slow sink database).
+
+  - interval: 1m
+    input_series:
+      - series: 'deltaflow_runner_events_total{instance="w1", event="restarts"}'
+        values: "0+1x20"
+      - series: 'deltaflow_runner_events_total{instance="w2", event="restarts"}'
+        values: "0x20"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: DeltaflowRestartLoop
+        exp_alerts:
+          - exp_labels: { severity: warning, instance: w1, event: restarts }
+            exp_annotations:
+              summary: "w1 restarted its pipeline 15 times in 15 minutes"
+              description: >-
+                Each restart resumes exactly-once, but the cause recurs: see the log's
+                "pipeline interrupted" lines (connections, the server restarting, a slot
+                still held).
+
+  - interval: 1m
+    input_series:
+      - series: 'up{job="deltaflow", instance="w1"}'
+        values: "1x60"
+      - series: 'deltaflow_runner_events_total{instance="w1", event="checkpoints"}'
+        values: "5x60"
+      - series: 'up{job="deltaflow", instance="w2"}'
+        values: "1x60"
+      - series: 'deltaflow_runner_events_total{instance="w2", event="checkpoints"}'
+        values: "0+1x60"
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: DeltaflowNotCheckpointing
+        exp_alerts:
+          - exp_labels: { severity: warning, instance: w1, event: checkpoints }
+            exp_annotations:
+              summary: "w1 has not checkpointed for 30 minutes"
+              description: >-
+                Without checkpoints the slot is not acknowledged (WAL accumulates) and a
+                restart replays everything since the last one. A single transaction applied
+                in part blocks checkpoints until it ends.

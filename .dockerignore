@@ -1,0 +1,17 @@
+.git
+.github
+.venv
+.deltaflow
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.hypothesis
+**/__pycache__
+dist
+build
+console
+benchmarks
+tests
+deploy
+docker
+docs

@@ -73,6 +73,9 @@ from deltaflow.state.store import StateStore
 
 #: Timestamp of the initial snapshot: before every streamed transaction.
 SNAPSHOT_TIME = Lsn(0)
+#: The format of the state and its checkpoint metadata. A version that
+#: cannot read another's checkpoints bootstraps instead (`cannot_resume`).
+STATE_VERSION = 1
 
 
 class Engine:
@@ -164,7 +167,7 @@ class Engine:
         loading = {"loading": self._load_meta()} if self._loading else {}
         return {
             **loading,
-            "version": 1,
+            "version": STATE_VERSION,
             "lsn": int(self.frontier.lower),
             "fingerprint": self._fingerprint,
             "shard": self.shard,
@@ -193,6 +196,10 @@ class Engine:
     def cannot_resume(registry: Deltaflow, meta: Mapping[str, Any]) -> str | None:
         """Why a checkpoint taken under `meta` cannot be resumed with
         `registry` (None if it can, rebuilding changed views if need be)."""
+        if (version := meta.get("version")) != STATE_VERSION:
+            return (
+                f"the checkpoint's state format is version {version}; this one is {STATE_VERSION}"
+            )
         if meta.get("fingerprint") == fingerprint(registry):
             return None
         if "loading" in meta:
@@ -201,6 +208,12 @@ class Engine:
             return "the views changed since the checkpoint, which predates per-view state"
         if meta.get("sharding") != _sharding(registry):
             return "the sharding changed since the checkpoint"
+        return Engine._unbuildable(registry, meta)
+
+    @staticmethod
+    def _unbuildable(registry: Deltaflow, meta: Mapping[str, Any]) -> str | None:
+        """A changed or new view that reads a table the checkpoint has no
+        copy of, so that it cannot be built from the checkpoint."""
         arranged = set(meta["arrangements"])
         for view in Engine.views_to_rebuild(registry, meta):
             for table in view.sources:

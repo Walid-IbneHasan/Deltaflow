@@ -1,0 +1,15 @@
+Deltaflow ({{ .Values.mode }} mode) is starting.
+
+  kubectl logs -f statefulset/{{ include "deltaflow.fullname" . }}
+
+Its first start bootstraps: it loads the views' tables in chunks (VACUUM
+keeps working meanwhile) and then writes each view's table. The pod is
+ready once its views are live:
+
+  kubectl port-forward svc/{{ include "deltaflow.fullname" . }} {{ .Values.metrics.port }}
+  curl localhost:{{ .Values.metrics.port }}/readyz      # live, or why not yet
+  curl localhost:{{ .Values.metrics.port }}/api/stats   # positions, lag, load progress
+  curl localhost:{{ .Values.metrics.port }}/metrics     # Prometheus
+
+Applications can wait for their writes to reach the views:
+  SELECT _deltaflow.wait_for(pg_current_wal_lsn());

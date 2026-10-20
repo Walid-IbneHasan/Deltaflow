@@ -21,6 +21,7 @@ from deltaflow.devtools.loadgen import load_state, run_load
 from deltaflow.devtools.seed import seed_database
 from deltaflow.devtools.workload import Workload
 from deltaflow.replication.lsn import Lsn
+from deltaflow.runtime.cluster import CLUSTER_DDL
 from deltaflow.sinks.postgres import ensure_watermark_table
 from tests.integration import cli_views
 from tests.worker_harness import emit_marker
@@ -63,10 +64,10 @@ def get(url: str) -> str:
 
 def prepare(dsn: str) -> None:
     run(seed_database(dsn, seed=7, customers=30, orders=150))
+    run(_ensure_watermarks(dsn))
     with psycopg.connect(dsn, autocommit=True) as sql:
         sql.execute(cli_views.DDL)
         sql.execute("DELETE FROM _deltaflow.watermarks WHERE view LIKE 'orders_%%'")
-    run(_ensure_watermarks(dsn))
 
 
 async def _ensure_watermarks(dsn: str) -> None:
@@ -128,6 +129,7 @@ def test_run_status_and_reset_a_users_own_views(dsn: str, tmp_path: Path) -> Non
         assert applied is not None
         assert int(applied.group(1)) > 0  # rollbacks and unpublished tables never arrive
         assert json.loads(get(f"{url}/api/stats"))["slot"] == slot
+        assert get(f"{url}/readyz").startswith("live")  # what a readiness probe asks
 
         status = deltaflow("status", "--dsn", dsn, "--json")
         assert status.returncode == 0, status.stderr
@@ -177,6 +179,7 @@ def test_a_cluster_worker_serves_every_shards_metrics(dsn: str, tmp_path: Path) 
     prepare(dsn)
     prefix = f"it_clic_{uuid.uuid4().hex[:6]}"
     with psycopg.connect(dsn, autocommit=True) as sql:
+        sql.execute(CLUSTER_DDL)  # a fresh server has no cluster tables yet
         sql.execute("DELETE FROM _deltaflow.shard_leases")
         sql.execute("DELETE FROM _deltaflow.workers")
     log = tmp_path / "cluster.log"
@@ -345,6 +348,7 @@ def test_a_cluster_runs_a_sql_file(dsn: str, tmp_path: Path) -> None:
         sql.execute("DROP SCHEMA IF EXISTS cli_sqlc CASCADE")
         # a previous run's watermarks would make the wait below end at once
         sql.execute("DELETE FROM _deltaflow.watermarks WHERE view LIKE 'per\\_customer@%%'")
+        sql.execute(CLUSTER_DDL)
         sql.execute("DELETE FROM _deltaflow.shard_leases")
         sql.execute("DELETE FROM _deltaflow.workers")
     query = (

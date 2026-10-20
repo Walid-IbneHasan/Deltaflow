@@ -1,0 +1,13 @@
+{{- if .Values.metrics.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "deltaflow.fullname" . }}
+  labels:
+    {{- include "deltaflow.labels" . | nindent 4 }}
+    {{- with .Values.metrics.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- .Files.Get "files/deltaflow-alerts.yml" | nindent 2 }}
+{{- end }}

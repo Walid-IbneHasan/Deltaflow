@@ -19,6 +19,13 @@ to the size of the change, not the size of the tables.
 | M6 — metrics, JSON logs, Next.js console, backpressure, measured benchmark | done — [notes](docs/milestones/M6.md), [design](docs/operations.md) |
 | M7 — scale-out: sharded views, Postgres leases with epoch fencing, failover | done — [notes](docs/milestones/M7.md), [design](docs/scale-out.md) |
 | After M7 — hardening: TLS, idle sources, restarts, the `deltaflow` command, left joins, avg and count distinct | done — [notes](docs/milestones/hardening.md) |
+| Views written in SQL, verified against Postgres | done — [docs/sql.md](docs/sql.md), [decision 0008](docs/decisions/0008-sql-views.md) |
+| Changed views rebuilt alone, without a bootstrap | done — [exactly-once.md](docs/exactly-once.md) |
+| Bootstrap in chunks: VACUUM keeps working, a stopped load resumes | done — [decision 0009](docs/decisions/0009-chunked-snapshots.md) |
+| Real schemas: json, jsonb, arrays; ADD COLUMN; partitioned tables; large transactions | done — [docs/schemas.md](docs/schemas.md) |
+| Read-your-writes: `_deltaflow.wait_for` | done — [docs/read-your-writes.md](docs/read-your-writes.md) |
+| Failover: Postgres 17 failover slots, several hosts, timeline checks | done — [docs/failover.md](docs/failover.md) |
+| Packaging: wheel, container image, Helm chart, alerts, CI on Postgres 15–18 | done — [docs/deploy.md](docs/deploy.md) |
 
 Views can filter, map, project, join (inner and left) and aggregate source tables,
 written in SQL ([docs/sql.md](docs/sql.md)) or as Python steps.
@@ -67,12 +74,35 @@ same hardware, the slowest checkpoint took 0.118 s. Details, evidence and
 everything else measuring found:
 [docs/milestones/M6.md](docs/milestones/M6.md).
 
+## Requirements
+
+- PostgreSQL 15, 16, 17 or 18, with `wal_level = logical`. CI runs the suite
+  on each.
+- A role with `REPLICATION` that may create a publication on the source
+  tables (or a publication made for it), and that owns the sink tables.
+- `max_replication_slots` and `max_wal_senders`: two per worker while it
+  loads, one otherwise.
+- Source tables with a primary key (or `REPLICA IDENTITY USING INDEX`);
+  partitioned tables are read through their root.
+
+## Deploy
+
+- **Container:** `docker build -t deltaflow .`, then `deltaflow run views.sql
+  --slot shop` inside it, state on a volume at `/var/lib/deltaflow`.
+- **Kubernetes:** the Helm chart in [`deploy/helm/deltaflow`](deploy/helm/deltaflow)
+  (one worker, or a cluster), with probes, a ServiceMonitor and alerts.
+- **Alerts:** [`deploy/helm/deltaflow/files/deltaflow-alerts.yml`](deploy/helm/deltaflow/files/deltaflow-alerts.yml)
+  for Prometheus, tested with promtool.
+
+Details, and what to watch: [docs/deploy.md](docs/deploy.md),
+[docs/operations.md](docs/operations.md), [docs/failover.md](docs/failover.md).
+
 ## Quick start
 
 Requires Docker, [uv](https://docs.astral.sh/uv/) and GNU make.
 
 ```sh
-make up      # Postgres 16 with wal_level=logical and TLS on localhost:55432
+make up      # Postgres 16 (DELTAFLOW_PG_VERSION=15..18) with wal_level=logical and TLS on :55432
 make seed    # customers + orders, deterministic
 make load    # randomized inserts/updates/deletes; prints a replayable seed
 make check   # ruff, mypy --strict, pytest
@@ -85,6 +115,8 @@ make chaos   # kill -9 the worker during load; sinks must equal a recompute
 make bench   # capacity and freshness benchmark (re-seeds the database)
 make cluster-worker ID=w1  # sharded worker; start w2, w3 alongside, kill any of them
 make cluster-reset         # drop the cluster's slots, partial tables, leases and state
+make failover              # failover under load on a Postgres 17 primary and standby
+make image chart alerts    # the container image; the Helm chart; the alerting rules
 ```
 
 ## Run your own views
@@ -145,6 +177,10 @@ Some details:
   (`Deltaflow(shards=N, shard_by=...)`) and, per view, a partial table
   `<table>__shards` with a leading `shard` column. `cluster` creates the
   merge view `<table>` over it ([docs/scale-out.md](docs/scale-out.md)).
+
+Applications that read a view right after writing can wait for their write
+to arrive: `SELECT _deltaflow.wait_for(pg_current_wal_lsn())`
+([docs/read-your-writes.md](docs/read-your-writes.md)).
 
 Design decisions are in [`docs/decisions/`](docs/decisions/), and per-milestone
 notes are in [`docs/milestones/`](docs/milestones/).

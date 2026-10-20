@@ -12,8 +12,10 @@ def _setting(dsn: str, name: str) -> str:
     return str(row[0])
 
 
-def test_server_is_postgres_16_or_newer(dsn: str) -> None:
-    assert int(_setting(dsn, "server_version_num")) >= 160000
+def test_server_is_postgres_15_or_newer(dsn: str) -> None:
+    """The oldest version supported: pg_publication_tables has the row
+    filter and column list columns the source checks read (snapshot.py)."""
+    assert int(_setting(dsn, "server_version_num")) >= 150000
 
 
 def test_wal_level_is_logical(dsn: str) -> None:

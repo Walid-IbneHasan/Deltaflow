@@ -1,0 +1,14 @@
+apiVersion: v2
+name: deltaflow
+description: Incremental view maintenance over PostgreSQL logical replication
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - postgresql
+  - cdc
+  - logical-replication
+  - materialized-views
+home: https://github.com/Walid-IbneHasan/Deltaflow
+sources:
+  - https://github.com/Walid-IbneHasan/Deltaflow

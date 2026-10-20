@@ -11,10 +11,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The supported floor and the newest release.
-        python: ["3.12", "3.14"]
+        include:
+          # Every supported Postgres on the oldest Python; the newest Python once.
+          - { python: "3.12", postgres: "15" }
+          - { python: "3.12", postgres: "16" }
+          - { python: "3.12", postgres: "17" }
+          - { python: "3.12", postgres: "18", data_mount: /var/lib/postgresql }
+          - { python: "3.14", postgres: "16" }
     env:
       UV_PYTHON: ${{ matrix.python }}
+      DELTAFLOW_PG_VERSION: ${{ matrix.postgres }}
+      DELTAFLOW_PG_DATA_MOUNT: ${{ matrix.data_mount || '/var/lib/postgresql/data' }}
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: astral-sh/setup-uv@v10.2.0
@@ -26,6 +33,26 @@ jobs:
       - name: Postgres logs on failure
         if: failure()
         run: docker compose logs postgres
+
+  failover:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.2.0
+      - run: uv sync --locked
+      - run: make failover
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.2.0
+      - run: uv build
+      - run: docker build -t deltaflow:ci .
+      - run: docker run --rm deltaflow:ci --version
+      - uses: azure/setup-helm@v4.3.0
+      - run: make chart
+      - run: make alerts
 
   console:
     runs-on: ubuntu-latest

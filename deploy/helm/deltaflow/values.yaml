@@ -1,0 +1,99 @@
+# Deltaflow: views written in SQL, kept up to date from a Postgres
+# replication slot, written to Postgres tables (docs/operations.md).
+
+image:
+  repository: ghcr.io/walid-ibnehasan/deltaflow
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# run: one worker maintains every view (a StatefulSet of one).
+# cluster: `replicas` workers share the views' shards (docs/scale-out.md).
+mode: run
+replicas: 2
+
+# The replication slot (run), or the slots' prefix (cluster: <slot>_s<n>).
+slot: deltaflow
+# Default: the slot's name.
+publication: ""
+
+# The views, as SQL (CREATE VIEW analytics.x AS SELECT ...; docs/sql.md).
+# Either inline here, or in an existing ConfigMap with a `views.sql` key.
+views:
+  sql: ""
+  existingConfigMap: ""
+
+# Cluster mode: how the views' rows are split.
+cluster:
+  shards: 4
+  # table=column, one per source table, e.g. ["public.orders=customer_id"]
+  shardBy: []
+  heartbeatSeconds: 0.5
+  ttlSeconds: 10
+
+# The connection string, from a Secret: never inline in values. For a
+# failover setup give every host: host=db1,db2 ... target_session_attrs=read-write
+database:
+  existingSecret: ""
+  secretKey: dsn
+
+snapshot:
+  # chunked: pages with their own snapshots, VACUUM keeps working
+  # (decision 0009). single: one transaction, for small databases.
+  mode: chunked
+  chunkRows: 20000
+
+memoryBudgetMiB: 256
+flushIntervalSeconds: 0.1
+checkpointIntervalSeconds: 10
+maxTransactionChanges: 10000
+sinkSpillAfter: 100000
+logFormat: json
+extraArgs: []
+env: []
+
+persistence:
+  # The state: RocksDB and its checkpoints. Without it, every restart
+  # bootstraps.
+  size: 10Gi
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    memory: 1Gi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+metrics:
+  port: 9187
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+  # Alerts (files/deltaflow-alerts.yml) as a PrometheusRule.
+  prometheusRule:
+    enabled: false
+    labels: {}
+
+# A graceful stop flushes and checkpoints; a long checkpoint needs time.
+terminationGracePeriodSeconds: 60
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

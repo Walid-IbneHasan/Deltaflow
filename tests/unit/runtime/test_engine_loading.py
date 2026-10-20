@@ -194,3 +194,15 @@ def test_schemas_are_declared_before_any_row(tmp_path: Path) -> None:
     assert engine._columns_of("public.customers") == C_SCHEMA.columns
     assert isinstance(engine.arrangements["public.orders"].schema, TableSchema)
     store.close()
+
+
+def test_a_checkpoint_of_another_state_format_is_not_resumed(tmp_path: Path) -> None:
+    sd = StateDirectory(tmp_path / "s")
+    store = sd.open_live(memory_budget=8 * MB)
+    engine = Engine(registry([]), store)
+    install(engine)
+    meta = {**engine.metadata(), "version": 2}
+    store.close()
+    assert Engine.cannot_resume(registry([]), meta) == (
+        "the checkpoint's state format is version 2; this one is 1"
+    )

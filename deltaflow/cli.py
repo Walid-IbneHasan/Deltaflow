@@ -47,9 +47,9 @@ from typing import Any
 
 import psycopg
 
-from deltaflow import aio
+from deltaflow import __version__, aio
 from deltaflow.observability import logs
-from deltaflow.observability.http import Handler, MonitorServer, json_handler
+from deltaflow.observability.http import Handler, MonitorServer, Unavailable, json_handler
 from deltaflow.planner import Deltaflow, PlanError
 from deltaflow.runtime import sqlviews
 from deltaflow.runtime.cluster import ClusterWorker, prepare_cluster
@@ -108,6 +108,7 @@ def load_views(spec: str, *, factory: bool = False) -> Callable[[], Deltaflow]:
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="deltaflow", description=__doc__.splitlines()[0])
+    p.add_argument("--version", action="version", version=f"deltaflow {__version__}")
     commands = p.add_subparsers(dest="command", required=True, metavar="command")
 
     def common(sub: argparse.ArgumentParser) -> None:
@@ -233,9 +234,17 @@ async def _monitor(args: argparse.Namespace, routes: dict[str, Handler]) -> Moni
 
 
 def runner_routes(runner: DurableRunner) -> dict[str, Handler]:
+    def ready() -> tuple[str, bytes]:
+        """/readyz: the views are live (not starting, loading, or restarting)."""
+        engine = runner.engine
+        if engine is None or not engine.live or runner.flushed_lsn is None:
+            raise Unavailable("not live yet: starting, loading or restarting")
+        return "text/plain", f"live; sinks written through {runner.flushed_lsn}\n".encode()
+
     return {
         "/metrics": lambda: ("text/plain; version=0.0.4", runner.collect().expose().encode()),
         "/api/stats": json_handler(runner.stats),
+        "/readyz": ready,
     }
 
 

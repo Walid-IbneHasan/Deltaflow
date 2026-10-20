@@ -19,7 +19,18 @@ log = logging.getLogger(__name__)
 
 type Handler = Callable[[], tuple[str, bytes]]
 
-_REASONS = {200: "OK", 404: "Not Found", 405: "Method Not Allowed", 500: "Internal Server Error"}
+_REASONS = {
+    200: "OK",
+    404: "Not Found",
+    405: "Method Not Allowed",
+    500: "Internal Server Error",
+    503: "Service Unavailable",
+}
+
+
+class Unavailable(Exception):
+    """Raised by a handler: answer 503 with this message (a readiness probe
+    that is not ready)."""
 
 
 def json_handler(produce: Callable[[], Any]) -> Handler:
@@ -60,6 +71,8 @@ class MonitorServer:
                 try:
                     ctype, body = handler()
                     status = 200
+                except Unavailable as exc:
+                    status, ctype, body = 503, "text/plain", f"{exc}\n".encode()
                 except Exception:
                     log.exception("monitor endpoint %s failed", path)
                     status, ctype, body = 500, "text/plain", b"internal error\n"

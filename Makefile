@@ -7,7 +7,7 @@ LOAD_ARGS ?= --txns 2000
 WORKER_ARGS ?=
 SEED_ARGS ?=
 
-.PHONY: up down nuke psql seed load tail tail-drop views worker worker-reset cluster-worker cluster-reset console bench differential chaos failover lint fmt typecheck test check
+.PHONY: up down nuke psql seed load tail tail-drop views worker worker-reset cluster-worker cluster-reset console bench differential chaos failover image chart alerts lint fmt typecheck test check
 
 up:
 	$(COMPOSE) up -d --wait
@@ -76,6 +76,23 @@ failover:
 	$(FAILOVER_COMPOSE) down -v
 	$(FAILOVER_COMPOSE) up -d --wait
 	DELTAFLOW_FAILOVER=1 $(UV) run pytest tests/failover -v -s; status=$$?; $(FAILOVER_COMPOSE) down -v; exit $$status
+
+# The worker's container image.
+image:
+	docker build -t deltaflow:dev .
+
+# The Helm chart: lint, and render both modes with example values.
+CHART_VALUES = --set database.existingSecret=db --set views.sql="CREATE VIEW analytics.v AS SELECT 1 AS x FROM public.t"
+chart:
+	helm lint deploy/helm/deltaflow $(CHART_VALUES)
+	helm template deltaflow deploy/helm/deltaflow $(CHART_VALUES) > /dev/null
+	helm template deltaflow deploy/helm/deltaflow $(CHART_VALUES) --set mode=cluster > /dev/null
+
+# The alerting rules: valid, and their unit tests pass (promtool, in Prometheus's image).
+ALERTS = deploy/helm/deltaflow/files
+alerts:
+	docker run --rm -v "$(CURDIR)/$(ALERTS):/rules" -w /rules --entrypoint promtool prom/prometheus:v2.53.0 check rules deltaflow-alerts.yml
+	docker run --rm -v "$(CURDIR)/$(ALERTS):/rules" -w /rules --entrypoint promtool prom/prometheus:v2.53.0 test rules deltaflow-alerts.test.yml
 
 # Differential acceptance tests (M1 replay, M2 views). Random seed unless DELTAFLOW_SEED is set.
 differential:

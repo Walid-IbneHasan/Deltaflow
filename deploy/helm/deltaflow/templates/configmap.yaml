@@ -1,0 +1,14 @@
+{{- if not .Values.views.existingConfigMap }}
+{{- if not .Values.views.sql }}
+{{- fail "views.sql (the views, in SQL) or views.existingConfigMap is required" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "deltaflow.viewsConfigMap" . }}
+  labels:
+    {{- include "deltaflow.labels" . | nindent 4 }}
+data:
+  views.sql: |
+    {{- .Values.views.sql | nindent 4 }}
+{{- end }}

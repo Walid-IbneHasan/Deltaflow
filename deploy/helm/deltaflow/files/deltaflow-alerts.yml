@@ -1,0 +1,102 @@
+# Prometheus alerting rules for Deltaflow workers (docs/operations.md).
+# Load this file as is into Prometheus, or let the Helm chart create a
+# PrometheusRule from it (metrics.prometheusRule.enabled).
+groups:
+  - name: deltaflow
+    rules:
+      - alert: DeltaflowDown
+        expr: up{job=~".*deltaflow.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Deltaflow worker {{ $labels.instance }} is down"
+          description: >-
+            Its views are not maintained, and its slot keeps WAL on the source
+            until it is back. It resumes from its checkpoint when restarted.
+
+      - alert: DeltaflowViewsStale
+        expr: >-
+          histogram_quantile(0.99,
+            sum by (instance, le) (rate(deltaflow_end_to_end_lag_seconds_bucket[5m]))) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Views on {{ $labels.instance }} lag their source by {{ $value | humanizeDuration }} (p99)"
+          description: >-
+            Source commit to sink commit. Check deltaflow_apply_lag_bytes (the
+            engine behind the stream) and deltaflow_sink_flush_seconds (a slow
+            sink database).
+
+      - alert: DeltaflowSlotRetainsWal
+        expr: deltaflow_slot_lag_bytes > 1073741824
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The source keeps {{ $value | humanize1024 }}B of WAL for {{ $labels.instance }}'s slot"
+          description: >-
+            WAL the slot has not acknowledged stays on the source's disk. It
+            is acknowledged at each checkpoint: a worker that is down,
+            stalled, or far behind lets it grow until the disk fills.
+
+      - alert: DeltaflowSlotRetainsWalCritical
+        expr: deltaflow_slot_lag_bytes > 10737418240
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The source keeps {{ $value | humanize1024 }}B of WAL for {{ $labels.instance }}'s slot"
+          description: >-
+            Act before the source's disk fills: restore the worker, or, as a
+            last resort, drop the slot (`deltaflow reset`), which forces a
+            bootstrap.
+
+      - alert: DeltaflowApplyBacklog
+        expr: deltaflow_apply_lag_bytes > 268435456
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} has {{ $value | humanize1024 }}B of WAL received but not applied"
+          description: >-
+            The engine is slower than the source's write rate. Look at
+            deltaflow_operator_seconds_total for the slow operator, or shard
+            the views (docs/scale-out.md).
+
+      - alert: DeltaflowNotCheckpointing
+        expr: >-
+          increase(deltaflow_runner_events_total{event="checkpoints"}[30m]) == 0
+          and on (instance) up{job=~".*deltaflow.*"} == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} has not checkpointed for 30 minutes"
+          description: >-
+            Without checkpoints the slot is not acknowledged (WAL accumulates)
+            and a restart replays everything since the last one. A single
+            transaction applied in part blocks checkpoints until it ends.
+
+      - alert: DeltaflowRestartLoop
+        expr: increase(deltaflow_runner_events_total{event="restarts"}[15m]) > 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} restarted its pipeline {{ $value }} times in 15 minutes"
+          description: >-
+            Each restart resumes exactly-once, but the cause recurs: see the
+            log's "pipeline interrupted" lines (connections, the server
+            restarting, a slot still held).
+
+      - alert: DeltaflowBootstrapped
+        expr: increase(deltaflow_runner_events_total{event="bootstraps"}[1h]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $labels.instance }} bootstrapped"
+          description: >-
+            A first start, or one after a failover that lost WAL, a dropped
+            partition, a missing slot, or a view over a new table. The log
+            says why ("bootstrapping from a fresh snapshot: ...").

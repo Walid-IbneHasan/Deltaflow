@@ -81,7 +81,6 @@ wheels = [
 
 [[package]]
 name = "deltaflow"
-version = "0.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "pglast" },

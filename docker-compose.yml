@@ -2,9 +2,13 @@ name: deltaflow
 
 services:
   postgres:
-    # 16 is the oldest version Deltaflow supports; developing against the floor
-    # keeps us from depending on newer pgoutput protocol features by accident.
-    image: postgres:16
+    # Postgres 15 through 18 are supported, and CI runs the suite on each
+    # (DELTAFLOW_PG_VERSION). Postgres 18's image keeps its data under
+    # /var/lib/postgresql: set DELTAFLOW_PG_DATA_MOUNT=/var/lib/postgresql,
+    # and give each version its own volume with another project name
+    # (docker compose -p deltaflow-pg18 ...). From Git Bash on Windows, also set
+    # MSYS_NO_PATHCONV=1, or the path is rewritten into a Windows one.
+    image: postgres:${DELTAFLOW_PG_VERSION:-16}
     environment:
       POSTGRES_USER: deltaflow
       POSTGRES_PASSWORD: deltaflow
@@ -33,7 +37,7 @@ services:
     ports:
       - "${DELTAFLOW_PG_PORT:-55432}:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata:${DELTAFLOW_PG_DATA_MOUNT:-/var/lib/postgresql/data}
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U deltaflow -d deltaflow_test"]
