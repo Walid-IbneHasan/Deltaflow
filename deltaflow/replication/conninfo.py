@@ -18,11 +18,16 @@ Implemented as libpq documents it:
 * `connect_timeout`, TCP keepalives, `tcp_user_timeout` (Linux),
   `require_auth`, `options`.
 
+* several hosts (`host=a,b` with a matching `port` list, or one port for
+  all) tried in order, and `target_session_attrs` any / read-write /
+  primary, so that after a failover the connection finds the new primary
+  (wire.py checks each server's reported state).
+
 Everything else libpq would act on is **refused** with `ConnInfoError`, not
-ignored: several hosts, `hostaddr`, service files, CRLs,
-`channel_binding=require`, GSS encryption, `target_session_attrs`, direct
-TLS negotiation, and `options` that change the output formats the decoder
-parses. A setting left at libpq's default is always fine.
+ignored: `hostaddr`, service files, CRLs, `channel_binding=require`, GSS
+encryption, the other `target_session_attrs`, direct TLS negotiation, and
+`options` that change the output formats the decoder parses. A setting
+left at libpq's default is always fine.
 
 One documented difference: with no host at all, libpq on POSIX uses a Unix
 socket in its compiled-in directory; this module uses localhost over TCP.
@@ -71,7 +76,7 @@ _PINNED = re.compile(
 _ONLY: dict[str, frozenset[str]] = {
     "channel_binding": frozenset({"disable", "prefer"}),
     "gssencmode": frozenset({"disable", "prefer"}),
-    "target_session_attrs": frozenset({"any"}),
+    "target_session_attrs": frozenset({"any", "read-write", "primary"}),
     "load_balance_hosts": frozenset({"disable"}),
     "sslnegotiation": frozenset({"postgres"}),
     "sslcertmode": frozenset({"allow", "disable"}),
@@ -153,15 +158,32 @@ class ConnectSettings:
 
 
 def resolve(dsn: str) -> ConnectSettings:
-    """The settings libpq would use for `dsn`, or ConnInfoError."""
+    """The settings libpq would use for `dsn`'s first host, or ConnInfoError."""
+    return resolve_hosts(dsn)[0][0]
+
+
+def resolve_hosts(dsn: str) -> tuple[list[ConnectSettings], str]:
+    """The settings for each of `dsn`'s hosts, in the order libpq tries
+    them, and `target_session_attrs`."""
     values, explicit = _merge(dsn)
-    host = values["host"] or "localhost"
-    port = values["port"] or "5432"
-    for what, value in (("hosts", host), ("ports", port)):
-        if "," in value:
-            raise ConnInfoError(
-                f"several {what} ({value}) are not supported by the replication connection"
-            )
+    hosts = (values["host"] or "localhost").split(",")
+    ports = (values["port"] or "").split(",")
+    if len(ports) == 1:
+        ports *= len(hosts)
+    if len(ports) != len(hosts):
+        raise ConnInfoError(
+            f"{len(hosts)} hosts and {len(ports)} ports: give one port, or one each"
+        )
+    attrs = values["target_session_attrs"] or "any"
+    return [
+        _settings(values, explicit, host or "localhost", port or "5432")
+        for host, port in zip(hosts, ports, strict=True)
+    ], attrs
+
+
+def _settings(
+    values: dict[str, str | None], explicit: set[str], host: str, port: str
+) -> ConnectSettings:
     user = values["user"]
     if not user:
         raise ConnInfoError("no user name in the connection settings")

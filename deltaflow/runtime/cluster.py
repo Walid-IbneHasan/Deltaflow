@@ -54,6 +54,7 @@ from typing import Any
 import psycopg
 from psycopg import sql
 
+from deltaflow.config import with_connect_timeout
 from deltaflow.observability.metrics import Registry, merge
 from deltaflow.planner import Deltaflow, PlanError
 from deltaflow.planner.merge import merge_view_sql
@@ -220,7 +221,7 @@ class ClusterWorker:
             )
         self.shards = probe.shards
         self._make_registry = make_registry
-        self._dsn = dsn
+        self._dsn = with_connect_timeout(dsn)
         self.worker_id = worker_id
         self._state_root = state_root
         self._slot_prefix = slot_prefix

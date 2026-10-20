@@ -52,6 +52,13 @@ has been delivered by the time it arrives, so it is progress, and the
 runner moves its watermark there at once (flushing anything pending
 first), instead of at the next checkpoint while the sources are idle.
 
+**Failover** (docs/failover.md). On Postgres 17+ the slot is a failover
+slot, so a promoted standby has it. Every checkpoint records the server's
+system identifier and timeline. Resumed on a new timeline, the runner reads
+its history: a checkpoint past the point where its own timeline ended has
+applied WAL the new primary never had, and the runner bootstraps instead of
+resuming on top of rows that no longer exist.
+
 **Large transactions.** The stream delivers a transaction of more than
 `max_transaction_changes` changes in parts (replication/changes.py), and
 each sink spills its buffers to the state store past `sink_spill_after`
@@ -90,6 +97,7 @@ from typing import Any, Literal
 import psycopg
 from psycopg import sql
 
+from deltaflow.config import with_connect_timeout
 from deltaflow.core import Frontier
 from deltaflow.faults import crash_point
 from deltaflow.observability.memory import rss
@@ -98,7 +106,16 @@ from deltaflow.planner import Deltaflow, PlanError
 from deltaflow.replication.changes import Transaction, TransactionPart
 from deltaflow.replication.lsn import Lsn
 from deltaflow.replication.pgoutput import Message
-from deltaflow.replication.slot import create_publication, create_slot, drop_slot, slot_exists
+from deltaflow.replication.slot import (
+    SystemInfo,
+    create_publication,
+    create_slot,
+    diverged,
+    drop_slot,
+    identify_system,
+    set_failover,
+    slot_exists,
+)
 from deltaflow.replication.stream import Progress, ReplicationEndedError, ReplicationStream
 from deltaflow.replication.wire import (
     PgError,
@@ -186,6 +203,7 @@ class DurableRunner:
         snapshot_chunk_rows: int = 20_000,
         max_transaction_changes: int = 10_000,
         sink_spill_after: int = 100_000,
+        failover: bool | None = None,
     ) -> None:
         """With `shard`, this runner maintains that shard of a sharded
         registry: its sinks write partial rows to `<table>__shards`, its
@@ -200,7 +218,10 @@ class DurableRunner:
         A transaction of more than `max_transaction_changes` changes is
         applied in parts, and a sink buffering more than `sink_spill_after`
         deltas or keys moves them to the state store: memory stays bounded
-        however large a transaction (or a view's initial contents) is."""
+        however large a transaction (or a view's initial contents) is.
+
+        `failover`: make the slot a failover slot. None (the default) does so
+        on Postgres 17 and later, which have them."""
         if snapshot not in ("chunked", "single"):
             raise ValueError(f"snapshot must be 'chunked' or 'single', not {snapshot!r}")
         if snapshot_chunk_rows < 1:
@@ -221,8 +242,8 @@ class DurableRunner:
         #: every connection is tagged with it, so a cluster can find (and
         #: terminate) all of a dead worker's sessions
         self._app = application_name
-        self._dsn = dsn
-        self._sink_dsn = sink_dsn or dsn
+        self._dsn = with_connect_timeout(dsn)
+        self._sink_dsn = with_connect_timeout(sink_dsn or dsn)
         self.state = StateDirectory(state_dir, live=live_name)
         self.slot = slot
         self.publication = publication
@@ -236,6 +257,11 @@ class DurableRunner:
         self._chunk_rows = snapshot_chunk_rows
         self._max_txn_changes = max_transaction_changes
         self._spill_after = sink_spill_after
+        self._failover = failover
+        #: the slot is (to be) a failover slot, as decided at start
+        self._failover_on = False
+        #: the server this session runs on (IDENTIFY_SYSTEM)
+        self.system: SystemInfo | None = None
         self.counters: Counter[str] = Counter()
         self.metrics = RunnerMetrics()
         #: (end_lsn, commit_time) of applied transactions not yet flushed
@@ -282,9 +308,14 @@ class DurableRunner:
                 await self._ensure_publication(admin, registry_sources)
             have_slot = await slot_exists(admin, self.slot)
             self._partitions = await self._current_partitions(admin)
+            failover = await self._failover_wanted(admin)
+            failover_now = have_slot and failover and not await _is_failover_slot(admin, self.slot)
         repl = await ReplicationConnection.connect(self._dsn, application_name=self._app)
         loading = False
         try:
+            self.system = await identify_system(repl)
+            if failover_now:
+                await set_failover(repl, self.slot)
             checkpoint = self.state.latest()
             reason = await self._why_not_resume(checkpoint, have_slot)
             if reason is None and checkpoint is not None and "loading" in checkpoint.meta:
@@ -376,13 +407,15 @@ class DurableRunner:
             return "no state checkpoint"
         if not have_slot:
             return f"replication slot {self.slot} is missing"
-        if (reason := Engine.cannot_resume(self.registry, checkpoint.meta)) is not None:
-            return reason
-        if (gone := removed_partitions(checkpoint.meta.get("partitions", {}),
-                                       self._partitions)) is not None:  # fmt: skip
-            return gone
-        if "loading" in checkpoint.meta:
-            return None  # the sinks are replaced when the load goes live
+        assert self.system is not None
+        meta = checkpoint.meta
+        reason = (
+            Engine.cannot_resume(self.registry, meta)
+            or removed_partitions(meta.get("partitions", {}), self._partitions)
+            or diverged(checkpoint.lsn, meta.get("system", {}), self.system)
+        )
+        if reason is not None or "loading" in meta:
+            return reason  # a load's sinks are replaced when it goes live
         return await self._watermark_problem(checkpoint)
 
     async def _watermark_problem(self, checkpoint: Any) -> str | None:
@@ -469,7 +502,7 @@ class DurableRunner:
         self.store = self.state.open_live(memory_budget=self._memory_budget)
         self._bind_fresh(shapes)
         self.engine = Engine(self.registry, self.store, shard=self.shard, chunked=True)
-        info = await create_slot(repl, self.slot)
+        info = await create_slot(repl, self.slot, failover=self._failover_on)
         crash_point("bootstrap:after_slot")
         async with await psycopg.AsyncConnection.connect(
             self._dsn, autocommit=True, application_name=self._app
@@ -587,7 +620,7 @@ class DurableRunner:
         self.engine = Engine(
             self.registry, self.store, shard=self.shard, snapshot_chunk_rows=self._chunk_rows
         )
-        info = await create_slot(repl, self.slot, export_snapshot=True)
+        info = await create_slot(repl, self.slot, export_snapshot=True, failover=self._failover_on)
         assert info.snapshot_name is not None
         crash_point("bootstrap:after_slot")
         async with await psycopg.AsyncConnection.connect(
@@ -902,7 +935,12 @@ class DurableRunner:
         # host produces; docs/operations.md.
         await self._check_partitions()
         started = time.perf_counter()
-        meta = {**self.engine.metadata(), "partitions": self._partitions}
+        assert self.system is not None
+        meta = {
+            **self.engine.metadata(),
+            "partitions": self._partitions,
+            "system": {"id": self.system.system_id, "timeline": self.system.timeline},
+        }
         await asyncio.to_thread(self.state.checkpoint, self.store, lsn, meta)
         seconds = time.perf_counter() - started
         self.metrics.checkpoint_seconds.observe(seconds)
@@ -912,6 +950,28 @@ class DurableRunner:
         if self._stream is not None:
             self._stream.ack(lsn)
         self.counters["checkpoints"] += 1
+
+    async def _failover_wanted(self, admin: Conn) -> bool:
+        """Whether the slot should be a failover slot: asked for, or by
+        default where the server has them. Warn when a failover could
+        still lose the slot's position: without synchronized_standby_slots,
+        the slot may get ahead of what a standby has received."""
+        version = admin.info.server_version // 10000
+        wanted = version >= 17 if self._failover is None else self._failover
+        if wanted and version < 17:
+            raise PlanError(f"failover slots need Postgres 17 or later; the server is {version}")
+        if wanted:
+            async with admin.cursor() as cur:
+                await cur.execute("SHOW synchronized_standby_slots")
+                row = await cur.fetchone()
+            if not (row and row[0]):
+                log.warning(
+                    "synchronized_standby_slots is not set: a standby may lag behind what the "
+                    "slot has sent, and after a failover the runner then bootstraps "
+                    "(docs/failover.md)"
+                )
+        self._failover_on = wanted
+        return wanted
 
     async def _current_partitions(self, conn: Conn) -> dict[str, list[str]]:
         tables = await partitioned_sources(conn, self.registry.sources)
@@ -975,6 +1035,13 @@ LAG_BUCKETS = (
     0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75,
     1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 30.0, 60.0,
 )  # fmt: skip
+
+
+async def _is_failover_slot(conn: Conn, slot: str) -> bool:
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT failover FROM pg_replication_slots WHERE slot_name = %s", (slot,))
+        row = await cur.fetchone()
+    return bool(row and row[0])
 
 
 class RunnerMetrics:

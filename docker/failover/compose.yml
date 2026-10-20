@@ -1,0 +1,54 @@
+# A Postgres 17 primary and a streaming standby that syncs failover slots,
+# for tests/failover (make failover). Not for production: trust between the
+# containers and a fixed password.
+name: deltaflow-failover
+
+services:
+  primary:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: deltaflow
+      POSTGRES_PASSWORD: deltaflow
+      POSTGRES_DB: deltaflow_test
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=16
+      - -c
+      - max_wal_senders=16
+      - -c
+      - hot_standby=on
+      # Logical walsenders send nothing the standby has not confirmed: a
+      # failover can then not lose WAL a runner has already applied.
+      - -c
+      - synchronized_standby_slots=standby_slot
+    ports:
+      - "${DELTAFLOW_FAILOVER_PRIMARY_PORT:-55441}:5432"
+    volumes:
+      - ./primary-init.sh:/docker-entrypoint-initdb.d/primary-init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deltaflow -d deltaflow_test"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  standby:
+    image: postgres:17
+    user: postgres
+    depends_on:
+      primary:
+        condition: service_healthy
+    environment:
+      PGDATA: /var/lib/postgresql/data
+    entrypoint: ["bash", "/standby-entrypoint.sh"]
+    ports:
+      - "${DELTAFLOW_FAILOVER_STANDBY_PORT:-55442}:5432"
+    volumes:
+      - ./standby-entrypoint.sh:/standby-entrypoint.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deltaflow -d deltaflow_test"]
+      interval: 1s
+      timeout: 3s
+      retries: 120

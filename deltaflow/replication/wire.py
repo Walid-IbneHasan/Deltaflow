@@ -98,12 +98,45 @@ class ReplicationConnection:
     async def connect(
         cls, dsn: str, *, application_name: str = "deltaflow", timeout: float = 10.0
     ) -> ReplicationConnection:
-        """Connect as libpq would for `dsn`. `timeout` applies unless the
+        """Connect as libpq would for `dsn`: each of its hosts in turn, until
+        one accepts and is what `target_session_attrs` asks for (a primary,
+        after a failover). `timeout` applies to each attempt unless the
         settings give a `connect_timeout` (0 there means no limit)."""
-        settings = conninfo.resolve(dsn)
-        limit = timeout if settings.connect_timeout is None else settings.connect_timeout or None
-        async with asyncio.timeout(limit):
-            return await cls._negotiate(settings, application_name)
+        hosts, attrs = conninfo.resolve_hosts(dsn)
+        failures: list[str] = []
+        for settings in hosts:
+            limit = (
+                timeout if settings.connect_timeout is None else settings.connect_timeout or None
+            )
+            try:
+                async with asyncio.timeout(limit):
+                    conn = await cls._negotiate(settings, application_name)
+            except Exception as exc:
+                if len(hosts) == 1:
+                    raise
+                failures.append(f"{settings.host}:{settings.port}: {exc!r}")
+                continue
+            if attrs == "any" or await conn._session_is(attrs):
+                return conn
+            failures.append(f"{settings.host}:{settings.port}: not {attrs}")
+            await conn.close()
+        raise ConnectionError(f"no host is available as {attrs}: {'; '.join(failures)}")
+
+    async def _session_is(self, attrs: str) -> bool:
+        """`target_session_attrs` read-write or primary, as libpq checks it:
+        from the state the server reports (14+), else by asking."""
+        standby = self.parameters.get("in_hot_standby")
+        if standby is None:
+            [(recovering,)] = await self.simple_query("SELECT pg_is_in_recovery()")
+            standby = "on" if recovering == "t" else "off"
+        if standby == "on":
+            return False
+        if attrs == "read-write":
+            read_only = self.parameters.get("default_transaction_read_only")
+            if read_only is None:
+                [(read_only,)] = await self.simple_query("SHOW transaction_read_only")
+            return read_only == "off"
+        return True
 
     @classmethod
     async def _negotiate(cls, s: ConnectSettings, app: str) -> ReplicationConnection:
@@ -127,6 +160,8 @@ class ReplicationConnection:
                 # A server without TLS answers "N", and the same connection
                 # continues in plaintext.
                 return await cls._attempt(s, app, tls, plaintext_if_refused=True)
+            except _Unreachable:
+                raise  # no connection at all: nothing to retry without TLS
             except (ssl.SSLError, ConnectionError) as exc:
                 log.warning(
                     "TLS handshake with %s:%s failed (%s); retrying without TLS",
@@ -153,7 +188,10 @@ class ReplicationConnection:
         if s.unix_socket and sys.platform != "win32":
             reader, writer = await asyncio.open_unix_connection(f"{s.host}/.s.PGSQL.{s.port}")
         else:
-            sock = await _tcp_connect(s)
+            try:
+                sock = await _tcp_connect(s)
+            except OSError as exc:
+                raise _Unreachable(exc.errno, f"{s.host}:{s.port}: {exc}") from exc
             try:
                 if tls is not None and await _request_tls(sock):
                     reader, writer = await asyncio.open_connection(
@@ -399,6 +437,11 @@ def _check_policy(policy: AuthPolicy, method: str, what: str) -> None:
             f"server {what} {method} authentication, which require_auth={policy.spec} "
             "does not allow"
         )
+
+
+class _Unreachable(OSError):
+    """The TCP connection itself failed (refused, unreachable, unresolved),
+    before any TLS: sslmode=prefer has no plaintext retry to make."""
 
 
 async def _tcp_connect(s: ConnectSettings) -> socket.socket:

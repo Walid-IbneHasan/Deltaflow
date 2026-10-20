@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import psycopg
 from psycopg import sql
@@ -45,17 +45,91 @@ async def create_slot(
     *,
     temporary: bool = False,
     export_snapshot: bool = False,
+    failover: bool = False,
 ) -> SlotInfo:
+    """With `failover` (Postgres 17+), standbys with `sync_replication_slots`
+    keep a copy of the slot, so it survives a promotion."""
     check_name(name, "slot")
     snapshot = "export" if export_snapshot else "nothing"
     temp = " TEMPORARY" if temporary else ""
+    options = f"SNAPSHOT '{snapshot}'" + (", FAILOVER true" if failover else "")
     rows = await conn.simple_query(
-        f"CREATE_REPLICATION_SLOT {name}{temp} LOGICAL pgoutput (SNAPSHOT '{snapshot}')"
+        f"CREATE_REPLICATION_SLOT {name}{temp} LOGICAL pgoutput ({options})"
     )
     [(slot_name, consistent_point, snapshot_name, _plugin)] = rows
     if slot_name is None or consistent_point is None:
         raise ValueError(f"CREATE_REPLICATION_SLOT returned {rows!r}")
     return SlotInfo(slot_name, Lsn.parse(consistent_point), snapshot_name)
+
+
+async def set_failover(conn: ReplicationConnection, name: str) -> None:
+    """Make an existing slot a failover slot (Postgres 17+)."""
+    await conn.simple_query(f"ALTER_REPLICATION_SLOT {check_name(name, 'slot')} (FAILOVER true)")
+
+
+@dataclass(frozen=True, slots=True)
+class SystemInfo:
+    """IDENTIFY_SYSTEM: which cluster, which timeline, how far its WAL goes."""
+
+    system_id: str
+    timeline: int
+    xlogpos: Lsn
+    #: (timeline, the LSN where it ended) for each ancestor (TIMELINE_HISTORY)
+    history: tuple[tuple[int, Lsn], ...] = field(default=())
+
+
+async def identify_system(conn: ReplicationConnection) -> SystemInfo:
+    [(system_id, timeline, xlogpos, _db)] = await conn.simple_query("IDENTIFY_SYSTEM")
+    assert system_id is not None
+    assert timeline is not None
+    assert xlogpos is not None
+    tli = int(timeline)
+    history: tuple[tuple[int, Lsn], ...] = ()
+    if tli > 1:  # timeline 1 has no history file
+        [(_name, content)] = await conn.simple_query(f"TIMELINE_HISTORY {tli}")
+        history = _history(content or "")
+    return SystemInfo(system_id, tli, Lsn.parse(xlogpos), history)
+
+
+def _history(content: str) -> tuple[tuple[int, Lsn], ...]:
+    """A timeline history file: "parent_tli<TAB>switchpoint<TAB>reason" lines
+    (as bytea text, hex, when the server sends it so)."""
+    if content.startswith("\\x"):
+        content = bytes.fromhex(content[2:]).decode()
+    entries = []
+    for line in content.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0].isdigit():
+            entries.append((int(fields[0]), Lsn.parse(fields[1])))
+    return tuple(entries)
+
+
+def diverged(checkpoint_lsn: Lsn, recorded: dict[str, object], now: SystemInfo) -> str | None:
+    """Why a checkpoint taken on `recorded` (system id, timeline) cannot be
+    resumed on `now`'s server: another cluster, or a timeline that ended
+    before the checkpoint (a failover lost WAL the views applied)."""
+    if not recorded:
+        return None
+    if recorded.get("id") != now.system_id:
+        return (
+            f"the server is another cluster (system identifier {now.system_id}, the checkpoint's "
+            f"{recorded.get('id')})"
+        )
+    timeline = int(str(recorded.get("timeline")))
+    if timeline == now.timeline:
+        return None
+    ends = dict(now.history)
+    if timeline not in ends:
+        return (
+            f"timeline {timeline} of the checkpoint is not in the history of timeline "
+            f"{now.timeline}"
+        )
+    if checkpoint_lsn > ends[timeline]:
+        return (
+            f"the checkpoint at {checkpoint_lsn} is past where timeline {timeline} ended "
+            f"({ends[timeline]}): the failover lost WAL the views had applied"
+        )
+    return None
 
 
 async def drop_slot(conn: ReplicationConnection, name: str) -> None:

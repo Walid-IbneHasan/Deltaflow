@@ -7,7 +7,7 @@ LOAD_ARGS ?= --txns 2000
 WORKER_ARGS ?=
 SEED_ARGS ?=
 
-.PHONY: up down nuke psql seed load tail tail-drop views worker worker-reset cluster-worker cluster-reset console bench differential chaos lint fmt typecheck test check
+.PHONY: up down nuke psql seed load tail tail-drop views worker worker-reset cluster-worker cluster-reset console bench differential chaos failover lint fmt typecheck test check
 
 up:
 	$(COMPOSE) up -d --wait
@@ -68,6 +68,14 @@ bench:
 # Chaos suite: kill -9 the worker during load; sinks must equal a recompute.
 chaos:
 	$(UV) run pytest tests/chaos -v -s
+
+# Failover under load: a Postgres 17 primary and standby, created here, broken by the
+# test (the standby is promoted), then removed.
+FAILOVER_COMPOSE = $(COMPOSE) -f docker/failover/compose.yml
+failover:
+	$(FAILOVER_COMPOSE) down -v
+	$(FAILOVER_COMPOSE) up -d --wait
+	DELTAFLOW_FAILOVER=1 $(UV) run pytest tests/failover -v -s; status=$$?; $(FAILOVER_COMPOSE) down -v; exit $$status
 
 # Differential acceptance tests (M1 replay, M2 views). Random seed unless DELTAFLOW_SEED is set.
 differential:

@@ -15,6 +15,7 @@ from deltaflow.replication.conninfo import (
     ConnInfoError,
     pgpass_password,
     resolve,
+    resolve_hosts,
     ssl_context,
 )
 
@@ -68,14 +69,13 @@ def test_connect_timeout_follows_libpq() -> None:
 @pytest.mark.parametrize(
     ("dsn", "message"),
     [
-        ("postgresql://alice@h1,h2/shop", "several hosts"),
-        ("host=h port=5432,5433 user=alice", "several ports"),
+        ("host=h1,h2,h3 port=5432,5433 user=alice", "3 hosts and 2 ports"),
         (BASE + "?hostaddr=10.0.0.1", "hostaddr"),
         (BASE + "?service=prod", "service"),
         (BASE + "?sslcrl=/x.crl", "sslcrl"),
         (BASE + "?channel_binding=require", "channel_binding"),
         (BASE + "?gssencmode=require", "gssencmode"),
-        (BASE + "?target_session_attrs=read-write", "target_session_attrs"),
+        (BASE + "?target_session_attrs=standby", "target_session_attrs"),
         (BASE + "?load_balance_hosts=random", "load_balance_hosts"),
         (BASE + "?client_encoding=LATIN1", "client_encoding"),
         (BASE + "?sslnegotiation=direct", "sslnegotiation"),
@@ -100,6 +100,22 @@ def test_settings_at_their_harmless_values_are_accepted() -> None:
         "&client_encoding=UTF8&replication=database&sslnegotiation=postgres&sslcertmode=allow"
         "&options=-c%20statement_timeout%3D0&application_name=x"
     )
+
+
+def test_several_hosts_are_tried_in_order_as_libpq_does() -> None:
+    """A port list matches the host list; one port applies to every host;
+    target_session_attrs read-write or primary keeps standbys out."""
+    hosts, attrs = resolve_hosts("host=a,b,c port=5432,,6432 user=alice dbname=shop")
+    assert [(h.host, h.port) for h in hosts] == [("a", 5432), ("b", 5432), ("c", 6432)]
+    assert attrs == "any"
+    hosts, attrs = resolve_hosts(
+        "postgresql://alice@a:5433,b:5434/shop?target_session_attrs=read-write"
+    )
+    assert [(h.host, h.port, h.dbname) for h in hosts] == [("a", 5433, "shop"), ("b", 5434, "shop")]
+    assert attrs == "read-write"
+    hosts, _ = resolve_hosts("host=a,b port=6000 user=alice")
+    assert [h.port for h in hosts] == [6000, 6000]
+    assert resolve("host=a,b user=alice").host == "a"
 
 
 def test_sslrootcert_system_defaults_to_verify_full() -> None:
