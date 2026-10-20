@@ -58,6 +58,51 @@ type Conn = psycopg.AsyncConnection[tuple[Any, ...]]
 
 WATERMARKS = "_deltaflow.watermarks"
 SHARD_COLUMN = "shard"
+#: prefix of the logical message `_deltaflow.wait_for` emits to wake runners
+WAIT_PREFIX = "deltaflow.wait"
+#: serializes Deltaflow's DDL: concurrent CREATE ... IF NOT EXISTS, and
+#: CREATE OR REPLACE FUNCTION, collide in the catalog
+_DDL_LOCK = 0x44464C57
+
+_WAIT_FOR = """
+CREATE OR REPLACE FUNCTION _deltaflow.wait_for(
+    target pg_lsn, view_names text[] DEFAULT NULL, timeout interval DEFAULT '10 seconds'
+) RETURNS boolean
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    deadline timestamptz := clock_timestamp() + timeout;
+    reached pg_lsn;
+    missing text;
+BEGIN
+    IF view_names IS NOT NULL THEN
+        SELECT string_agg(v, ', ') INTO missing FROM unnest(view_names) AS v
+        WHERE NOT EXISTS (
+            SELECT 1 FROM _deltaflow.watermarks w WHERE split_part(w.view, '@', 1) = v
+        );
+        IF missing IS NOT NULL THEN
+            RAISE EXCEPTION 'no view named % has a watermark', missing
+                USING ERRCODE = 'undefined_object';
+        END IF;
+    END IF;
+    -- Wakes the runners: every transaction committed before this message
+    -- has been sent to them, so they may move their watermark here now
+    -- instead of at their next checkpoint (sources idle).
+    PERFORM pg_logical_emit_message(false, 'deltaflow.wait', target::text);
+    LOOP
+        SELECT min(w.lsn) INTO reached FROM _deltaflow.watermarks w
+        WHERE view_names IS NULL OR split_part(w.view, '@', 1) = ANY (view_names);
+        IF reached >= target THEN
+            RETURN true;
+        END IF;
+        IF clock_timestamp() >= deadline THEN
+            RETURN false;
+        END IF;
+        PERFORM pg_sleep(0.005);
+    END LOOP;
+END
+$fn$
+"""
 #: past this many buffered deltas or keys, a bound sink spills (`bind`)
 SPILL_AFTER = 100_000
 #: rows per chunk of a flush's writes (`take_chunks`)
@@ -388,11 +433,20 @@ class PostgresSink(Sink):
 
 
 async def ensure_watermark_table(conn: Conn) -> None:
-    await conn.execute("CREATE SCHEMA IF NOT EXISTS _deltaflow")
-    await conn.execute(
-        "CREATE TABLE IF NOT EXISTS _deltaflow.watermarks ("
-        " view text PRIMARY KEY, lsn pg_lsn NOT NULL, updated_at timestamptz NOT NULL)"
-    )
+    """The watermark table, and `_deltaflow.wait_for` (read-your-writes:
+    docs/read-your-writes.md), which any role may call."""
+    async with conn.transaction():
+        await conn.execute("SELECT pg_advisory_xact_lock(%s)", (_DDL_LOCK,))
+        await conn.execute("CREATE SCHEMA IF NOT EXISTS _deltaflow")
+        await conn.execute(
+            "CREATE TABLE IF NOT EXISTS _deltaflow.watermarks ("
+            " view text PRIMARY KEY, lsn pg_lsn NOT NULL, updated_at timestamptz NOT NULL)"
+        )
+        await conn.execute(_WAIT_FOR)
+        await conn.execute("GRANT USAGE ON SCHEMA _deltaflow TO PUBLIC")
+        await conn.execute(
+            "GRANT EXECUTE ON FUNCTION _deltaflow.wait_for(pg_lsn, text[], interval) TO PUBLIC"
+        )
 
 
 async def describe_sink_table(conn: Conn, table: str) -> tuple[tuple[str, ...], tuple[str, ...]]:

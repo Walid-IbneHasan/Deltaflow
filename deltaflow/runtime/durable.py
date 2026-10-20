@@ -46,6 +46,12 @@ When every page is in and the stream is past the last page's consistent
 point, the views are built from the arrangements and every sink's
 contents are replaced at that position, which is where they go live.
 
+**Read-your-writes.** `_deltaflow.wait_for` (sinks/postgres.py) emits a
+non-transactional logical message. Every transaction committing before it
+has been delivered by the time it arrives, so it is progress, and the
+runner moves its watermark there at once (flushing anything pending
+first), instead of at the next checkpoint while the sources are idle.
+
 **Large transactions.** The stream delivers a transaction of more than
 `max_transaction_changes` changes in parts (replication/changes.py), and
 each sink spills its buffers to the state store past `sink_spill_after`
@@ -91,6 +97,7 @@ from deltaflow.observability.metrics import Registry
 from deltaflow.planner import Deltaflow, PlanError
 from deltaflow.replication.changes import Transaction, TransactionPart
 from deltaflow.replication.lsn import Lsn
+from deltaflow.replication.pgoutput import Message
 from deltaflow.replication.slot import create_publication, create_slot, drop_slot, slot_exists
 from deltaflow.replication.stream import Progress, ReplicationEndedError, ReplicationStream
 from deltaflow.replication.wire import (
@@ -114,6 +121,7 @@ from deltaflow.runtime.snapshot import (
 )
 from deltaflow.sinks.postgres import (
     SHARD_COLUMN,
+    WAIT_PREFIX,
     PostgresSink,
     SinkError,
     describe_sink_table,
@@ -246,6 +254,8 @@ class DurableRunner:
         self._progress_lsn: Lsn | None = None
         #: partitioned source -> its partitions, as the state knows them
         self._partitions: dict[str, list[str]] = {}
+        #: someone waits for its writes (`_deltaflow.wait_for`): flush now
+        self._wake = False
 
     # --- start: resume or bootstrap ------------------------------------------
 
@@ -778,6 +788,11 @@ class DurableRunner:
             if due:
                 await self._flush()
                 pending = 0
+            if self._wake and not pending and not self.engine.partial:
+                self._wake = False
+                if self._advance_idle():
+                    await self._flush()
+                    self.counters["wakes"] += 1
             if (
                 not pending
                 and not self.engine.partial
@@ -799,6 +814,16 @@ class DurableRunner:
                         return event
                     if isinstance(event, Progress):
                         self._progress_lsn = event.lsn
+                    elif (
+                        isinstance(event, Message)
+                        and not event.transactional
+                        and event.prefix == WAIT_PREFIX
+                    ):
+                        # Every transaction committing before it has been
+                        # delivered: progress, and a reason to flush now.
+                        self._progress_lsn = max(self._progress_lsn or event.lsn, event.lsn)
+                        self._wake = True
+                        return None
         except TimeoutError:
             return None
 
