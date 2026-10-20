@@ -37,8 +37,14 @@ _EPOCH_NAIVE = datetime(1970, 1, 1)
 _MICRO = timedelta(microseconds=1)
 
 
+#: one-byte varints, the common case
+_SMALL = [bytes((n,)) for n in range(128)]
+
+
 def _varint(n: int) -> bytes:
     """LEB128 of a non-negative int."""
+    if n < 128:
+        return _SMALL[n]
     out = bytearray()
     while True:
         byte = n & 0x7F
@@ -67,10 +73,36 @@ def _number(sign: int, digits: str, exp: int) -> bytes:
     return _blob(b"N", f"{'-' if sign else '+'}{stripped}e{exp}".encode())
 
 
+#: encodings of short strings (column names, statuses, countries): the
+#: same few are encoded over and over
+_STRINGS: dict[str, bytes] = {}
+_STRINGS_MAX = 8192
+#: and of ints (ids, counts)
+_INTS: dict[int, bytes] = {}
+_INTS_MAX = 65536
+
+
 def _encode(value: Any) -> bytes:  # noqa: PLR0911, PLR0912 - ordered type dispatch
     # bool before int (bool is an int, and True == 1); datetime before date.
     if value is None:
         return b"0"
+    if type(value) is str:  # exactly str: subclasses (Untyped) are no different, but rarer
+        cached = _STRINGS.get(value)
+        if cached is None:
+            cached = _blob(b"S", value.encode("utf-8", "surrogatepass"))
+            if len(value) <= 64:
+                if len(_STRINGS) >= _STRINGS_MAX:
+                    _STRINGS.clear()
+                _STRINGS[value] = cached
+        return cached
+    if type(value) is int:  # exactly int: bool, an int too, encodes the same anyway
+        cached = _INTS.get(value)
+        if cached is None:
+            cached = _number(value < 0, str(abs(value)), 0)
+            if len(_INTS) >= _INTS_MAX:
+                _INTS.clear()
+            _INTS[value] = cached
+        return cached
     if isinstance(value, int):
         return _number(value < 0, str(abs(value)), 0)
     if isinstance(value, str):
@@ -134,10 +166,23 @@ def encode_key(values: Iterable[Any]) -> bytes:
     return b"".join(_encode(v) for v in values)
 
 
+#: a row shape (its column names, in order) -> its names sorted, encoded
+_PLANS: dict[tuple[str, ...], tuple[tuple[str, bytes], ...]] = {}
+_PLANS_MAX = 1024
+
+
 def encode_row_key(row: Row) -> bytes:
     """Canonical bytes of a whole row: column names sorted, since row
     equality ignores column order."""
-    return b"".join(_encode(name) + _encode(row[name]) for name in sorted(row))
+    shape = tuple(row)
+    plan = _PLANS.get(shape)
+    if plan is None:
+        plan = tuple((name, _encode(name)) for name in sorted(shape))
+        if len(_PLANS) >= _PLANS_MAX:
+            _PLANS.clear()
+        _PLANS[shape] = plan
+    values = row._values  # the dict itself: every name is a key of it
+    return b"".join([part for name, encoded in plan for part in (encoded, _encode(values[name]))])
 
 
 def encode_row(row: Row) -> bytes:

@@ -204,6 +204,7 @@ class DurableRunner:
         max_transaction_changes: int = 10_000,
         sink_spill_after: int = 100_000,
         failover: bool | None = None,
+        max_batch_transactions: int = 256,
     ) -> None:
         """With `shard`, this runner maintains that shard of a sharded
         registry: its sinks write partial rows to `<table>__shards`, its
@@ -258,6 +259,9 @@ class DurableRunner:
         self._max_txn_changes = max_transaction_changes
         self._spill_after = sink_spill_after
         self._failover = failover
+        self._max_batch = max_batch_transactions
+        #: an event read while gathering a batch that cannot join it
+        self._held: Transaction | TransactionPart | None = None
         #: the slot is (to be) a failover slot, as decided at start
         self._failover_on = False
         #: the server this session runs on (IDENTIFY_SYSTEM)
@@ -292,6 +296,7 @@ class DurableRunner:
         # A session: a restart replays from the checkpoint, so progress and
         # commit times of the previous session no longer apply.
         self._progress_lsn = None
+        self._held = None
         self._pending_commits.clear()
         self._sql = await psycopg.AsyncConnection.connect(
             self._sink_dsn, autocommit=True, application_name=self._app
@@ -797,22 +802,10 @@ class DurableRunner:
             timeout = self._flush_interval if pending else 0.5
             event = await self._next(timeout)
             now = time.monotonic()
-            if isinstance(event, TransactionPart):
-                # A large transaction, still arriving: nothing of it is
-                # complete, so a flush leaves it out. Flushing earlier
-                # transactions meanwhile is fine; a checkpoint is not.
-                self.engine.apply_part(event)
-                self.counters["transaction_parts"] += 1
-                self.metrics.changes.inc(len(event.changes))
-            elif isinstance(event, Transaction):
-                self.engine.apply(event)
-                self.counters["transactions"] += 1
-                self.metrics.transactions.inc()
-                self.metrics.changes.inc(len(event.changes))
-                self._pending_commits.append((event.end_lsn, event.commit_time))
-                if not pending:
-                    first_pending = now
-                pending += 1
+            applied = await self._take(event, room=self._max_flush - pending)
+            if applied and not pending:
+                first_pending = now
+            pending += applied
             due = pending and (
                 event is None
                 or pending >= self._max_flush
@@ -837,8 +830,56 @@ class DurableRunner:
                     await self._checkpoint()
                     last_checkpoint = now
 
+    async def _take(self, event: Transaction | TransactionPart | None, *, room: int) -> int:
+        """Apply what the stream delivered; the number of whole transactions."""
+        assert self.engine is not None
+        if isinstance(event, TransactionPart):
+            # A large transaction, still arriving: nothing of it is complete,
+            # so a flush leaves it out. Flushing earlier transactions
+            # meanwhile is fine; a checkpoint is not.
+            self.engine.apply_part(event)
+            self.counters["transaction_parts"] += 1
+            self.metrics.changes.inc(len(event.changes))
+            return 0
+        if event is None:
+            return 0
+        batch = await self._gather(event, room)
+        self.engine.apply_batch(batch)
+        for txn in batch:
+            self.metrics.changes.inc(len(txn.changes))
+            self._pending_commits.append((txn.end_lsn, txn.commit_time))
+        self.counters["transactions"] += len(batch)
+        self.metrics.transactions.inc(len(batch))
+        return len(batch)
+
+    async def _gather(self, first: Transaction, room: int) -> list[Transaction]:
+        """`first`, and the whole transactions queued behind it: applied as
+        one step, which is several times faster than one by one (consolidated
+        changes, one pass over each key's state). Only past every sink's
+        watermark: a batch must not mix replayed transactions with new ones
+        (Engine.apply_batch). Nothing is waited for."""
+        batch = [first]
+        if first.continued or not self._past_watermarks():
+            return batch
+        while len(batch) < min(self._max_batch, max(room, 1)):
+            event = await self._next(0)
+            if event is None:
+                break
+            if isinstance(event, TransactionPart) or event.continued:
+                self._held = event  # parts are applied as they come
+                break
+            batch.append(event)
+        return batch
+
+    def _past_watermarks(self) -> bool:
+        lsn = self._state_lsn()
+        return all(s.watermark is None or lsn >= s.watermark for s in self.sinks)
+
     async def _next(self, timeout: float) -> Transaction | TransactionPart | None:
         assert self._stream is not None
+        if self._held is not None:
+            held, self._held = self._held, None
+            return held
         try:
             async with asyncio.timeout(timeout):
                 while True:

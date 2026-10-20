@@ -572,6 +572,33 @@ class Engine:
         self.counters["transactions"] += 1
         self.advance(Frontier.at(txn.end_lsn))
 
+    def apply_batch(self, txns: Sequence[Transaction]) -> None:
+        """Consecutive whole transactions as one step. Their changes go
+        through the arrangements in order, then every delta is stamped with
+        the last transaction's commit LSN and they are consolidated: the
+        views move from before the first to after the last in one step, as
+        if the transactions were one. Nothing is observable in between, since
+        sinks write and checkpoints happen only at step boundaries. The
+        caller must not let a batch straddle a sink's watermark: a replayed
+        change stamped past it would be applied twice (durable.py)."""
+        if not txns:
+            return
+        if len(txns) == 1 or self._loading:
+            for txn in txns:
+                self.apply(txn)
+            return
+        last = txns[-1]
+        for txn in txns:
+            self._admit(txn.xid, txn.commit_lsn)
+            if txn.continued or self._partial is not None:
+                raise RuntimeError("a batch holds whole transactions only")
+        changes = [c for txn in txns for c in txn.changes]
+        self._step(self._batches(changes, last.commit_lsn))
+        crash_point("apply:after_state")
+        self.counters["transactions"] += len(txns)
+        self.counters["batches"] += 1
+        self.advance(Frontier.at(last.end_lsn))
+
     def _admit(self, xid: int, commit_lsn: Lsn) -> None:
         if not self._started:
             raise RuntimeError("engine not started: install snapshots, then start()")

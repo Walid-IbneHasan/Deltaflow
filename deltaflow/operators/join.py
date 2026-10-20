@@ -89,6 +89,8 @@ class Join(Operator):
         self._left_outer = left_outer
         self._right_columns = right_columns or (lambda: ())
         self._counts = store.keyspace(f"join:{name}:right_count") if left_outer else None
+        #: (prefix, a row's columns) -> those columns qualified, once per shape
+        self._qualified: dict[tuple[str, tuple[str, ...]], tuple[str, ...]] = {}
         counts = (f"join:{name}:right_count",) if left_outer else ()
         self.state_keyspaces = (f"join:{name}:left", f"join:{name}:right", *counts)
 
@@ -173,7 +175,8 @@ class Join(Operator):
                 if diff == 0:
                     continue
                 current = own.get(entry)
-                n = diff + (_decode(current)[1] if current is not None else 0)
+                # the count only: the stored row is the one at hand
+                n = diff + (_count(current) if current is not None else 0)
                 if n < 0:
                     raise JoinStateError(
                         f"join {self.name}: {row!r} would have multiplicity {n} "
@@ -189,11 +192,21 @@ class Join(Operator):
         merged: dict[str, Any] = {}
         for prefix, row in zip(self._prefixes, (left, right), strict=True):
             if prefix is None:
-                merged.update(row)
-            else:
-                merged.update((f"{prefix}.{c}", v) for c, v in row.items())
-        return Row(merged)
+                merged.update(row.items())
+                continue
+            shape = (prefix, tuple(row))
+            names = self._qualified.get(shape)
+            if names is None:
+                if len(self._qualified) >= 64:  # shapes are few; never grow unbounded
+                    self._qualified.clear()
+                names = self._qualified[shape] = tuple(f"{prefix}.{c}" for c in shape[1])
+            merged.update(zip(names, row.values(), strict=True))
+        return Row.of_dict(merged)
 
 
 def _decode(value: bytes) -> tuple[Row, int]:
-    return decode_row(value[_COUNT:]), int.from_bytes(value[:_COUNT], "big", signed=True)
+    return decode_row(value[_COUNT:]), _count(value)
+
+
+def _count(value: bytes) -> int:
+    return int.from_bytes(value[:_COUNT], "big", signed=True)
