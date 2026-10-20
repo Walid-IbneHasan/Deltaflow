@@ -228,3 +228,41 @@ rocksdict does not expose. Not done.
 freshness of transactions arriving during a checkpoint includes it. On
 Linux that was 0.05–0.12 s every 10 s. On the Windows host, rarely, tens
 of seconds.
+
+### Applying queued transactions as one step (after M7)
+
+The engine's per-change cost is Python's. A profile of replayed
+transactions shows no single hotspot. The time is spread across join
+output, RocksDB reads, key encoding and row hashing. Two changes help:
+
+- **Hot paths.** Rows are built without copying their dict, and a column
+  name is resolved once per row shape. The join caches its qualified
+  column names and reads a stored count without unpickling the row. Key
+  encoding caches short strings, small varints and each row shape's
+  sorted column names.
+- **Batches.** When the stream has already queued transactions behind
+  the one at hand, the runner applies up to 256 of them as one step
+  (`Engine.apply_batch`, `max_batch_transactions`). Their changes are
+  consolidated, so a key changed several times is read and written
+  once. The runner never waits to fill a batch. Under light load each
+  transaction is still its own step, so batching changes nothing for
+  freshness and helps exactly when the worker is behind: a backlog, a
+  burst, a restart. Batches form only past every sink's watermark,
+  since a batch stamped past a watermark must not hold replayed changes.
+
+Measured on 2,840 recorded `pgoutput` transactions (12,034 changes)
+through the worker's four views, engine only (no sinks, no checkpoints),
+on the Windows host. Each figure is the median of three runs, all taken
+at the same time:
+
+| Code | changes/s | |
+|---|---|---|
+| before | 2,619 | |
+| hot paths, one transaction at a time | 3,276 | 1.25× |
+| batches of 32 | 4,787 | 1.83× |
+| batches of 256 | 4,857 | 1.85× |
+
+The end-to-end `make bench` figures in the README are M6's; they were
+not measured again in this round (the host ran short of memory). The
+next large step would be native code for the operators, since what is
+left is spread over many small Python calls. It is not done.

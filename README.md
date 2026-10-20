@@ -26,6 +26,8 @@ to the size of the change, not the size of the tables.
 | Read-your-writes: `_deltaflow.wait_for` | done — [docs/read-your-writes.md](docs/read-your-writes.md) |
 | Failover: Postgres 17 failover slots, several hosts, timeline checks | done — [docs/failover.md](docs/failover.md) |
 | Packaging: wheel, container image, Helm chart, alerts, CI on Postgres 15–18 | done — [docs/deploy.md](docs/deploy.md) |
+| Throughput: queued transactions applied as one step, faster hot paths | done — [operations.md](docs/operations.md#applying-queued-transactions-as-one-step-after-m7) |
+| The production round: everything since hardening, what testing found, what is not done | [notes](docs/milestones/production.md) |
 
 Views can filter, map, project, join (inner and left) and aggregate source tables,
 written in SQL ([docs/sql.md](docs/sql.md)) or as Python steps.
@@ -73,6 +75,12 @@ the host took up to 31 s to write a single RocksDB file. On Linux, on the
 same hardware, the slowest checkpoint took 0.118 s. Details, evidence and
 everything else measuring found:
 [docs/milestones/M6.md](docs/milestones/M6.md).
+
+These end-to-end figures are M6's. Since then the engine applies queued
+transactions as one step. On recorded transactions, engine alone, that
+went from 2,619 to 4,787 changes/s
+([operations.md](docs/operations.md#applying-queued-transactions-as-one-step-after-m7)).
+The end-to-end benchmark has not been run again.
 
 ## Requirements
 
