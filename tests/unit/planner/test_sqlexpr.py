@@ -97,6 +97,35 @@ def test_constant_folding_raises_as_postgres_plans() -> None:
     assert expression("i + NULL / 0")(ROW) is None  # strict: NULL, before dividing
 
 
+@pytest.mark.parametrize(
+    ("sql", "value"),
+    [
+        # one item is `x = item`, strict: NULL, before dividing
+        ("(i / 0) IN (NULL)", None),
+        ("(i / 0) NOT IN (NULL)", None),
+        ("NULL IN (i / 0)", None),
+        # the items without columns are one `x = ANY (...)`, the rest each
+        # `x = item`, in order, stopping at the first TRUE
+        ("NULL IN (1, 2, i / 0)", None),
+        ("NULL NOT IN (1, i / 0)", None),
+        ("i IN (7, i / 0)", True),
+        ("7 IN (1, 7, i / 0)", True),
+        ("i IN (1, 2, i / 0)", EvalError),
+        ("i IN (i / 0, 7)", EvalError),
+        ("i NOT IN (8, i / 0)", EvalError),
+        ("(i / 0) IN (NULL, NULL)", EvalError),  # = ANY is not strict
+    ],
+)
+def test_in_is_rewritten_as_postgres_parses_it(sql: str, value: object) -> None:
+    """Answers from Postgres, over rows it cannot fold (transformAExprIn)."""
+    fn = expression(sql)
+    if value is EvalError:
+        with pytest.raises(EvalError, match="division by zero"):
+            fn(ROW)
+    else:
+        assert fn(ROW) is value
+
+
 def test_a_literal_that_cannot_take_the_common_type_fails_even_unreached() -> None:
     with pytest.raises(EvalError, match="invalid input syntax for type integer"):
         expression("COALESCE(1, 'x')")

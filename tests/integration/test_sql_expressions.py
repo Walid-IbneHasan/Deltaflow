@@ -18,7 +18,7 @@ from typing import Any
 
 import psycopg
 import pytest
-from hypothesis import HealthCheck, event, given, settings
+from hypothesis import HealthCheck, event, given, reject, settings
 from hypothesis import strategies as st
 
 from deltaflow.core import Row
@@ -122,6 +122,8 @@ def comparison(
     return st.tuples(a, st.sampled_from(ops), a).map(lambda t: f"({t[0]}{collate} {t[1]} {t[2]})")
 
 
+in_item = st.one_of(int_lit, st.just("NULL"), int_expr)
+
 bool_leaf = st.one_of(
     st.just("b"),
     st.sampled_from(["TRUE", "FALSE", "CAST(NULL AS boolean)"]),
@@ -130,10 +132,11 @@ bool_leaf = st.one_of(
     st.tuples(num_expr, int_expr).map(lambda t: f"({t[0]} < {t[1]})"),
     comparison(text_expr, ordered=False),
     comparison(text_expr, ordered=True, collate=' COLLATE "C"'),
-    st.tuples(int_expr, st.lists(st.one_of(int_lit, st.just("NULL")), min_size=1, max_size=3)).map(
+    # items with and without columns: Postgres parses the two differently
+    st.tuples(int_expr, st.lists(in_item, min_size=1, max_size=4)).map(
         lambda t: f"({t[0]} IN ({', '.join(t[1])}))"
     ),
-    st.tuples(int_expr, st.lists(int_lit, min_size=1, max_size=3)).map(
+    st.tuples(int_expr, st.lists(in_item, min_size=1, max_size=4)).map(
         lambda t: f"({t[0]} NOT IN ({', '.join(t[1])}))"
     ),
     st.tuples(num_expr, num_lit, num_lit).map(lambda t: f"({t[0]} BETWEEN {t[1]} AND {t[2]})"),
@@ -186,6 +189,10 @@ def postgres(conn: Sql, sql: str, row: tuple[Any, ...]) -> tuple[str, Any]:
         result = conn.execute(query, row + row).fetchone()
     except psycopg.DataError as exc:  # division by zero, out of range, ...
         return "error", type(exc).__name__
+    except psycopg.errors.UndefinedFunction:
+        # Ill-typed (round(round(1), 0) has no round(float8, int)): a view
+        # never gets this far, since Postgres checks every view first.
+        reject()
     assert result is not None
     return "value", result[0]
 

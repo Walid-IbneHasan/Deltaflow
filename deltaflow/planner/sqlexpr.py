@@ -54,7 +54,7 @@ import decimal
 import math
 import operator
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -183,6 +183,42 @@ def _function(c: Compiled) -> Callable[[Row], Any]:
     return lambda _row: value
 
 
+def _junction(sql: str, args: Iterable[Compiled], *, is_and: bool) -> Compiled:
+    """AND or OR of `args`, folded as eval_const_expressions does: in order,
+    a constant that decides it ends it (later arguments are never folded),
+    other constants drop out."""
+    decisive = not is_and  # AND stops at FALSE, OR at TRUE
+    kept: list[Compiled] = []
+    has_null = False
+    for arg in args:
+        if arg.error is not None:
+            return Compiled(sql, error=arg.error, kind="bool")
+        if arg.const:
+            value = _boolean(arg.value)
+            if value is None:
+                has_null = True
+            elif value == decisive:
+                return _const(sql, decisive, kind="bool")
+            continue  # a non-decisive constant drops out
+        kept.append(arg)
+    if not kept:
+        return _const(sql, None if has_null else not decisive, kind="bool")
+    fns = [a.fn for a in kept]
+
+    def evaluate(row: Row) -> bool | None:
+        null = has_null
+        for f in fns:
+            assert f is not None
+            v = _boolean(f(row))
+            if v is None:
+                null = True
+            elif v == decisive:
+                return decisive
+        return None if null else not decisive
+
+    return Compiled(sql, fn=evaluate, kind="bool")
+
+
 # --- static types ------------------------------------------------------------------
 
 _NUMERIC_KINDS = frozenset({"int", "numeric", "float"})
@@ -266,6 +302,17 @@ def _promoting(fn: Callable[[Row], Any], kind: str | None) -> Callable[[Row], An
 def _items(field: Any) -> tuple[Any, ...]:
     """A list field of a parse node (None when empty)."""
     return tuple(field or ())
+
+
+def _has_column(node: Any) -> bool:
+    """Whether a parse tree refers to a column (contain_vars_of_level)."""
+    if isinstance(node, ast.ColumnRef):
+        return True
+    if isinstance(node, ast.Node):
+        return any(_has_column(getattr(node, attr)) for attr in node)
+    if isinstance(node, tuple | list):
+        return any(_has_column(x) for x in node)
+    return False
 
 
 # --- compilation ----------------------------------------------------------------
@@ -510,23 +557,48 @@ class _Compiler:
         raise SqlError(f"prefix operator {op} is not supported: {sql}")
 
     def _in(self, node: ast.A_Expr, op: str, sql: str) -> Compiled:
+        """As Postgres's parser rewrites it (transformAExprIn): the items
+        without a column, if there are several, are one `x = ANY (...)`;
+        every other item is its own `x = item`, a strict operator; all are
+        joined by OR, or for NOT IN (`<>`, `<> ALL`) by AND. So `x IN (NULL)`
+        is NULL without evaluating x, and an item after a match is never
+        evaluated."""
         if not isinstance(node.rexpr, tuple | list):
             raise SqlError(f"{sql}: IN takes a list of values here, not a subquery")
         lhs = self.node(node.lexpr)
-        items = [self.node(e) for e in node.rexpr]
-        negate = op == "<>"
+        every = op == "<>"
+        constant = [n for n in node.rexpr if not _has_column(n)]
+        rest = list(node.rexpr)
+        parts: list[Compiled] = []
+        if len(constant) > 1:
+            parts.append(self._in_array(lhs, [self.node(n) for n in constant], op, every, sql))
+            rest = [n for n in rest if _has_column(n)]
+        for n in rest:
+            item = self.node(n)
+            collate = lhs.collate_c or item.collate_c
+            parts.append(_fold(
+                f"{lhs.sql} {op} {item.sql}", [lhs, item],
+                lambda a, b, c=collate: _compare(op, a, b, c), kind="bool",
+            ))  # fmt: skip
+        return _junction(sql, parts, is_and=every)
+
+    @staticmethod
+    def _in_array(lhs: Compiled, items: list[Compiled], op: str, every: bool, sql: str) -> Compiled:
+        """`lhs op ANY (ARRAY[items])`, or ALL: not strict, so it folds only
+        when every argument is constant."""
         collate = lhs.collate_c or any(i.collate_c for i in items)
 
         def evaluate(a: Any, *values: Any) -> bool | None:
-            if a is None:
+            if a is None:  # the array has elements
                 return None
             seen_null = False
             for v in values:
-                eq = _compare("=", a, v, collate)
-                if eq is True:
-                    return not negate
-                seen_null = seen_null or eq is None
-            return None if seen_null else negate
+                found = _compare(op, a, v, collate)
+                if found is None:
+                    seen_null = True
+                elif found != every:
+                    return found
+            return None if seen_null else every
 
         return _fold(sql, [lhs, *items], evaluate, strict=False, kind="bool")
 
@@ -559,38 +631,8 @@ class _Compiler:
         if node.boolop == B.NOT_EXPR:
             (only,) = _items(node.args)
             return _fold(sql, [self.node(only)], lambda a: not _boolean(a), kind="bool")
-        is_and = node.boolop == B.AND_EXPR
-        decisive = not is_and  # AND stops at FALSE, OR at TRUE
-        kept: list[Compiled] = []
-        has_null = False
-        for arg_node in _items(node.args):
-            arg = self.node(arg_node)
-            if arg.error is not None:
-                return Compiled(sql, error=arg.error, kind="bool")
-            if arg.const:
-                value = _boolean(arg.value)
-                if value is None:
-                    has_null = True
-                elif value == decisive:
-                    return _const(sql, decisive, kind="bool")  # later arguments are never folded
-                continue  # a non-decisive constant drops out
-            kept.append(arg)
-        if not kept:
-            return _const(sql, None if has_null else not decisive, kind="bool")
-        fns = [a.fn for a in kept]
-
-        def evaluate(row: Row) -> bool | None:
-            null = has_null
-            for f in fns:
-                assert f is not None
-                v = _boolean(f(row))
-                if v is None:
-                    null = True
-                elif v == decisive:
-                    return decisive
-            return None if null else not decisive
-
-        return Compiled(sql, fn=evaluate, kind="bool")
+        args = (self.node(a) for a in _items(node.args))  # compiled as they are reached
+        return _junction(sql, args, is_and=node.boolop == B.AND_EXPR)
 
     def _NullTest(self, node: ast.NullTest, sql: str) -> Compiled:
         is_null = node.nulltesttype == enums.NullTestType.IS_NULL
