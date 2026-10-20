@@ -22,7 +22,7 @@ vacuous, and real output.
 ## Test results
 
 The final state (ruff, mypy --strict, pytest) on the Windows host with
-Postgres 16, in four parts:
+Postgres 16, in parts (the host was short of memory for one long run):
 
 | Part | Result |
 |---|---|
@@ -32,6 +32,10 @@ Postgres 16, in four parts:
 | differential | 6 passed |
 | failover (`make failover`, Postgres 17) | 1 passed |
 
+The differential run came before the last commit (the host preference),
+which changes nothing for a DSN with one host; the other parts ran after
+it.
+
 The other Postgres versions, run locally during the round:
 
 - **15:** every integration module alone, each on a new server: 97
@@ -39,8 +43,8 @@ The other Postgres versions, run locally during the round:
 - **17:** chaos, differential and integration: 112 passed, 1 skipped,
   1 failed. The failure was a real bug, fixed (below). The failover test
   runs on Postgres 17 too.
-- **18:** not completed locally: the run was stopped when the host ran
-  short of memory. CI runs the suite on 18.
+- **18:** chaos, differential and integration on the final code: 114
+  passed, 1 skipped.
 
 ## Found along the way
 
