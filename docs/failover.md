@@ -21,6 +21,19 @@ primary and know whether its own state is still valid there.
 - `wal_level = logical` and `max_wal_senders` / `max_replication_slots` at
   least the primary's, for it to serve logical replication once promoted.
 
+**Before you rely on it**, check on the standby that the runner's slot is
+there, synced and persistent:
+
+```sql
+SELECT slot_name, synced, temporary FROM pg_replication_slots WHERE failover;
+```
+
+Postgres keeps a synced copy `temporary` until the standby can serve it,
+and drops temporary copies when it is promoted. A failover in that window
+leaves the new primary without the slot, and the runner bootstraps. The
+failover test waits for `temporary = false` before killing the primary;
+in CI it once did not, and the runner bootstrapped.
+
 **The runner** creates its slot as a failover slot on Postgres 17+ (or
 makes an existing one one): `DurableRunner(failover=None)` is "where
 supported". Give it every host, wanting the primary:

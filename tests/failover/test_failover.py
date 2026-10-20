@@ -51,12 +51,18 @@ async def load(target: str, seed: int, txns: int) -> None:
 
 
 async def synced(standby: Sql) -> bool:
+    """The standby's copy of the slot survives a promotion: synced, and no
+    longer temporary. Postgres keeps a synced copy temporary until the
+    standby can serve it, and drops temporary copies when it is promoted;
+    the runner then bootstraps (it did, in CI, before this waited for it)."""
     async with standby.cursor() as cur:
         await cur.execute(
-            "SELECT synced, failover FROM pg_replication_slots WHERE slot_name = %s", (SLOT,)
+            "SELECT synced AND failover AND NOT temporary FROM pg_replication_slots"
+            " WHERE slot_name = %s",
+            (SLOT,),
         )
         row = await cur.fetchone()
-    return row is not None and bool(row[0]) and bool(row[1])
+    return row is not None and bool(row[0])
 
 
 def test_a_failover_under_load_resumes_exactly_on_the_promoted_standby(tmp_path: Path) -> None:
