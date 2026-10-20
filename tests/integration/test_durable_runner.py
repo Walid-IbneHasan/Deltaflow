@@ -479,3 +479,57 @@ def test_changed_and_added_views_are_built_alone(dsn: str, tmp_path: Path) -> No
     assert outcome["untouched"], "an unchanged view's sink was rewritten"
     assert outcome["rewritten"], "the changed view's sink kept its old rows"
     assert outcome["differences"] == {}
+
+
+def test_views_built_behind_the_other_sinks_replay_into_their_own_sinks_only(
+    dsn: str, tmp_path: Path
+) -> None:
+    """Rebuilt views start at the checkpoint, the other sinks are further on:
+    the replay between the two writes only the rebuilt views' sinks. It
+    used to write every sink, and moving the others' watermarks back was
+    refused, so the runner stopped. Here the checkpoint is the bootstrap's
+    (huge checkpoint interval), the sinks far past it, then a crash."""
+    slot = f"it_durable_{uuid.uuid4().hex[:8]}"
+
+    def runner(registry: Deltaflow) -> DurableRunner:
+        return DurableRunner(
+            registry, dsn, state_dir=tmp_path, slot=slot, publication="it_durable",
+            flush_interval=0.02, max_flush_transactions=5, checkpoint_interval=3600,
+        )  # fmt: skip
+
+    async def go() -> tuple[dict[str, Any], dict[str, Any]]:
+        await fresh(dsn)
+        async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as sql:
+            await sql.execute(
+                "CREATE TABLE analytics.paid_orders"
+                " (order_id bigint PRIMARY KEY, amount numeric NOT NULL)"
+            )
+            try:
+                first = runner(views())
+                await first.start()
+                await load_and_sync(dsn, first, sql, seed=8, txns=150)
+                assert first.checkpointed_lsn is not None
+                assert first.flushed_lsn is not None
+                assert first.checkpointed_lsn < first.flushed_lsn
+                await first.close(final_checkpoint=False)  # a crash
+
+                second = runner(registry_v2())
+                await second.start()
+                await load_and_sync(dsn, second, sql, seed=9, txns=100)
+                counters = dict(second.counters)
+                differences = {}
+                for table, query in V2_SQL.items():
+                    actual = await query_multiset(sql, f"SELECT * FROM {table}")
+                    expected = await query_multiset(sql, query)
+                    if actual != expected:
+                        differences[table] = first_difference(actual, expected)
+                await second.close()
+            finally:
+                await drop(dsn, slot)
+        return counters, differences
+
+    counters, differences = run(go())
+    assert counters.get("bootstraps", 0) == 0, counters
+    assert counters["views_rebuilt"] == 2, counters
+    assert counters.get("replayed_flushes_skipped", 0) == 0, counters  # rebuilt views need each
+    assert differences == {}

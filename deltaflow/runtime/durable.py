@@ -885,7 +885,11 @@ class DurableRunner:
         transactions the sinks already hold (frontier at or below every
         watermark), there is nothing to write, and writing the watermark would
         move it *backwards*, so that later replays would be applied twice.
-        The chaos suite caught exactly that. So a replay flush is a no-op."""
+        The chaos suite caught exactly that. So a replay flush is a no-op.
+
+        Sinks need not agree: views rebuilt at the checkpoint (or loaded
+        anew) are behind the others. A flush between the two writes only
+        the sinks behind it; the others dropped those deltas as replays."""
         assert self._sql is not None
         lsn = self._state_lsn()
         if self.flushed_lsn is not None and lsn <= self.flushed_lsn:
@@ -894,7 +898,8 @@ class DurableRunner:
             return
         started = time.perf_counter()
         before = self.flushed_lsn
-        written = await flush(self._sql, self.sinks, lsn, fence=self._fence)
+        behind = [s for s in self.sinks if s.watermark is None or s.watermark < lsn]
+        written = await flush(self._sql, behind, lsn, fence=self._fence)
         self.metrics.flush_seconds.observe(time.perf_counter() - started)
         # End-to-end freshness of every transaction this flush made visible:
         # from its commit on the source to the sink's commit. Replayed
