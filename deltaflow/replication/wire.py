@@ -444,6 +444,18 @@ class _Unreachable(OSError):
     before any TLS: sslmode=prefer has no plaintext retry to make."""
 
 
+#: The replication socket's receive buffer, fixed rather than autotuned.
+#: A consumer that falls behind stops reading, and the walsender waits on
+#: TCP (stream.py). With autotuning, Linux could run short of memory for
+#: data it had already invited and drop some. Every later server packet
+#: then lay beyond the closed window and was discarded, acknowledgements
+#: of our status updates included, so the heartbeats stalled in
+#: retransmission backoff until wal_sender_timeout ended the connection
+#: (docs/operations.md). A fixed buffer closes the window without dropping
+#: anything. Bytes; Linux doubles the value, capped by net.core.rmem_max.
+RECEIVE_BUFFER = 4 << 20
+
+
 async def _tcp_connect(s: ConnectSettings) -> socket.socket:
     """A connected, non-blocking TCP socket to the first address that answers."""
     loop = asyncio.get_running_loop()
@@ -452,6 +464,8 @@ async def _tcp_connect(s: ConnectSettings) -> socket.socket:
     for family, kind, proto, _, address in infos:
         sock = socket.socket(family, kind, proto)
         try:
+            # Before connecting: the window scale is agreed in the handshake.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RECEIVE_BUFFER)
             sock.setblocking(False)
             await loop.sock_connect(sock, address)
         except OSError as exc:
