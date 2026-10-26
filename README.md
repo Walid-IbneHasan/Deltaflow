@@ -93,12 +93,23 @@ The end-to-end benchmark has not been run again.
 - Source tables with a primary key (or `REPLICA IDENTITY USING INDEX`);
   partitioned tables are read through their root.
 
+## Install
+
+```sh
+pip install deltaflow-pg                    # or: uv tool install deltaflow-pg
+docker pull ghcr.io/walid-ibnehasan/deltaflow
+```
+
+The package is `deltaflow-pg` on PyPI; the command and the module are
+`deltaflow`. The image is built for linux/amd64 and linux/arm64.
+
 ## Deploy
 
-- **Container:** `docker build -t deltaflow .`, then `deltaflow run views.sql
-  --slot shop` inside it, state on a volume at `/var/lib/deltaflow`.
-- **Kubernetes:** the Helm chart in [`deploy/helm/deltaflow`](deploy/helm/deltaflow)
-  (one worker, or a cluster), with probes, a ServiceMonitor and alerts.
+- **Container:** `ghcr.io/walid-ibnehasan/deltaflow`, running `deltaflow run
+  views.sql --slot shop`, state on a volume at `/var/lib/deltaflow`.
+- **Kubernetes:** the Helm chart, `oci://ghcr.io/walid-ibnehasan/charts/deltaflow`
+  (source in [`deploy/helm/deltaflow`](deploy/helm/deltaflow)): one worker, or a
+  cluster, with probes, a ServiceMonitor and alerts.
 - **Alerts:** [`deploy/helm/deltaflow/files/deltaflow-alerts.yml`](deploy/helm/deltaflow/files/deltaflow-alerts.yml)
   for Prometheus, tested with promtool.
 
@@ -192,3 +203,8 @@ to arrive: `SELECT _deltaflow.wait_for(pg_current_wal_lsn())`
 
 Design decisions are in [`docs/decisions/`](docs/decisions/), and per-milestone
 notes are in [`docs/milestones/`](docs/milestones/).
+
+## License
+
+Apache License 2.0: [LICENSE](LICENSE) and [NOTICE](NOTICE). Changes by
+version are in [CHANGELOG.md](CHANGELOG.md).

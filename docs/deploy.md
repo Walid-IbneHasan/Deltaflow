@@ -9,27 +9,31 @@ database (or another, `sink_dsn`). Its monitoring server answers on
 ## As a package
 
 ```sh
-pip install deltaflow           # or: uv tool install deltaflow
+pip install deltaflow-pg        # or: uv tool install deltaflow-pg
 deltaflow --version
 deltaflow run views.sql --slot shop --state-dir /var/lib/deltaflow/shop
 ```
 
-The wheel is pure Python. Its three dependencies (psycopg, pglast,
+The package is called `deltaflow-pg` on PyPI, because `deltaflow` was
+taken there; the command and the module are `deltaflow`. The wheel is
+pure Python. Its three dependencies (psycopg, pglast,
 rocksdict) ship binary wheels for Linux, macOS and Windows.
 
 ## As a container
 
 ```sh
-docker build -t deltaflow .
 docker run -d --name deltaflow \
   -e DELTAFLOW_DSN='host=db user=deltaflow dbname=shop sslmode=verify-full' \
   -v deltaflow-state:/var/lib/deltaflow \
   -v "$PWD/views.sql:/etc/deltaflow/views.sql:ro" \
   -p 9187:9187 \
-  deltaflow run /etc/deltaflow/views.sql --slot shop \
+  ghcr.io/walid-ibnehasan/deltaflow run /etc/deltaflow/views.sql --slot shop \
     --state-dir /var/lib/deltaflow/shop --http-host 0.0.0.0
 ```
 
+- Each release is published as `ghcr.io/walid-ibnehasan/deltaflow:<version>`
+  (and `latest`), for linux/amd64 and linux/arm64. `docker build -t
+  deltaflow .` builds the same image from a checkout.
 - The image installs dependencies exactly as `uv.lock` pins them, with
   hashes checked.
 - It runs as uid/gid 10001, not root, and works with a read-only root
@@ -41,7 +45,7 @@ docker run -d --name deltaflow \
 ```sh
 kubectl create secret generic shop-db \
   --from-literal=dsn='host=db1,db2 user=deltaflow dbname=shop target_session_attrs=read-write'
-helm install shop deploy/helm/deltaflow \
+helm install shop oci://ghcr.io/walid-ibnehasan/charts/deltaflow \
   --set database.existingSecret=shop-db \
   --set-file views.sql=views.sql \
   --set metrics.serviceMonitor.enabled=true \

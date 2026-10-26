@@ -1,9 +1,10 @@
 [project]
-name = "deltaflow"
-dynamic = ["version"]
+name = "deltaflow-pg"
+dynamic = ["version", "readme"]
 description = "Incremental view maintenance over PostgreSQL logical replication"
-readme = "README.md"
 requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Walid Ibne Hasan", email = "walid.ibne.hasan@gmail.com" }]
 keywords = ["postgresql", "cdc", "logical-replication", "materialized-views", "streaming", "ivm"]
 classifiers = [
@@ -29,6 +30,7 @@ Homepage = "https://github.com/Walid-IbneHasan/Deltaflow"
 Source = "https://github.com/Walid-IbneHasan/Deltaflow"
 Documentation = "https://github.com/Walid-IbneHasan/Deltaflow/tree/main/docs"
 Issues = "https://github.com/Walid-IbneHasan/Deltaflow/issues"
+Changelog = "https://github.com/Walid-IbneHasan/Deltaflow/blob/main/CHANGELOG.md"
 
 [project.scripts]
 deltaflow = "deltaflow.cli:main"
@@ -42,17 +44,28 @@ dev = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27", "hatch-fancy-pypi-readme>=24.1"]
 build-backend = "hatchling.build"
 
 [tool.hatch.version]
 path = "deltaflow/__init__.py"
 
+# PyPI shows the README; links into the repository become absolute there.
+[tool.hatch.metadata.hooks.fancy-pypi-readme]
+content-type = "text/markdown"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.fragments]]
+path = "README.md"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '\]\((?!https?://|#)([^)]+)\)'
+replacement = '](https://github.com/Walid-IbneHasan/Deltaflow/blob/main/\1)'
+
 [tool.hatch.build.targets.wheel]
 packages = ["deltaflow"]
 
 [tool.hatch.build.targets.sdist]
-include = ["deltaflow", "docs", "README.md", "pyproject.toml"]
+include = ["/deltaflow", "/docs", "/README.md", "/CHANGELOG.md", "/LICENSE", "/NOTICE", "/pyproject.toml"]
 
 [tool.ruff]
 line-length = 100

@@ -108,10 +108,10 @@ The other Postgres versions, run locally during the round:
   many small Python calls, so the next large step is native code for the
   operators (Rust, DBSP-style). There is no Rust toolchain on this
   machine.
-- **Publishing.** The wheel and image build, but nothing is on PyPI or a
-  container registry: that needs the owner's accounts.
-- **A license.** The repository has none, so the package metadata has
-  none; that is the owner's decision.
+- **Publishing** has been set up since: Apache-2.0, `deltaflow-pg` on
+  PyPI, the image and the chart on ghcr.io, by
+  `.github/workflows/release.yml`. The first release waits on the
+  owner's PyPI account.
 - **A checkpoint still holds the GIL** (M6): on a host with slow file
   I/O it can freeze the worker for its duration. `wal_sender_timeout`
   and the cluster lease TTL must allow for it.

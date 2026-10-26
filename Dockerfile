@@ -11,7 +11,7 @@
 FROM python:3.12-slim AS build
 RUN pip install --no-cache-dir uv==0.12.5
 WORKDIR /src
-COPY pyproject.toml uv.lock README.md ./
+COPY pyproject.toml uv.lock README.md LICENSE NOTICE ./
 COPY deltaflow ./deltaflow
 RUN uv export --frozen --no-dev --no-emit-project --format requirements-txt -o requirements.txt \
  && uv venv /opt/deltaflow \

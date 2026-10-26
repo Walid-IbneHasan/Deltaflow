@@ -80,7 +80,7 @@ wheels = [
 ]
 
 [[package]]
-name = "deltaflow"
+name = "deltaflow-pg"
 source = { editable = "." }
 dependencies = [
     { name = "pglast" },
