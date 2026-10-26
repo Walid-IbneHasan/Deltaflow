@@ -98,6 +98,15 @@ The other Postgres versions, run locally during the round:
 - **From Git Bash on Windows, the data mount for Postgres 18
   (`/var/lib/postgresql`) is rewritten into a Windows path.** The
   compose file says to set `MSYS_NO_PATHCONV=1`.
+- **The backpressure test failed about one run in fourteen, and not for
+  the reason first given.** While the consumer did not read, Linux's
+  autotuned receive buffer could drop a segment it had invited, then
+  discard the server's acknowledgements of our heartbeats, which stalled
+  in retransmission backoff until `wal_sender_timeout`. Packet captures
+  and TCP counters showed it; Python 3.14, TLS and docker-proxy, all
+  suspected along the way, played no part. The replication socket now has
+  a fixed receive buffer: 200 runs out of 200 passed
+  ([operations.md](../operations.md#backpressure-under-a-slow-sink)).
 
 ## Not done
 

@@ -135,7 +135,7 @@ times the timeout, under load. It checks that:
 - after the lock is released everything catches up, and every sink equals
   its SQL.
 
-Two things found while making that test honest:
+Three things found while making that test honest:
 
 - **The first version tested nothing.** `docker-compose.yml` passed
   `-c wal_sender_timeout=60s`, and command-line settings override
@@ -154,6 +154,42 @@ Two things found while making that test honest:
   `wal_sender_timeout` is disconnected. The runner exits, and a restart
   resumes exactly-once (M5). The runner does not reconnect by itself: run
   it under a supervisor.
+- **An autotuned receive buffer broke it on Linux too, now and then.** In
+  CI the test failed in 3 of 17 runs, always with `terminating walsender
+  process due to replication timeout`. Run 350 times with heartbeat,
+  socket and packet logs, it failed 25 times (one in fourteen): with
+  and without TLS, through docker-proxy and straight to the container, on
+  Python 3.12 and 3.14. The heartbeats were sent on time in every one (the
+  event loop never stalled for more than 0.73 s) and left the process.
+  TCP held them back:
+  1. With the consumer not reading, the kernel ran short of
+     receive-buffer memory before the window it had advertised was full,
+     and dropped a segment the walsender had already sent (`TCPRcvQDrop`).
+  2. Every later server packet lay beyond the now closed window, and
+     Linux (6.17 on the CI runner) discarded it unread, together with the
+     acknowledgement of our next status update.
+  3. Seeing no acknowledgement, our side retransmitted that update with
+     exponential backoff (0.2, 0.2, 0.4, 0.8, 1.7, 3.3 s in one capture),
+     and with one segment in flight it held every later update back. The
+     walsender received nothing new for 2 s and ended the connection.
+
+  The replication socket now has a fixed receive buffer (`RECEIVE_BUFFER`
+  in `replication/wire.py`, 4 MiB requested, set before connecting). Given
+  enough of it, the window closes without dropping anything. With it the
+  test passed 200
+  runs out of 200: 50 straight to the container, and 150 the way CI
+  connects (localhost, TLS) on Python 3.12 and 3.14.
+
+  How much buffer the kernel grants depends on `net.core.rmem_max`. At
+  1 MiB (the CI runner's), so a 2 MiB buffer, nothing was dropped. At
+  208 KiB, a common default that caps the buffer at 416 KiB, the kernel
+  still dropped a segment about once per run, but every time (72 of 72)
+  it recovered after one retransmission, and all 75 of those runs passed.
+  On such a host, raise `net.core.rmem_max` to 1 MiB or more.
+
+  Outside the test `wal_sender_timeout` is 60 s by default, so the same
+  drop would end a connection only if the stall outlasted that;
+  `deltaflow run` then reconnects and resumes exactly-once.
 
 ## Performance: what measuring found
 
@@ -202,13 +238,15 @@ with the direct call: the slowness had nothing to do with threads.
 
 **A second explanation was wrong too, and is corrected here.** The backpressure
 test once failed in CI (Python 3.14): `terminating walsender process due to
-replication timeout`. A checkpoint had stopped the heartbeats for longer
-than the test's 2 s `wal_sender_timeout`. I moved the checkpoint back into
-a worker thread "so heartbeats keep running", and CI went green. That
-reasoning was false. **rocksdict holds the GIL for the whole checkpoint.**
-During a 1.1 s checkpoint in a thread, the main thread made exactly one
-iteration, so heartbeats (asyncio or thread) wait for it either way. CI
-passed because the next runs' checkpoints were fast.
+replication timeout`. I took it for a checkpoint that had stopped the
+heartbeats for longer than the test's 2 s `wal_sender_timeout`. Most likely
+it was the receive buffer described under backpressure above: in all 25
+failures reproduced since, the heartbeats were on time. I moved the
+checkpoint back into a worker thread "so heartbeats keep running", and CI
+went green. That reasoning was false. **rocksdict holds the GIL for the
+whole checkpoint.** During a 1.1 s checkpoint in a thread, the main thread
+made exactly one iteration, so heartbeats (asyncio or thread) wait for it
+either way. CI passed because the failure is intermittent.
 
 What is actually true:
 

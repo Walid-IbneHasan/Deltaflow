@@ -100,6 +100,13 @@ unit tests.
   (hard links, so not twice the space).
 - **The source.** One replication slot per worker (per shard in a
   cluster), plus one more while loading.
+- **The host's `net.core.rmem_max`.** The replication socket asks for a
+  fixed 4 MiB receive buffer, and Linux grants at most twice
+  `net.core.rmem_max`. Set it to 1 MiB or more
+  (`sysctl -w net.core.rmem_max=1048576`). With less (208 KiB is a common
+  default), a consumer that falls behind still kept its connection in
+  testing, but with less margin
+  ([operations.md](operations.md#backpressure-under-a-slow-sink)).
 
 ## Privileges
 
