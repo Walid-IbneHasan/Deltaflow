@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.1 — 2026-10-26
+
+Two fixes, both found by tests that failed now and then in CI.
+
+- **A runner that falls behind keeps its connection.** While a slow sink
+  held the runner back, Linux's autotuned receive buffer could drop data
+  the server had already sent, and then ignore the server's
+  acknowledgements of the runner's status updates. Those stalled in
+  retransmission backoff until `wal_sender_timeout` ended the connection.
+  The replication socket now has a fixed receive buffer. On Linux, set
+  `net.core.rmem_max` to 1 MiB or more
+  ([docs/operations.md](docs/operations.md#backpressure-under-a-slow-sink),
+  [docs/deploy.md](docs/deploy.md)).
+- **`wait_for` returns promptly on a quiet server.** Its wake-up message
+  was not flushed, so with nothing else committing it could wait up to
+  15 s and run out its 10 s timeout. It is flushed now, and on PostgreSQL
+  17 and later the median wait fell from 57 ms to 6 ms
+  ([docs/read-your-writes.md](docs/read-your-writes.md#why-it-is-prompt)).
+  A runner replaces the function when it starts.
+
+The README is now written for someone new to Deltaflow, with a walkthrough
+that CI runs as written.
+
 ## 0.1.0 — 2026-10-26
 
 The first release. Deltaflow keeps views up to date from a PostgreSQL

@@ -362,7 +362,7 @@ systems will need the native core that is planned. Details:
 
 ## Status
 
-**Version 0.1.0, beta.** It is tested hard: more than 600 tests,
+**Version 0.1.1, beta.** It is tested hard: more than 600 tests,
 including:
 
 - every view compared with PostgreSQL's own answer after thousands of
