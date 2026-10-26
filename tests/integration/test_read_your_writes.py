@@ -85,6 +85,46 @@ def test_after_wait_for_the_view_has_the_write(dsn: str, tmp_path: Path) -> None
     assert statistics.median(latencies) < 1.0, latencies  # not the 30 s checkpoint interval
 
 
+def test_wait_for_wakes_the_runner_when_nothing_else_commits(dsn: str, tmp_path: Path) -> None:
+    """The wake-up message must reach the runner by itself. Emitted without
+    a flush, it waited in the WAL buffers for the next commit (the WAL
+    writer flushes only completed pages), and where nothing else committed,
+    wait_for ran out its timeout."""
+    slot = f"it_ryw_{uuid.uuid4().hex[:8]}"
+
+    async def go() -> tuple[float, int]:
+        await fresh(dsn)
+        r = DurableRunner(
+            views(), dsn, state_dir=tmp_path, slot=slot, publication="it_ryw",
+            flush_interval=0.05, checkpoint_interval=30,
+        )  # fmt: skip
+        await r.start()
+        stop = asyncio.Event()
+        task = asyncio.create_task(r.run(stop))
+        try:
+            async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as sql:
+                assert await await_for(sql, views=["order_totals"], timeout=10)
+                # The runner's watermark commit is now the last WAL, and
+                # nothing commits after it.
+                await asyncio.sleep(1)
+                started = time.monotonic()
+                assert await await_for(sql, views=["order_totals"], timeout=10)
+                return time.monotonic() - started, sql.info.server_version
+        finally:
+            stop.set()
+            await task
+            await r.close()
+            await drop(dsn, slot)
+
+    seconds, version = run(go())
+    print(f"wait_for with nothing else committing: {seconds:.3f} s (server {version})")
+    # Unflushed, the message waited for the background writer's running-xacts
+    # record, up to 15 s. PostgreSQL 17 and later flush it at once; before,
+    # the WAL writer flushes the page the filler completes within its sleep
+    # (5 s at most).
+    assert seconds < (1 if version >= 170000 else 6)
+
+
 def test_without_a_runner_wait_for_times_out(dsn: str) -> None:
     async def go() -> None:
         await fresh(dsn)

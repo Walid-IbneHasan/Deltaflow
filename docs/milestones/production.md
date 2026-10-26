@@ -107,6 +107,12 @@ The other Postgres versions, run locally during the round:
   suspected along the way, played no part. The replication socket now has
   a fixed receive buffer: 200 runs out of 200 passed
   ([operations.md](../operations.md#backpressure-under-a-slow-sink)).
+- **`wait_for` could run out its timeout on a quiet server.** Its wake-up
+  message was written but not flushed, so it waited for the next commit,
+  or up to 15 s for the background writer. It is flushed now: with
+  PostgreSQL 17's `flush` option, and on 15 and 16 with a filler message
+  that completes the WAL page
+  ([read-your-writes.md](../read-your-writes.md#why-it-is-prompt)).
 
 ## Not done
 

@@ -64,6 +64,20 @@ WAIT_PREFIX = "deltaflow.wait"
 #: CREATE OR REPLACE FUNCTION, collide in the catalog
 _DDL_LOCK = 0x44464C57
 
+#: How `wait_for` emits its wake-up message. Unflushed, it waited in the WAL
+#: buffers for the next commit: the WAL writer flushes completed pages, but
+#: never a part-filled one. Where nothing else committed, wait_for ran out
+#: its timeout. PostgreSQL 17 added pg_logical_emit_message's flush; before
+#: it, a second message that fills the rest of the page lets the WAL writer
+#: flush both, within its sleep (wal_writer_delay, 5 s at most when idle).
+_EMIT_WAKE = "    PERFORM pg_logical_emit_message(false, 'deltaflow.wait', target::text, true);"
+_EMIT_WAKE_BEFORE_17 = """\
+    PERFORM pg_logical_emit_message(false, 'deltaflow.wait', target::text);
+    PERFORM pg_logical_emit_message(false, 'deltaflow.flush', repeat(' ',
+        current_setting('wal_block_size')::int
+        - ((pg_current_wal_insert_lsn() - '0/0'::pg_lsn)
+           % current_setting('wal_block_size')::int)::int));"""
+
 _WAIT_FOR = """
 CREATE OR REPLACE FUNCTION _deltaflow.wait_for(
     target pg_lsn, view_names text[] DEFAULT NULL, timeout interval DEFAULT '10 seconds'
@@ -87,8 +101,9 @@ BEGIN
     END IF;
     -- Wakes the runners: every transaction committed before this message
     -- has been sent to them, so they may move their watermark here now
-    -- instead of at their next checkpoint (sources idle).
-    PERFORM pg_logical_emit_message(false, 'deltaflow.wait', target::text);
+    -- instead of at their next checkpoint (sources idle). Flushed, because
+    -- walsenders send only flushed WAL (Deltaflow's sinks/postgres.py).
+{emit}
     LOOP
         SELECT min(w.lsn) INTO reached FROM _deltaflow.watermarks w
         WHERE view_names IS NULL OR split_part(w.view, '@', 1) = ANY (view_names);
@@ -442,7 +457,8 @@ async def ensure_watermark_table(conn: Conn) -> None:
             "CREATE TABLE IF NOT EXISTS _deltaflow.watermarks ("
             " view text PRIMARY KEY, lsn pg_lsn NOT NULL, updated_at timestamptz NOT NULL)"
         )
-        await conn.execute(_WAIT_FOR)
+        emit = _EMIT_WAKE if conn.info.server_version >= 170000 else _EMIT_WAKE_BEFORE_17
+        await conn.execute(_WAIT_FOR.replace("{emit}", emit))
         await conn.execute("GRANT USAGE ON SCHEMA _deltaflow TO PUBLIC")
         await conn.execute(
             "GRANT EXECUTE ON FUNCTION _deltaflow.wait_for(pg_lsn, text[], interval) TO PUBLIC"

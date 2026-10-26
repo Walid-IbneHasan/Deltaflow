@@ -55,6 +55,32 @@ pending, moves its watermark to the message's position, and the waiter sees
 it. The test measures a median under a second with a 30-second checkpoint
 interval (`tests/integration/test_read_your_writes.py`).
 
+**The message must be flushed.** A walsender sends only WAL that is on
+disk, and a non-transactional message is not flushed when it is written.
+At first `wait_for` did not flush it. It went out with the next commit,
+usually the runner's own flush of the waiter's write. When that flush
+committed just before the message, and nothing else committed after it,
+the message waited for PostgreSQL's background writer. Every 15 s at
+most, that writer logs the running transactions and asks for a flush. The
+WAL writer flushes only completed pages, so nothing sooner moved the
+message. `wait_for` then ran out its 10 s timeout, once in CI and 3 times
+in 200 runs of the test on PostgreSQL 18.
+
+Now it is flushed:
+
+- **PostgreSQL 17 and later:** `pg_logical_emit_message(..., flush =>
+  true)`. With nothing else committing, the wait took 8–12 ms, against
+  4 s before. The test's median fell from 57 ms to 6 ms.
+- **PostgreSQL 15 and 16,** which have no such option: a second message
+  (prefix `deltaflow.flush`, ignored by runners) fills the rest of the WAL
+  page, and the WAL writer flushes the completed page on its next round.
+  That is `wal_writer_delay` (200 ms) after the call, or up to 5 s when
+  the WAL writer has gone to sleep on an idle server. Measured: 0.2 s.
+  The filler is at most one WAL page (8 KiB) per call.
+
+`tests/integration/test_read_your_writes.py` waits with nothing else
+committing, on every supported version.
+
 ## Notes
 
 - **Isolation.** Call it in READ COMMITTED (the default): it polls the
